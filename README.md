@@ -195,23 +195,33 @@ worker then reads `torch.cuda.max_memory_allocated` and calibrates the real
 per-pixel cost of *that* model at *that* precision, so every later page is
 sized from measurement instead of a formula. Whole-page input and output
 tensors are excluded from that calibration, and the tile only shrinks under
-genuine pressure - a cudaMalloc retry, or a peak within 8% of free memory -
-never merely for crossing a deliberately pessimistic safety estimate.
+pressure that repeats - two or more cudaMalloc retries inside one page, or two
+consecutive pages peaking within 8% of free memory - never merely for crossing
+a deliberately pessimistic safety estimate. A single retry keeps the proven
+tile, because one retry costs far less than a smaller tile does on every page
+that follows. Later pages reuse the size that already finished, because the
+driver counts page 1's cached blocks as used and budgeting from that number
+alone was quietly collapsing a proven tile to a fraction of its size.
 
-That restraint is the whole point. Measured on a 1920x1080 to 7680x4320 4x job
-on a 6 GB RTX 3060 laptop:
+That restraint is the whole point. Measured on a 6 GB RTX 3060 laptop,
+1920x1080 to 7680x4320 (4x), `4x_IllustrationJaNai_V3denoise_FDAT_M_47k_fp16`,
+FP16, autotune off, two pages per run:
 
-| Tile | Time | ms/MP |
-| --- | --- | --- |
-| `Auto` -> 1248px | 74.5s | 2244 |
-| fixed 1024px | 79.3s | 2391 (+6.5%) |
-| fixed 768px | 81.5s | 2456 (+9.4%) |
+| Tile | Time | ms/MP | vs best |
+| --- | --- | --- | --- |
+| fixed 1952px | 36.27s | 547 | best |
+| fixed 1632px | 41.83s | 630 | +15.3% |
+| fixed 1376px | 41.91s | 632 | +15.5% |
+| fixed 1152px | 41.64s | 628 | +14.8% |
 
-Bigger tiles win, so a planner that shrinks needlessly costs throughput on
-every page that follows. Run-to-run variance on the same laptop is about 5%
-(73.7s vs 77.7s for identical repeats), which is worth knowing before chasing
-small regressions. *Maximum*, *No tiling* and a fixed pixel size are all still
-available when you want to force the issue.
+The largest tile is fastest *even while the allocator retries once per page*,
+and every smaller one costs about 15%. Across a four-page chapter `Auto`
+calibrates on page 1 and then holds 1952px for the rest of the run: **67.50s,
+509 ms/MP**. An earlier build that stepped down after a single retry ratcheted
+to 1632px and then 1376px, taking 72.77s (548 ms/MP) for the same four pages.
+Run-to-run variance on this laptop is about 5%, which is worth knowing before
+chasing small regressions. *Maximum*, *No tiling* and a fixed pixel size are
+all still available when you want to force the issue.
 
 *Keep GPU awake* (on by default) holds a 256 KB tensor on the GPU in a tiny
 background process while the window is open. That keeps a CUDA context resident,
@@ -360,9 +370,9 @@ Velopack packaging, the bundled updater, the workflow/chain state in
   checkbox that could silently do nothing.
 - **an adaptive tile planner** - it measures what the loaded model actually
   costs per pixel on the first page, keeps the tile that worked for the rest of
-  the run, and shrinks only after repeated allocator pressure. Measured at
-  parity with a hand-picked fixed tile, and well ahead of the old 1024/768
-  defaults on the same hardware.
+  the run, and shrinks only after pressure that repeats. Measured at parity
+  with the best hand-picked fixed tile (509 ms/MP across a four-page chapter)
+  and about 15% ahead of any smaller one.
 - **grayscale detection from image statistics**, and when it is on you pick two
   models: one for colour pages, one for grayscale ones.
 - **a scale/model sanity check** - every weight carries its factor in its name,
@@ -372,9 +382,10 @@ Velopack packaging, the bundled updater, the workflow/chain state in
   strips are copied straight through in the chosen output format instead of
   being upscaled. Adopted from another fork's `SkipLargeLong*` settings, minus
   the clause that also caught ordinary large spreads.
-- **cuDNN autotune off by default** - it measured 21-23 s per page here against
-  ~17 s with it off, even across repeats of the same image, so it is now an
-  opt-in rather than the default.
+- **cuDNN autotune off by default** - a controlled A/B at a fixed 1952px tile,
+  the same two pages back to back, measured 34.35s with it off against 39.78s
+  with it on (518 against 600 ms/MP, about 16%). It is opt-in now rather than
+  the default.
 - **output packages** - loose files, one CBZ per source folder (one chapter per
   archive), or a single CBZ, in any supported format regardless of what went
   in.
