@@ -19,8 +19,8 @@
       backend\python        the virtual environment (uv)
       backend\pythons       the managed CPython the venv is built on
       backend\models        model weights
-      backend\src           upscaling backend, copied from the repository
-      backend\ImageMagick   ICC profiles, copied from the repository
+      backend\src           upscaling backend, part of this repository
+      backend\ImageMagick   ICC profiles, part of this repository
       backend\_cache        uv cache and downloads - safe to delete
       tools\                uv.exe, cjxl.exe, djxl.exe
       janai.config.json     what was resolved, and how
@@ -36,21 +36,6 @@
 
 .PARAMETER Models
     Which model packs to download: all, manga, illustration, none.
-
-.PARAMETER Reuse
-    One-off shortcut for a machine that already has MangaJaNaiConverterGui
-    installed: junction its python and models folders into backend\ instead of
-    creating an environment and downloading several GB. Nothing is installed
-    into the shared runtime, so that app keeps working. Everything else about
-    the app behaves exactly as it does on a clean install.
-
-.PARAMETER From
-    The MangaJaNaiConverterGui install to borrow with -Reuse. Autodetected in
-    %APPDATA% and %LOCALAPPDATA% when omitted.
-
-.PARAMETER BackendFrom
-    The MangaJaNaiConverterGui\backend folder holding src and ImageMagick.
-    Autodetected from the repository this app sits in.
 
 .PARAMETER JxlTools
     Folder holding cjxl.exe and djxl.exe. Autodetected from PATH when omitted.
@@ -74,10 +59,6 @@
     .\setup.cmd -Torch cpu -Models manga
     No CUDA, grayscale manga models only.
 
-.EXAMPLE
-    .\setup.cmd -Reuse
-    Borrow the runtime and models of an installed MangaJaNaiConverterGui and
-    download nothing.
 #>
 [CmdletBinding()]
 param(
@@ -86,10 +67,6 @@ param(
     [string] $Torch = 'auto',
     [ValidateSet('all', 'manga', 'illustration', 'none')]
     [string] $Models = 'all',
-    [switch] $Reuse,
-    [string] $From,
-    [Alias('ReuseFrom')]
-    [string] $BackendFrom,
     [string] $JxlTools,
     [switch] $NoJxlPlugin,
     [switch] $Offline,
@@ -103,7 +80,6 @@ $Here = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $Backend = Join-Path $Here 'backend'
 $PyRoot = Join-Path $Backend 'python'
 $ModelsDir = Join-Path $Backend 'models'
-$ExtrasDir = Join-Path $Backend 'extras'
 $Cache = Join-Path $Backend '_cache'
 $ToolsDir = Join-Path $Here 'tools'
 $Worker = Join-Path $Here 'worker\worker.py'
@@ -142,16 +118,10 @@ function Full([string] $p) {
     return [IO.Path]::GetFullPath((Join-Path (Get-Location).Path $p))
 }
 
-function Same([string] $a, [string] $b) {
-    if (-not $a -or -not $b) { return $false }
-    return ([IO.Path]::GetFullPath($a).TrimEnd('\') -ieq [IO.Path]::GetFullPath($b).TrimEnd('\'))
-}
-
 function Find-Interpreter([string] $dir) {
-    # A uv venv, a standalone CPython, or the nested layout an installed
-    # MangaJaNaiConverterGui exposes through a junction.
+    # A uv venv, or a standalone CPython sitting directly in the folder.
     if (-not $dir) { return $null }
-    foreach ($rel in @('Scripts\python.exe', 'python.exe', 'python\python.exe')) {
+    foreach ($rel in @('Scripts\python.exe', 'python.exe')) {
         $cand = Join-Path $dir $rel
         if (Test-Path -LiteralPath $cand -PathType Leaf) { return (Resolve-Path -LiteralPath $cand).Path }
     }
@@ -164,16 +134,8 @@ function Count-Models([string] $dir) {
         Where-Object { $_.Extension -match $ModelExt }).Count
 }
 
-function Get-FolderSize([string] $dir) {
-    if (-not (Test-Path -LiteralPath $dir)) { return 0 }
-    $sum = (Get-ChildItem -LiteralPath $dir -Recurse -File -ErrorAction SilentlyContinue |
-        Measure-Object -Property Length -Sum).Sum
-    if (-not $sum) { return 0 }
-    return [math]::Round($sum / 1GB, 2)
-}
-
 # --------------------------------------------------------------------------- #
-# links, copies, downloads
+# copies and downloads
 # --------------------------------------------------------------------------- #
 function Test-Reparse([string] $path) {
     if (-not (Test-Path -LiteralPath $path)) { return $false }
@@ -181,48 +143,10 @@ function Test-Reparse([string] $path) {
     return [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
 }
 
-function Get-LinkTarget([string] $path) {
-    $item = Get-Item -LiteralPath $path -Force
-    $target = @($item.Target)[0]
-    if (-not $target) { $target = @($item.LinkTarget)[0] }
-    return $target
-}
-
 function Remove-Link([string] $path) {
     # rmdir unlinks a junction without following it into the real folder.
     & cmd.exe /c "rmdir `"$path`"" 2>&1 | Out-Null
     return -not (Test-Path -LiteralPath $path)
-}
-
-function New-Junction([string] $link, [string] $target) {
-    if (-not (Test-Path -LiteralPath $target)) { Warn "link target is missing: $target"; return $false }
-    if (Test-Reparse $link) {
-        if ((Same (Get-LinkTarget $link) $target) -and -not $Force) {
-            Info "$(Split-Path -Leaf $link) -> already linked"
-            return $true
-        }
-        if (-not (Remove-Link $link)) { Warn "could not remove the existing link: $link"; return $false }
-    }
-    elseif (Test-Path -LiteralPath $link) {
-        if (-not $Force) {
-            Warn "$(Split-Path -Leaf $link) is a real folder here, leaving it alone"
-            return $true
-        }
-        Remove-Item -LiteralPath $link -Recurse -Force
-    }
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $link) | Out-Null
-    try {
-        New-Item -ItemType Junction -Path $link -Target $target -ErrorAction Stop | Out-Null
-    }
-    catch {
-        & cmd.exe /c "mklink /J `"$link`" `"$target`"" 2>&1 | Out-Null
-    }
-    if (Test-Reparse $link) {
-        Info "$(Split-Path -Leaf $link) -> $target"
-        return $true
-    }
-    Warn "could not create a junction at $link"
-    return $false
 }
 
 function Get-Download([string] $url, [string] $dest) {
@@ -317,135 +241,71 @@ New-Item -ItemType Directory -Force -Path $Backend | Out-Null
 
 # --------------------------------------------------------------------------- #
 Step 'Backend source and ICC profiles'
-$parent = Split-Path -Parent $Here
-$grand = Split-Path -Parent $parent
-$srcCandidates = @()
-if ($BackendFrom) { $srcCandidates += (Full $BackendFrom) }
-# This repository ships src, ImageMagick and resources under .\backend, so look
-# there first: a fresh clone then needs nothing copied at all.
-$srcCandidates += $Backend
-$srcCandidates += (Join-Path $parent 'MangaJaNaiConverterGui\backend')
-$srcCandidates += (Join-Path $parent 'backend')
-if ($grand) { $srcCandidates += (Join-Path $grand 'MangaJaNaiConverterGui\backend') }
-$source = $null
-foreach ($c in $srcCandidates) {
-    if ($c -and (Test-Path (Join-Path $c 'src\progress_controller.py'))) { $source = (Resolve-Path -LiteralPath $c).Path; break }
+# src, ImageMagick and resources are tracked in this repository, so a clone
+# already has them: nothing is copied, and nothing is borrowed from another app.
+$required = [ordered]@{
+    'backend\src'         = (Join-Path $Backend 'src\progress_controller.py')
+    'backend\ImageMagick' = (Join-Path $Backend 'ImageMagick\Dot Gain 20%.icc')
+    'backend\resources'   = (Join-Path $Backend 'resources')
 }
-$ownBackend = if (Test-Path $Backend) { (Resolve-Path -LiteralPath $Backend).Path } else { $Backend }
-if ($source -and $source -eq $ownBackend) {
-    Info 'already in this repository: src, ImageMagick, resources'
-}
-elseif ($source) {
-    Info "source: $source"
-    foreach ($name in @('src', 'ImageMagick', 'resources')) {
-        $fromDir = Join-Path $source $name
-        $toDir = Join-Path $Backend $name
-        if (-not (Test-Path $fromDir)) { Warn "not in the source tree: $name"; continue }
-        if ((Test-Path $toDir) -and -not $Force) { Info "$name already here"; continue }
-        if (Test-Path $toDir) { Remove-Item $toDir -Recurse -Force }
-        Info "copying $name"
-        Copy-Item -LiteralPath $fromDir -Destination $toDir -Recurse -Force
-    }
+$missing = @()
+foreach ($name in $required.Keys) {
+    if (-not (Test-Path -LiteralPath $required[$name])) { $missing += $name }
 }
-else {
+if ($missing.Count -gt 0) {
     Die @"
-the upscaling backend was not found.
+this checkout is incomplete: $($missing -join ', ') missing.
 
-  Looked for src\progress_controller.py in:
-$($srcCandidates | ForEach-Object { "    $_`n" })
-  A clone of this repository already contains backend\src. If it is missing,
-  restore it, keep this folder inside a MangaJaNaiConverterGui checkout, or
-  pass the path:
-    .\setup.cmd -BackendFrom "C:\path\to\MangaJaNaiConverterGui\backend"
+  Those folders are part of the repository. Restore them with
+      git checkout -- backend
+  or clone the repository again.
 "@
 }
+Info 'in this repository: src, ImageMagick, resources'
 
 # --------------------------------------------------------------------------- #
-$Mode = if ($Reuse -or $From) { 'reuse' } else { 'uv' }
-$Borrowed = ''
-$OwnEnvironment = ($Mode -eq 'uv')
+Step 'uv'
+$Uv = Get-Uv
+$uvVersion = (& $Uv --version 2>&1 | Select-Object -First 1)
+Info "$uvVersion"
+Info $Uv
+Info "cache      $env:UV_CACHE_DIR"
+Info "pythons    $env:UV_PYTHON_INSTALL_DIR"
 
-if ($Mode -eq 'reuse') {
-    Step 'Borrowing an installed MangaJaNaiConverterGui'
-    $candidates = @()
-    if ($From) { $candidates += (Full $From) }
-    foreach ($base in @($env:APPDATA, $env:LOCALAPPDATA, (Join-Path $env:USERPROFILE 'AppData\Roaming'))) {
-        if ($base) { $candidates += (Join-Path $base 'MangaJaNaiConverterGui') }
+Step "Python $Python environment"
+# A folder left linked by an older install is unlinked, never installed into:
+# the runtime and the weights always belong to this folder.
+foreach ($leftover in @(@{ Path = $PyRoot; Name = 'backend\python' }, @{ Path = $ModelsDir; Name = 'backend\models' })) {
+    if (Test-Reparse $leftover.Path) {
+        if (Remove-Link $leftover.Path) { Info "removed a leftover link at $($leftover.Name)" }
+        else { Die "$($leftover.Name) is a link to somewhere else and could not be removed" }
     }
-    $install = $null
-    foreach ($c in $candidates) {
-        if ($c -and (Find-Interpreter (Join-Path $c 'python'))) { $install = (Resolve-Path -LiteralPath $c).Path; break }
-    }
-    if (-not $install) {
-        Die @"
-no MangaJaNaiConverterGui runtime was found to borrow.
-
-  Looked in: $($candidates -join '; ')
-
-  Pass the install folder:  .\setup.cmd -From "D:\path\to\MangaJaNaiConverterGui"
-  or drop -Reuse to build the environment with uv instead.
-"@
-    }
-    $Borrowed = $install
-    $srcPython = Join-Path $install 'python'
-    $srcModels = Join-Path $install 'models'
-    Info "install: $install"
-    Info "runtime $(Get-FolderSize $srcPython) GB, models $(Get-FolderSize $srcModels) GB, $(Count-Models $srcModels) weight file(s)"
-
-    $linkedPython = New-Junction $PyRoot $srcPython
-    $linkedModels = $false
-    if (Test-Path -LiteralPath $srcModels) { $linkedModels = New-Junction $ModelsDir $srcModels }
-    else { Warn 'the install has no models folder' }
-
-    if ($linkedPython) {
-        $PyExe = Find-Interpreter $PyRoot
-    }
-    else {
-        Warn 'no junction could be made; recording absolute paths in janai.config.json instead'
-        $Config['python_dir'] = $srcPython
-        $PyExe = Find-Interpreter $srcPython
-    }
-    if (-not $linkedModels -and (Test-Path -LiteralPath $srcModels)) { $Config['models_dir'] = $srcModels }
-    if (-not $PyExe) { Die "no interpreter under $srcPython" }
-    Warn 'nothing is installed into the borrowed runtime, so MangaJaNaiConverterGui keeps working'
+}
+$existing = Find-Interpreter $PyRoot
+if ($existing -and -not $Force) {
+    Info 'backend\python already exists (use -Force to rebuild it)'
 }
 else {
-    Step 'uv'
-    $Uv = Get-Uv
-    $uvVersion = (& $Uv --version 2>&1 | Select-Object -First 1)
-    Info "$uvVersion"
-    Info $Uv
-    Info "cache      $env:UV_CACHE_DIR"
-    Info "pythons    $env:UV_PYTHON_INSTALL_DIR"
-
-    Step "Python $Python environment"
-    $existing = Find-Interpreter $PyRoot
-    if ($existing -and -not $Force) {
-        Info 'backend\python already exists (use -Force to rebuild it)'
+    # --managed-python keeps the interpreter inside this folder rather than
+    # binding the environment to whatever Python happens to be installed.
+    if (-not (Invoke-Uv 'venv' $PyRoot '--python' $Python '--managed-python')) {
+        Warn 'retrying without --managed-python'
+        if (-not (Invoke-Uv 'venv' $PyRoot '--python' $Python)) { Die 'uv venv failed' }
     }
-    else {
-        if (Test-Reparse $PyRoot) { Remove-Link $PyRoot | Out-Null }
-        # --managed-python keeps the interpreter inside this folder rather than
-        # binding the environment to whatever Python happens to be installed.
-        if (-not (Invoke-Uv 'venv' $PyRoot '--python' $Python '--managed-python')) {
-            Warn 'retrying without --managed-python'
-            if (-not (Invoke-Uv 'venv' $PyRoot '--python' $Python)) { Die 'uv venv failed' }
-        }
-    }
-    $PyExe = Find-Interpreter $PyRoot
-    if (-not $PyExe) { Die 'uv venv did not produce backend\python\Scripts\python.exe' }
+}
+$PyExe = Find-Interpreter $PyRoot
+if (-not $PyExe) { Die 'uv venv did not produce backend\python\Scripts\python.exe' }
 
-    Step 'Dependencies'
-    Info "torch build: $Torch"
-    if (-not (Invoke-Uv 'pip' 'install' '--python' $PyExe '--torch-backend' $Torch '-r' $Requirements)) {
-        Warn '--torch-backend was rejected; falling back to an explicit PyTorch index'
-        $index = if ($Torch -eq 'cpu') { 'https://download.pytorch.org/whl/cpu' }
-        elseif ($Torch -eq 'auto') { 'https://download.pytorch.org/whl/cu128' }
-        else { "https://download.pytorch.org/whl/$Torch" }
-        if (-not (Invoke-Uv 'pip' 'install' '--python' $PyExe '--extra-index-url' $index `
-                    '--index-strategy' 'unsafe-best-match' '-r' $Requirements)) {
-            Die 'installing the dependencies failed'
-        }
+Step 'Dependencies'
+Info "torch build: $Torch"
+if (-not (Invoke-Uv 'pip' 'install' '--python' $PyExe '--torch-backend' $Torch '-r' $Requirements)) {
+    Warn '--torch-backend was rejected; falling back to an explicit PyTorch index'
+    $index = if ($Torch -eq 'cpu') { 'https://download.pytorch.org/whl/cpu' }
+    elseif ($Torch -eq 'auto') { 'https://download.pytorch.org/whl/cu128' }
+    else { "https://download.pytorch.org/whl/$Torch" }
+    if (-not (Invoke-Uv 'pip' 'install' '--python' $PyExe '--extra-index-url' $index `
+                '--index-strategy' 'unsafe-best-match' '-r' $Requirements)) {
+        Die 'installing the dependencies failed'
     }
 }
 
@@ -457,11 +317,7 @@ Info $PyExe
 
 # --------------------------------------------------------------------------- #
 Step 'Models'
-if ($Mode -eq 'reuse') {
-    Info "$(Count-Models $ModelsDir) weight file(s) through the link - nothing to download"
-    Info 'the link points into the other install, so no pack is written there'
-}
-elseif ($Models -eq 'none') {
+if ($Models -eq 'none') {
     Info 'skipped (-Models none)'
     New-Item -ItemType Directory -Force -Path $ModelsDir | Out-Null
 }
@@ -523,26 +379,14 @@ elseif ($haveCjxl -and -not $Force) {
 }
 else {
     if (-not $Uv) { $Uv = Get-Uv }
-    if ($OwnEnvironment) {
-        if (Invoke-Uv 'pip' 'install' '--python' $PyExe 'pillow-jxl-plugin') { Info 'installed into backend\python' }
-        else { Warn 'pillow-jxl-plugin could not be installed; JXL may be unavailable' }
-    }
-    else {
-        # Borrowed runtime: install beside it, never into it.
-        New-Item -ItemType Directory -Force -Path $ExtrasDir | Out-Null
-        if (Invoke-Uv 'pip' 'install' '--python' $PyExe '--target' $ExtrasDir '--no-deps' 'pillow-jxl-plugin') {
-            Info 'installed into backend\extras'
-        }
-        else { Warn 'pillow-jxl-plugin could not be installed; JXL may be unavailable' }
-    }
+    if (Invoke-Uv 'pip' 'install' '--python' $PyExe 'pillow-jxl-plugin') { Info 'installed into backend\python' }
+    else { Warn 'pillow-jxl-plugin could not be installed; JXL may be unavailable' }
 }
 
 # --------------------------------------------------------------------------- #
 Step 'Configuration'
-$Config['mode'] = $Mode
 $Config['python'] = (& $PyExe -c "import sys; print(sys.version.split()[0])" 2>&1 | Select-Object -First 1)
-if ($Mode -eq 'uv') { $Config['torch_backend'] = $Torch }
-if ($Borrowed) { $Config['borrowed_from'] = $Borrowed }
+$Config['torch_backend'] = $Torch
 $Config['written'] = (Get-Date).ToString('s')
 $json = $Config | ConvertTo-Json -Depth 4
 # UTF-8 without a BOM: json.loads in the resolver will not accept one
@@ -596,8 +440,7 @@ Info "models detected by the worker: $(@($p.models).Count)"
 if (@($p.models).Count -eq 0) { Warn 'no models were found - upscaling will fall back to plain resizing' }
 
 Write-Host ''
-if ($Borrowed) { Write-Host "  Done, with no download: borrowing $Borrowed" -ForegroundColor Green }
-else { Write-Host '  Done.' -ForegroundColor Green }
+Write-Host '  Done.' -ForegroundColor Green
 Write-Host '  Start the app with JaNaiUpscaler.cmd' -ForegroundColor Green
 if (Test-Path $Cache) { Write-Host '  backend\_cache can be deleted to free disk space.' -ForegroundColor DarkGray }
 Write-Host ''

@@ -6,15 +6,17 @@ Everything the app needs lives in this one folder:
     backend/models        the model weights
     backend/src           the chaiNNer-derived upscaling backend
     backend/ImageMagick   the ICC profiles used by the dot-gain resize
-    tools/                cjxl.exe, djxl.exe, uv.exe
+    tools/                cjxl, djxl, uv
+
+The runtime and the weights are installed here by setup and are not tracked by
+git, so every clone starts clean; nothing is ever borrowed from another
+application's install.
 
 Each location is resolved at run time, in this order:
 
-1. an explicit path in ``janai.config.json`` next to the app
-2. ``<app>/backend/...`` - the normal layout, whether a real folder or a
-   junction someone pointed elsewhere
-3. the MangaJaNaiConverterGui checkout this folder sits in, for ``src``,
-   ``ImageMagick`` and ``resources`` only, which is handy while developing
+1. an explicit path in ``janai.config.json`` next to the app, for the rare
+   case of keeping the weights on another disk
+2. ``<app>/backend/...`` - the normal layout
 
 Standard library only: the GUI imports this module, and the GUI never imports
 torch. For a report of what this copy of the app resolves to::
@@ -33,7 +35,6 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 CONFIG_NAME = "janai.config.json"
-REPO_NAME = "MangaJaNaiConverterGui"
 MODEL_EXTS = {".pth", ".safetensors", ".pt", ".ckpt"}
 ICC_MARKER = "Dot Gain 20%.icc"
 SRC_MARKER = "progress_controller.py"
@@ -108,9 +109,9 @@ def _unique(paths: Iterable[Path | None]) -> list[Path]:
 def interpreter(python_dir: Path | None, windowless: bool = False) -> Path | None:
     """The interpreter inside a runtime folder, whichever layout it uses.
 
-    Handles a virtual environment (``Scripts/python.exe``, ``bin/python3``), a
-    standalone CPython (``python.exe``) and the nested ``python/python.exe``
-    layout that a junction to an installed app can expose.
+    Handles a virtual environment (``Scripts/python.exe`` on Windows,
+    ``bin/python3`` elsewhere) and a standalone CPython sitting directly in
+    the folder.
     """
     if python_dir is None:
         return None
@@ -121,7 +122,6 @@ def interpreter(python_dir: Path | None, windowless: bool = False) -> Path | Non
         python_dir / "Scripts",
         python_dir / "bin",
         python_dir,
-        python_dir / "python",
     ):
         for name in names:
             cand = base / name
@@ -198,18 +198,6 @@ def resolve(root: Path | None = None) -> Paths:
     backend = root / "backend"
     paths = Paths(root=root, config=cfg)
 
-    # The app normally sits inside the MangaJaNaiConverterGui checkout, whose
-    # backend folder carries the upscaling source and the ICC profiles. setup
-    # copies them into backend/, so this is only a fallback for a folder that
-    # has not been set up yet.
-    repos = _unique(
-        [
-            root.parent / REPO_NAME / "backend",
-            root.parent.parent / REPO_NAME / "backend",
-            root.parent / "backend",
-        ]
-    )
-
     def pick(
         name: str,
         tagged: list[tuple[str, Path]],
@@ -253,20 +241,17 @@ def resolve(root: Path | None = None) -> Paths:
     pick("models_dir", [("app", backend / "models")], check=_has_models)
     pick(
         "src_dir",
-        [("app", backend / "src")] + [("repo", r / "src") for r in repos],
+        [("app", backend / "src")],
         check=lambda d: (d / SRC_MARKER).is_file(),
         strict=True,
     )
     pick(
         "icc_dir",
-        [("app", backend / "ImageMagick")] + [("repo", r / "ImageMagick") for r in repos],
+        [("app", backend / "ImageMagick")],
         check=lambda d: (d / ICC_MARKER).is_file(),
         strict=True,
     )
-    pick(
-        "resources_dir",
-        [("app", backend / "resources")] + [("repo", r / "resources") for r in repos],
-    )
+    pick("resources_dir", [("app", backend / "resources")])
     pick("extras_dir", [("app", backend / "extras")])
     pick("tools_dir", [("app", root / "tools"), ("app", backend / "tools")])
     return paths

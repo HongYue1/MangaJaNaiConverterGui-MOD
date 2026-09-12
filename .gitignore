@@ -3,9 +3,12 @@
 # ---------------------------------------------------------------------------
 backend/python
 backend/python/
+backend/pythons
+backend/pythons/
 backend/models
 backend/models/
 backend/extras/
+backend/_cache/
 
 # ImageMagick binaries are downloaded by setup; the ICC profiles are tracked.
 backend/ImageMagick/*

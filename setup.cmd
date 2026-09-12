@@ -1,7 +1,6 @@
 @echo off
 rem JaNai Upscaler - one-shot setup. Any options are passed to setup.ps1,
 rem e.g.  setup.cmd -Torch cpu -Models manga
-rem       setup.cmd -Reuse                    (borrow an existing install)
 setlocal
 set "HERE=%~dp0"
 where powershell.exe >nul 2>nul

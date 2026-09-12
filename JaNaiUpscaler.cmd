@@ -9,13 +9,11 @@ rem 1. whatever setup recorded
 if exist "%HERE%janai.runtime.txt" set /p PY=<"%HERE%janai.runtime.txt"
 if defined PY if not exist "%PY%" set "PY="
 
-rem 2. the venv uv creates, then the layouts a junction can expose
+rem 2. the venv uv creates, or a standalone CPython in the same folder
 if not defined PY if exist "%HERE%backend\python\Scripts\pythonw.exe" set "PY=%HERE%backend\python\Scripts\pythonw.exe"
 if not defined PY if exist "%HERE%backend\python\Scripts\python.exe"  set "PY=%HERE%backend\python\Scripts\python.exe"
 if not defined PY if exist "%HERE%backend\python\pythonw.exe"         set "PY=%HERE%backend\python\pythonw.exe"
 if not defined PY if exist "%HERE%backend\python\python.exe"          set "PY=%HERE%backend\python\python.exe"
-if not defined PY if exist "%HERE%backend\python\python\pythonw.exe"  set "PY=%HERE%backend\python\python\pythonw.exe"
-if not defined PY if exist "%HERE%backend\python\python\python.exe"   set "PY=%HERE%backend\python\python\python.exe"
 
 if defined PY (
     start "JaNai Upscaler" "%PY%" "%MAIN%" %*

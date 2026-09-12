@@ -20,7 +20,7 @@ MangaJaNaiConverterGui-MOD\
   JaNaiUpscaler.cmd      launcher (finds the venv's pythonw.exe)
   setup.cmd / setup.ps1  one-shot installer, uv-driven
   requirements.txt       the pinned worker dependencies
-  janai.config.json      written by setup: mode, python, torch backend
+  janai.config.json      written by setup: python version, torch backend
   janai.runtime.txt      written by setup: which interpreter to launch
   settings.json          your last-used settings (created on first exit)
   app\                   the GUI - standard library only, never imports torch
@@ -36,12 +36,17 @@ MangaJaNaiConverterGui-MOD\
   backend\
     python\              the virtual environment: torch, pyvips, spandrel
     pythons\             the CPython uv downloaded for that venv
-    src\                 chaiNNer-derived backend copied from the old app
+    src\                 chaiNNer-derived backend, tracked in this repository
     ImageMagick\         ICC profiles used for grayscale resizing
     models\              *.pth / *.safetensors / *.onnx
-    extras\              side-loaded packages (pillow-jxl-plugin)
+    extras\              optional side-loaded packages, normally empty
     _cache\              uv cache + downloads, safe to delete
 ```
+
+`backend\python`, `backend\pythons`, `backend\models`, `backend\extras` and
+`backend\_cache` are per-machine and are not tracked by git: every clone starts
+clean and builds its own runtime. Nothing is ever shared with, or borrowed
+from, another application's install.
 
 ## Setup
 
@@ -51,8 +56,8 @@ Run **`setup.cmd`** once and let it finish. It is driven by
 1. finds `uv.exe` - `tools\`, `PATH`, `~\.local\bin`, WinGet links - and
    downloads it into `tools\` if you do not have it (~15 MB);
 2. checks that `backend\src`, `backend\ImageMagick` and `backend\resources`
-   are in place - in this repository they already are, so nothing is copied;
-   `-BackendFrom <path>` takes them from another checkout instead;
+   are in place - they are tracked here, so a clone already has them and
+   nothing is copied;
 3. `uv venv --python 3.13` into `backend\python`, fetching a managed CPython
    into `backend\pythons` when that version is not already available (~25 MB);
 4. `uv pip install --torch-backend auto -r requirements.txt`, which resolves
@@ -70,7 +75,6 @@ Useful options (pass them straight to `setup.cmd`):
 | `-Python 3.12` | build the venv on a different Python version |
 | `-Torch cpu` \| `cu126` \| `cu128` \| `cu129` | override the auto-detected torch build |
 | `-Models manga` \| `illustration` \| `none` | fetch only some model packs |
-| `-Reuse` `[-From <path>]` | link the runtime and models from an existing install instead of downloading them |
 | `-JxlTools <dir>` | take `cjxl.exe`/`djxl.exe` from a specific folder |
 | `-NoJxlPlugin` | skip `pillow-jxl-plugin` |
 | `-Offline` | fail rather than download anything |
@@ -78,17 +82,46 @@ Useful options (pass them straight to `setup.cmd`):
 
 Re-running setup is safe: finished steps are skipped.
 
-**`-Reuse`** is a one-off escape hatch for a machine that already has the old
-app installed (by default `%APPDATA%\MangaJaNaiConverterGui`). It junctions
-`backend\python` and `backend\models` to that install, so nothing is
-downloaded and nothing is written into the borrowed runtime -
-`pillow-jxl-plugin` goes to `backend\extras` instead. The app cannot tell the
-difference: it only ever looks inside `backend\`.
+Setup never borrows a runtime or weights from another application: everything
+is installed into `backend\` and belongs to this folder alone. If a previous
+version left `backend\python` or `backend\models` linked elsewhere, setup
+unlinks it and builds a real folder in its place. To keep the weights on
+another disk, point `models_dir` at them in `janai.config.json`.
 
 One portability caveat: a uv venv stores the absolute path of its base
 interpreter, so if you move the folder somewhere the old path no longer
 exists, run `setup.cmd -Force` once to rebuild the venv (the downloads are
 cached in `backend\_cache`).
+
+## Platform support
+
+Windows 10/11 x64 is what ships and what CI checks. The wrappers are Windows
+scripts (`setup.cmd`, `setup.ps1`, `JaNaiUpscaler.cmd`) and the bundled JPEG XL
+helpers are `cjxl.exe` / `djxl.exe`.
+
+The Python side itself is portable: the GUI is Tk, the worker is torch +
+pyvips, paths go through `pathlib`, and the Windows-only calls (DPI awareness,
+WM_DROPFILES drag & drop, `CREATE_NO_WINDOW`, opening a folder) are all guarded
+by platform checks with POSIX fallbacks. On Linux only the wrappers are
+missing, so running it means creating the environment by hand:
+
+```
+uv venv backend/python --python 3.13
+uv pip install --python backend/python/bin/python -r requirements.txt
+backend/python/bin/python app/main.py
+```
+
+plus `libvips` and `libjxl-tools` from the distribution's package manager
+(pyvips needs the system library, and the bundled `.exe` encoders will not
+run). That path is not tested here, so treat Linux as unsupported until it is.
+
+**NVIDIA T4** (Turing, sm_75, 16 GB) is a good fit. FP16 runs on its tensor
+cores, so the default half precision is a genuine speed-up, and 16 GB lets the
+tile planner keep whole pages in a single pass - the tuning that matters on a
+6 GB laptop card rarely triggers there. BF16 needs Ampere or newer, so a T4
+reports `bf16: false` in the probe; the upscaler never asks for BF16, and
+BF16-trained weights (the `*_bf16.safetensors` packs) load and run in FP16 or
+FP32 all the same. Any CUDA device torch supports works the same way.
 
 ## Using it
 
@@ -233,9 +266,6 @@ backend\python\Scripts\python.exe tools\selftest.py
 backend\python\Scripts\python.exe tools\bench.py --input page.png --tiles auto,1024,768
 ```
 
-(With `-Reuse` the interpreter sits at `backend\python\python\python.exe`
-instead; `janai.runtime.txt` always names the right one.)
-
 `--probe` prints one JSON line describing devices, encoders, models and
 library versions. `--job` takes the same JSON the GUI writes (input, output,
 format, upscale, perf sections) and streams JSONL progress events on stdout;
@@ -286,7 +316,7 @@ workflow editor.
   and press `F5`, or re-run `setup.cmd -Models all`.
 - **JXL disabled** - the tooltip shows why. Dropping `cjxl.exe` into `tools\`
   fixes it; `setup.cmd` also tries `pillow-jxl-plugin`, which setup installs
-  into the venv (or into `backend\extras` when the runtime is borrowed).
+  into the venv.
 - **GPU not listed** - the CPU build got installed; re-run
   `setup.cmd -Torch cu128 -Force`. If CUDA is present but upscaling still runs
   on CPU, check that the device selector is not pinned to CPU; *Auto* always
@@ -309,9 +339,9 @@ workflow editor.
   architectures at runtime. Keep that folder: FDAT models in `backend\models`
   do not load without it.
 
-Any existing install of the original `MangaJaNaiConverterGui` is left
-untouched: with `-Reuse`, setup only reads from it (the linked runtime and
-models).
+This app never reads from an install of the original `MangaJaNaiConverterGui`:
+it resolves the interpreter, the weights, the backend source and the ICC
+profiles inside its own folder, and nowhere else.
 
 ## What changed in this fork
 
@@ -342,8 +372,9 @@ Velopack packaging, the bundled updater, the workflow/chain state in
   nothing written and torch never loaded.
 - **the run log** - aligned and grouped, saved to `logs\Run_<timestamp>.log`
   automatically, and the log pane now fills the window.
-- **setup** - a single `uv`-driven `setup.cmd`, with `-Reuse` to borrow an
-  existing install's runtime and models instead of downloading several GB.
+- **setup** - a single `uv`-driven `setup.cmd` that builds the environment,
+  fetches the model packs and self-tests the result. Every install is clean
+  and self-contained.
 - **checks** - `tools\smoke.py` (no dependencies, runs in CI),
   `tools\selftest.py` (end to end, needs the runtime) and `tools\bench.py`
   (throughput).
