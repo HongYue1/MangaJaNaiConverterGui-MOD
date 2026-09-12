@@ -68,7 +68,9 @@ def build_job(args: argparse.Namespace, tile: str, out_dir: Path) -> dict:
             "use_fp16": not args.no_fp16,
             "tile": tile,
             "io_workers": 2,
-            "cudnn_benchmark": True,
+            # Off by default, exactly like the app, so a bench reflects what
+            # users actually get. Pass --cudnn to measure autotune instead.
+            "cudnn_benchmark": bool(args.cudnn),
             "allow_tf32": True,
         },
     }
@@ -131,6 +133,8 @@ def main() -> int:
     p.add_argument("--warmup", action="store_true", help="discard one run before measuring")
     p.add_argument("--no-fp16", action="store_true")
     p.add_argument("--no-grayscale", action="store_true")
+    p.add_argument("--cudnn", action="store_true",
+                   help="turn cuDNN autotune on (off by default, as in the app)")
     p.add_argument("--keep", action="store_true", help="keep upscaled output")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()

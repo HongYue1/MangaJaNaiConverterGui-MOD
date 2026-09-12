@@ -624,10 +624,24 @@ class TilePlanner:
             # chaiNNer's calibration, used until a real measurement replaces it
             per_px = (model_bytes / (1024 * 52)) * max(1, c) * self.elem
         tile = self._align(math.sqrt(budget / max(per_px, 1e-6)))
+        free = self._free_bytes()
+        proven = self._good.get(key, 0)
+        if proven > tile:
+            # Page 2 and later: the driver still counts page 1's blocks as
+            # used, because torch's allocator holds them to hand straight
+            # back. Budgeting from that number alone quietly shrank a proven
+            # 1952px tile to 864px, costing 23s a page against 17s. Repeat
+            # the size that already finished instead - and only that size,
+            # never larger: sizing from free memory plus the cache is what
+            # made a 1280px tile retry on every page.
+            tile = proven
+            # Peak-against-free is meaningless once the cache is serving the
+            # allocation, so leave real allocator retries as the only signal.
+            free = 0
         cap = self._cap.get(key)
         if cap:
             tile = min(tile, cap)
-        return self._arm(key, model, w, h, c, tile, budget, self._free_bytes())
+        return self._arm(key, model, w, h, c, tile, budget, free)
 
     def _arm(self, key: int, model: Any, w: int, h: int, c: int, tile: int,
              budget: int, free: int) -> Any:
@@ -689,20 +703,30 @@ class TilePlanner:
         retried = max(0, self._alloc_retries() - self._retries)
         near_limit = bool(free) and peak > int(free * 0.92)
         if not (retried or near_limit):
+            # A page that finished cleanly clears the slate: pressure has to be
+            # consecutive to mean anything, or one fragmented page early in a
+            # chapter ratchets the tile down for every page after it.
+            self._pressure.pop(key, None)
             return
-        # A single retry can just be a fragmented heap on the first page, and
-        # one cache flush costs far less than a permanently smaller tile.
-        # Shrink on the second sign of pressure - or at once if one page had
-        # to retry more than once.
         strikes = self._pressure.get(key, 0) + max(1, retried)
         self._pressure[key] = strikes
-        if strikes < 2:
-            log("memory was tight, keeping the tile for now", "debug")
+        # Measured on a 6 GB card, 1920x1080 -> 7680x4320 through the x4 FDAT
+        # model: the proven 1952px tile holds 18.1s a page even while the
+        # allocator retries once per page, against 20.9s at 1632px, 21.0s at
+        # 1376px and 20.8s at 1152px. One retry a page is far cheaper than a
+        # permanently smaller tile, and a genuine miss is already caught and
+        # re-tiled for that page by auto_split. So only pressure that repeats
+        # inside a single page earns a lasting step down.
+        if retried >= 2:
+            why = "repeated allocator retries in one page"
+        elif not retried and strikes >= 2:
+            why = "peaks near free memory"
+        else:
+            log("memory was tight, keeping the proven tile", "debug")
             return
         capped = max(self.MIN_TILE, self._align(tile * 0.85))
         if capped < (self._cap.get(key) or tile):
             self._cap[key] = capped
-            why = "repeated allocator retries" if retried else "peaks near free memory"
             log(f"tile capped at {capped}px after {why}", "debug")
 
 
