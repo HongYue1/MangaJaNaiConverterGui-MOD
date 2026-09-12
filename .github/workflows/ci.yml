@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    # The app is Windows-only, so the checks run where it actually ships.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Byte-compile the interface, worker and tools
+        run: python -m compileall -q app common worker tools
+
+      - name: Byte-compile the upscaling backend
+        run: python -m compileall -q backend/src
+
+      - name: Smoke-test the dependency-free modules
+        run: python tools/smoke.py
