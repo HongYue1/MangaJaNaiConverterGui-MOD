@@ -59,8 +59,9 @@ def build_job(args: argparse.Namespace, tile: str, out_dir: Path) -> dict:
             "grayscale_convert": not args.no_grayscale,
             "auto_levels": True,
             "grayscale_threshold": 12,
-            "grayscale_colour_permille": 2.5,
+            "grayscale_colour_percent": 0.25,
             "pre_downscale_height": 0,
+            "skip_long_strips": False,
         },
         "perf": {
             "device": args.device,

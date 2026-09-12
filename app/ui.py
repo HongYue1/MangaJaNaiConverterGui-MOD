@@ -73,6 +73,27 @@ TILE_CHOICES = [
 MODE_OPTIONS = [("Scale", "scale"), ("Width", "width"), ("Height", "height"), ("Fit", "fit")]
 
 AUTO_MODEL = "auto"
+
+
+def model_scale(name: str) -> int | None:
+    """The scale a model file advertises in its own name, else None.
+
+    Every weight ships with the factor in the filename (``4x_Illustration...``,
+    ``2x-AnimeSharp...``), so the name is enough to catch a 4x model pointed at
+    a 2x job before anything is loaded.
+    """
+    stem = Path(str(name or "")).stem.lower()
+    for token in stem.replace("-", "_").replace(" ", "_").split("_"):
+        head, tail = token[:-1], token[1:]
+        if token.endswith("x") and head.isdigit():
+            value = int(head)
+        elif token.startswith("x") and tail.isdigit():
+            value = int(tail)
+        else:
+            continue
+        if 1 <= value <= 16:
+            return value
+    return None
 LOG_TAGS = ("info", "debug", "warn", "error", "ok", "skip", "dry")
 
 # An empty device string means "let the worker pick the best one".
@@ -159,9 +180,10 @@ class App:
         self.var_levels = tk.BooleanVar(value=bool(u.get("auto_levels", True)))
         self.var_gray = tk.BooleanVar(value=bool(u.get("grayscale_convert", True)))
         self.var_threshold = tk.IntVar(value=int(u.get("grayscale_threshold", 12)))
-        self.var_colour_pm = tk.DoubleVar(
-            value=float(u.get("grayscale_colour_permille", 2.5)))
+        self.var_colour_pct = tk.DoubleVar(
+            value=float(u.get("grayscale_colour_percent", 0.25)))
         self.var_pre_h = tk.IntVar(value=int(u.get("pre_downscale_height", 0)))
+        self.var_skip_long = tk.BooleanVar(value=bool(u.get("skip_long_strips", False)))
 
         self.var_fmt = tk.StringVar(value=str(d["format"].get("id", "png")))
         self.var_adv = tk.BooleanVar(value=bool(ui.get("advanced_format", False)))
@@ -387,13 +409,10 @@ class App:
                                         style="Card.TLabel")
         self.cb_model_gray = combo(self.models_box, self.var_model_gray, [AUTO_MODEL], width=44,
                                    on_change=self.update_summary)
-        self.btn_suggest = ttk.Button(self.models_box, text="Suggest", style="Ghost.TButton",
-                                      command=self.suggest_models)
-        Tooltip(self.btn_suggest, "Fill both boxes from the installed model names: a "
-                                  "MangaJaNai variant for gray pages, an illustration "
-                                  "model for colour ones.", self.theme)
         self.lbl_models_hint = ttk.Label(self.models_box, text="", style="Muted.TLabel",
                                          wraplength=620, justify="left")
+        self.lbl_model_warn = ttk.Label(self.models_box, text="", style="Warn.TLabel",
+                                        wraplength=620, justify="left")
 
         adv = ttk.Frame(b, style="Card.TFrame")
         adv.grid(row=4, column=1, sticky="w", pady=(10, 0))
@@ -402,17 +421,25 @@ class App:
         sp.grid(row=0, column=1, padx=(8, 16))
         Tooltip(sp, "How much colour a page may carry and still count as grayscale. 12 is "
                     "the original default.", self.theme)
-        ttk.Label(adv, text="Colour pixels \u2030", style="Muted.TLabel").grid(row=0, column=2)
-        sp3 = int_spin(adv, self.var_colour_pm, 0.0, 100.0, 0.5, 6, self.update_summary)
+        ttk.Label(adv, text="Colour pixels %", style="Muted.TLabel").grid(row=0, column=2)
+        sp3 = int_spin(adv, self.var_colour_pct, 0.0, 25.0, 0.05, 6, self.update_summary)
         sp3.grid(row=0, column=3, padx=(8, 16))
-        Tooltip(sp3, "Second opinion: a page is colour as soon as this many pixels per "
-                     "thousand are clearly coloured, even if the average looks gray. "
+        Tooltip(sp3, "Second opinion: a page is colour as soon as this percentage of its "
+                     "pixels are clearly coloured, even if the average looks gray. "
                      "Catches spot colour on otherwise black-and-white pages.", self.theme)
         ttk.Label(adv, text="Pre-downscale height", style="Muted.TLabel").grid(row=0, column=4)
         sp2 = int_spin(adv, self.var_pre_h, 0, 20000, 100, 7, self.update_summary)
         sp2.grid(row=0, column=5, padx=(8, 0))
         Tooltip(sp2, "0 = off. Shrinks very large scans to this height before the model runs: "
                      "much faster, and often cleaner on oversized raws.", self.theme)
+        c3 = ttk.Checkbutton(adv, text="Pass through huge long strips",
+                             variable=self.var_skip_long, command=self.update_summary)
+        c3.grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        Tooltip(c3, "Webtoon-style mega strips \u2014 very tall and already huge \u2014 are "
+                    "copied straight through in the chosen output format instead of being "
+                    "upscaled. Off by default: the adaptive tiler handles them fine, so "
+                    "this is only for when you want the conversion and nothing else.",
+                self.theme)
 
         self.lbl_upscale_sum = ttk.Label(b, text="", style="Muted.TLabel", wraplength=620,
                                          justify="left")
@@ -788,7 +815,6 @@ class App:
             self.lbl_model.configure(text="Colour pages")
             self.lbl_model_gray.grid(row=1, column=0, sticky="w", padx=(0, 12), pady=4)
             self.cb_model_gray.grid(row=1, column=1, sticky="w", pady=4)
-            self.btn_suggest.grid(row=1, column=2, sticky="w", padx=(8, 0))
             self.lbl_models_hint.grid(row=2, column=1, columnspan=2, sticky="w", pady=(2, 0))
             self.lbl_models_hint.configure(
                 text="Both are required: colour pages go to the first model, detected "
@@ -798,33 +824,11 @@ class App:
             self.lbl_model.configure(text="Model")
             self.lbl_model_gray.grid_remove()
             self.cb_model_gray.grid_remove()
-            self.btn_suggest.grid_remove()
             self.lbl_models_hint.grid_remove()
         self.update_summary()
 
     def on_gray_toggle(self) -> None:
         self.render_models()
-
-    def suggest_models(self) -> None:
-        names = [str(m.get("name")) for m in self.models]
-        if not names:
-            self.log("no models installed to suggest from", "warn")
-            return
-        gray = next((n for n in names if "manga" in n.lower()), "")
-        colour = next((n for n in names if any(k in n.lower() for k in
-                                               ("illustration", "ultrasharp", "anime",
-                                                "colour", "color"))), "")
-        if gray:
-            self.var_model_gray.set(gray)
-        if colour:
-            self.var_model.set(colour)
-        if not gray and not colour:
-            self.log("could not tell the installed models apart by name; pick them by hand",
-                     "warn")
-        else:
-            self.log(f"models: colour={self.var_model.get()} \u00b7 "
-                     f"gray={self.var_model_gray.get()}")
-        self.update_summary()
 
     def on_container_change(self) -> None:
         self.update_summary()
@@ -1015,6 +1019,7 @@ class App:
         if self.safe_int(self.var_pre_h, 0):
             bits.append(f"pre-downscale {self.safe_int(self.var_pre_h, 0)}px")
         self.lbl_upscale_sum.configure(text=" \u00b7 ".join(bits))
+        self.update_model_warning()
 
         cid = self.container_value()
         self.lbl_container_hint.configure(text=CONTAINERS[cid].hint)
@@ -1038,6 +1043,36 @@ class App:
         if self.var_wake.get():
             hint.append("GPU kept awake")
         self.panel_perf.set_hint(" \u00b7 ".join(hint))
+
+    def update_model_warning(self) -> None:
+        """Flag a model whose name advertises a scale other than the target.
+
+        Only the plain scale mode is checked. In width/height/fit modes the
+        effective factor depends on each page's own size, so comparing against a
+        name there would fire on perfectly sensible setups.
+        """
+        notes: list[str] = []
+        if self.var_mode.get() == "scale":
+            want = self.safe_float(self.var_scale, 2.0)
+            gray_on = bool(self.var_gray.get())
+            pairs = [("Colour" if gray_on else "Selected", self.var_model.get())]
+            if gray_on:
+                pairs.append(("Grayscale", self.var_model_gray.get()))
+            for label, name in pairs:
+                name = str(name or "").strip()
+                if not name or name == AUTO_MODEL:
+                    continue
+                found = model_scale(name)
+                if found is not None and abs(found - want) > 0.01:
+                    notes.append(f"{label} model is {found}\u00d7 but the target is {want:g}\u00d7")
+        if notes:
+            self.lbl_model_warn.configure(
+                text="\u26a0  " + "; ".join(notes) + ". The output gets resampled to the "
+                     "target, which throws away detail \u2014 pick a matching model or "
+                     "change the scale.")
+            self.lbl_model_warn.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        else:
+            self.lbl_model_warn.grid_remove()
 
     def container_value(self) -> str:
         cid = str(self.var_container.get() or "files")
@@ -1256,8 +1291,9 @@ class App:
             "auto_levels": bool(self.var_levels.get()),
             "grayscale_convert": bool(self.var_gray.get()),
             "grayscale_threshold": self.safe_int(self.var_threshold, 12),
-            "grayscale_colour_permille": self.safe_float(self.var_colour_pm, 2.5),
+            "grayscale_colour_percent": self.safe_float(self.var_colour_pct, 0.25),
             "pre_downscale_height": self.safe_int(self.var_pre_h, 0),
+            "skip_long_strips": bool(self.var_skip_long.get()),
         }
         d["format"]["id"] = self.var_fmt.get()
         for fid in FORMATS:

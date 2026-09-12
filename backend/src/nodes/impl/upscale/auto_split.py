@@ -121,8 +121,13 @@ def _max_split(
         # the image was too large
         max_tile_size = split_tile_size(max_tile_size)
 
+        # Say which tile was planned as well as the one being retried: the run
+        # summary reports the planned tile, and reporting only the fallback here
+        # made the two look contradictory.
         logger.warn(
-            f"Unable to upscale the whole image at once. Reduced tile size to {max_tile_size}."
+            f"The whole {w}x{h}px image did not fit in one pass"
+            f" (planned tile {starting_tile_size[0]}px);"
+            f" retrying it in {max_tile_size[0]}px tiles."
         )
 
     # The upscale method is allowed to request splits at any time.
@@ -178,7 +183,10 @@ def _max_split(
 
                     new_tile_count_y = math.ceil(h / max_tile_size[1])
                     new_tile_size_y = math.ceil(h / new_tile_count_y)
-                    start_y = (y * tile_size_x) // new_tile_size_y
+                    # tile_size_y, not tile_size_x: y counts rows, so mixing in
+                    # the horizontal tile size restarts on the wrong row and
+                    # duplicates or drops a band of the page.
+                    start_y = (y * tile_size_y) // new_tile_size_y
 
                     logger.debug(
                         f"Split occurred. New tile size is {max_tile_size}. Starting at row {start_y}."
@@ -187,7 +195,8 @@ def _max_split(
                     # reset result
                     if result is not None:
                         # we already added at least one row, so we have to set the offset back
-                        result.offset = start_y * new_tile_size_y
+                        # offset lives in output pixels, so it has to be scaled
+                        result.offset = start_y * new_tile_size_y * scale
 
                     restart = True
                     break

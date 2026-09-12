@@ -232,8 +232,17 @@ def hint_label(parent: tk.Misc, row: int, text: str, style: str = "Muted.TLabel"
 
 def int_spin(parent: tk.Misc, variable: tk.Variable, lo: float, hi: float,
              step: float = 1, width: int = 7, on_change: Callable[[], None] | None = None):
+    """Spinbox for a numeric field.
+
+    A fractional step gets an explicit format, so the arrows produce 0.25
+    instead of 0.30000000000000004.
+    """
+    extra: dict[str, Any] = {}
+    if float(step) != int(float(step)):
+        decimals = len(f"{float(step):.6f}".rstrip("0").split(".")[1]) or 2
+        extra["format"] = f"%.{decimals}f"
     sp = ttk.Spinbox(parent, from_=lo, to=hi, increment=step, textvariable=variable,
-                     width=width, justify="right")
+                     width=width, justify="right", **extra)
     if on_change is not None:
         sp.configure(command=on_change)
         sp.bind("<FocusOut>", lambda _e: on_change(), add="+")

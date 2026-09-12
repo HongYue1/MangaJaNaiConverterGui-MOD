@@ -365,6 +365,16 @@ Velopack packaging, the bundled updater, the workflow/chain state in
   defaults on the same hardware.
 - **grayscale detection from image statistics**, and when it is on you pick two
   models: one for colour pages, one for grayscale ones.
+- **a scale/model sanity check** - every weight carries its factor in its name,
+  so pointing a 4x model at a 2x run (or the reverse) is flagged in the panel
+  before you start, and again in the log from the loaded weights themselves.
+- **long-strip passthrough** - optional, off by default: webtoon-style mega
+  strips are copied straight through in the chosen output format instead of
+  being upscaled. Adopted from another fork's `SkipLargeLong*` settings, minus
+  the clause that also caught ordinary large spreads.
+- **cuDNN autotune off by default** - it measured 21-23 s per page here against
+  ~17 s with it off, even across repeats of the same image, so it is now an
+  opt-in rather than the default.
 - **output packages** - loose files, one CBZ per source folder (one chapter per
   archive), or a single CBZ, in any supported format regardless of what went
   in.
@@ -380,10 +390,17 @@ Velopack packaging, the bundled updater, the workflow/chain state in
   (throughput).
 
 `backend\resources` and the ICC profiles are byte-identical to upstream. The
-backend under `backend\src` carries exactly one change: `auto_split.py` called
-an undefined `safe_cuda_cache_empty()`, which raised `NameError` the moment a
-job was paused mid-upscale; it now calls `safe_accelerator_cache_empty(device)`
-like the rest of the file. `backend\python` installs stock `spandrel` from
+backend under `backend\src` carries three deliberate changes, all in
+`auto_split.py`. It called an undefined `safe_cuda_cache_empty()`, which raised
+`NameError` the moment a job was paused mid-upscale; it now calls
+`safe_accelerator_cache_empty(device)` like the rest of the file. A mid-image
+tile split restarted from a row computed with the *horizontal* tile size and
+then wrote the restart offset in input pixels rather than output pixels, which
+duplicated or dropped a band of the page; both are fixed the same way another
+fork fixed them. And the "did not fit in one pass" message now names the
+planned tile next to the one being retried, because reporting only the
+fallback made it look like it contradicted the tile in the run summary.
+`backend\python` installs stock `spandrel` from
 PyPI, with the FDAT architectures registered at runtime from
 `backend\src\spandrel_custom\`, so `uv pip install` cannot break model
 loading.

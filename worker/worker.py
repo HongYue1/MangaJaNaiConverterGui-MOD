@@ -333,7 +333,7 @@ def apply_torch_perf(perf: dict) -> None:
     except Exception as exc:
         log(f"set_num_threads({tt}) ignored: {exc}", "warn")
     try:
-        torch.backends.cudnn.benchmark = bool(perf.get("cudnn_benchmark", True))
+        torch.backends.cudnn.benchmark = bool(perf.get("cudnn_benchmark", False))
         if bool(perf.get("allow_tf32", True)):
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
@@ -1015,8 +1015,8 @@ GRAY_SAMPLE = 768  # long edge of the copy the grayscale test looks at
 
 
 def gray_stats(image, threshold: float,
-               colour_permille: float = 2.5) -> tuple[bool, float, float]:
-    """(is_grayscale, mean colour excess, per-mille of clearly coloured pixels).
+               colour_percent: float = 0.25) -> tuple[bool, float, float]:
+    """(is_grayscale, mean colour excess, percent of clearly coloured pixels).
 
     Three things were wrong with the inherited test:
 
@@ -1061,9 +1061,9 @@ def gray_stats(image, threshold: float,
     mean_excess = float(excess[keep].sum()) / (kept * 3)
     spread = cv2.subtract(high, low)
     coloured = int(np.count_nonzero(np.logical_and(keep, spread > max(8, 2 * t))))
-    permille = 1000.0 * coloured / kept
-    is_gray = mean_excess <= threshold / 12 and permille <= max(0.0, colour_permille)
-    return is_gray, mean_excess, permille
+    percent = 100.0 * coloured / kept
+    is_gray = mean_excess <= threshold / 12 and percent <= max(0.0, colour_percent)
+    return is_gray, mean_excess, percent
 
 
 def to_grayscale(image):
@@ -1133,9 +1133,27 @@ def final_resize(image, scale: float, width: int, height: int, ow: int, oh: int,
     return image
 
 
+def is_long_strip(w: int, h: int, max_side: int, min_aspect: float, min_pixels: int) -> bool:
+    """True for webtoon-style mega strips that may be passed through untouched.
+
+    Adopted from the other fork's SkipLargeLong* settings, with one deliberate
+    change: the pixel clause also requires the long aspect, so an ordinary
+    large page (a 4000x2400 spread, say) is never mistaken for a strip.
+    """
+    if w <= 0 or h <= 0:
+        return False
+    aspect = max(w, h) / max(1, min(w, h))
+    if aspect < min_aspect:
+        return False
+    return max(w, h) >= max_side or (w * h) >= min_pixels
+
+
 class ModelCache:
-    def __init__(self, ctx) -> None:
+    def __init__(self, ctx, want_scale: float = 0.0) -> None:
         self.ctx = ctx
+        # Target factor for plain scale runs, 0 when the target is a width,
+        # height or display fit (there the factor depends on each page).
+        self.want_scale = float(want_scale or 0.0)
         self._cache: dict[str, Any] = {}
 
     def get(self, path: str):
@@ -1144,27 +1162,89 @@ class ModelCache:
             loaded = _load_model_node(self.ctx, Path(path))
             got = loaded[0] if isinstance(loaded, tuple) else loaded
             self._cache[path] = got
-            log(f"loaded model {Path(path).name} (x{getattr(got, 'scale', '?')})")
+            scale = getattr(got, "scale", None)
+            log(f"loaded model {Path(path).name} (x{scale if scale else '?'})")
+            # Read off the weights rather than the filename: this is the
+            # authoritative version of the warning the GUI shows from the name.
+            if scale and self.want_scale > 0 and abs(float(scale) - self.want_scale) > 0.01:
+                log(f"{Path(path).name} is x{scale} but the target is "
+                    f"{self.want_scale:g}x, so every page gets resampled to the "
+                    f"target and loses detail", "warn")
         return got
 
 
+# Upstream's default workflow shipped one MangaJaNai chain per page-height
+# band, in 2x and 4x flavours. These are those bands, copied from the original
+# default_cli_configuration.json (MaxResolution "0x1250", "0x1350", ...), as
+# (inclusive height limit, model bucket) pairs.
+GRAY_HEIGHT_BANDS: tuple[tuple[int, int], ...] = (
+    (1250, 1200),
+    (1350, 1300),
+    (1450, 1400),
+    (1550, 1500),
+    (1760, 1600),
+    (1984, 1920),
+)
+GRAY_TOP_BUCKET = 2048  # anything taller than the last band
+
+# What "auto" means for colour pages, per target scale.
+COLOUR_DEFAULTS = {
+    2: "2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16.safetensors",
+    4: "4x_IllustrationJaNai_V3denoise_FDAT_M_47k_fp16.safetensors",
+}
+
+_auto_pick_logged: set[tuple] = set()
+
+
+def gray_bucket(src_h: int) -> int:
+    """The MangaJaNai page-height bucket (1200p, 1300p, ...) for a source height."""
+    for limit, bucket in GRAY_HEIGHT_BANDS:
+        if src_h <= limit:
+            return bucket
+    return GRAY_TOP_BUCKET
+
+
 def choose_model(models: list[dict], is_gray: bool, src_h: int, target_scale: float) -> dict | None:
+    """Resolve "auto" to an installed model, the way the original fork did.
+
+    Gray pages follow upstream's height bands: a 1920px page gets the 1920p
+    model, and the 2x or 4x flavour is chosen from the target scale. Colour
+    pages get the current IllustrationJaNai denoise default for that scale.
+    Both fall back to the nearest installed match rather than failing.
+    """
     if not models:
         return None
+    want_scale = 2 if target_scale <= 2.0 else 4
     want_family = "manga" if is_gray else "illustration"
     pool = [m for m in models if m["family"] == want_family] or models
-    want_scale = 2 if target_scale <= 2.0 else 4
     scaled = [m for m in pool if m["scale"] == want_scale] or pool
+
     if is_gray:
+        bucket = gray_bucket(src_h)
         tagged = [m for m in scaled if m["height"]]
         if tagged:
-            bigger = sorted((m for m in tagged if m["height"] >= src_h), key=lambda m: m["height"])
-            if bigger:
-                return bigger[0]
-            return sorted(tagged, key=lambda m: -m["height"])[0]
-        return sorted(scaled, key=lambda m: m["name"])[0]
-    denoise = [m for m in scaled if m["denoise"]]
-    return sorted(denoise or scaled, key=lambda m: m["name"])[0]
+            pick = min(tagged, key=lambda m: (abs(m["height"] - bucket), m["height"], m["name"]))
+            why = (f"{bucket}p band for a {src_h}px page" if pick["height"] == bucket
+                   else f"{bucket}p band for a {src_h}px page, nearest installed")
+        else:
+            pick = sorted(scaled, key=lambda m: m["name"])[0]
+            why = "no height-tagged MangaJaNai model installed"
+    else:
+        wanted = COLOUR_DEFAULTS.get(want_scale, "")
+        pick = next((m for m in scaled if m["name"] == wanted), None)
+        if pick is not None:
+            why = f"default x{want_scale} colour model"
+        else:
+            denoise = [m for m in scaled if m["denoise"]]
+            pick = sorted(denoise or scaled, key=lambda m: m["name"])[0]
+            why = (f"{wanted} not installed, closest match" if wanted
+                   else "closest installed match")
+
+    key = (is_gray, want_scale, pick["name"], why)
+    if key not in _auto_pick_logged:
+        _auto_pick_logged.add(key)
+        log(f"auto {'gray' if is_gray else 'colour'} model -> {pick['name']} ({why})")
+    return pick
 
 
 def upscale_array(ctx, image, model, tile):
@@ -1584,8 +1664,8 @@ def predict_size(ow: int, oh: int, t_scale: float, t_w: int, t_h: int) -> tuple[
     return max(1, round(ow * t_scale)), max(1, round(oh * t_scale))
 
 
-def probe_image(path: Path, threshold: float, colour_permille: float):
-    """(width, height, is_gray, score, coloured per-mille) without a full decode.
+def probe_image(path: Path, threshold: float, colour_percent: float):
+    """(width, height, is_gray, score, coloured percent) without a full decode.
 
     The size comes from the header and the colour verdict from a thumbnail,
     which libvips produces with shrink-on-load, so a dry run over a folder of
@@ -1597,7 +1677,7 @@ def probe_image(path: Path, threshold: float, colour_permille: float):
     try:
         sample = pyvips.Image.thumbnail(str(path), GRAY_SAMPLE).numpy()
         if sample.ndim == 3 and sample.shape[2] >= 3:
-            gray, score, coloured = gray_stats(sample[:, :, :3], threshold, colour_permille)
+            gray, score, coloured = gray_stats(sample[:, :, :3], threshold, colour_percent)
         else:
             gray = True
     except Exception:
@@ -1665,7 +1745,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
                  sub_i=position if bundle else 0, sub_n=len(units) if bundle else 0)
             try:
                 w, h, gray, score, coloured = probe_image(
-                    src, cfg["threshold"], cfg["colour_permille"])
+                    src, cfg["threshold"], cfg["colour_percent"])
             except Exception as exc:
                 counters["failed"] += 1
                 emit("file", i=index, total=total, path=str(src), dry=True,
@@ -1743,7 +1823,7 @@ def run_job(job: dict) -> int:
     width = int(ups.get("width") or 0)
     height = int(ups.get("height") or 0)
     threshold = float(ups.get("grayscale_threshold", 12))
-    colour_permille = float(ups.get("grayscale_colour_permille", 2.5))
+    colour_percent = float(ups.get("grayscale_colour_percent", 0.25))
     do_gray = bool(ups.get("grayscale_convert", True))
     do_levels = bool(ups.get("auto_levels", True))
     pre_h = int(ups.get("pre_downscale_height") or 0)
@@ -1755,6 +1835,10 @@ def run_job(job: dict) -> int:
     io_workers = int(perf.get("io_workers") or 2)
     tile_mode, tile_fixed = parse_tile(perf.get("tile"))
     tile_label = str(perf.get("tile", "auto"))
+    skip_long = bool(ups.get("skip_long_strips", False))
+    long_max_side = int(ups.get("long_strip_max_side") or 3000)
+    long_aspect = float(ups.get("long_strip_min_aspect") or 2.8)
+    long_pixels = int(ups.get("long_strip_min_pixels") or 9_000_000)
 
     if mode == "scale":
         t_scale, t_w, t_h = scale, 0, 0
@@ -1792,7 +1876,7 @@ def run_job(job: dict) -> int:
         return dry_run(tasks, total, {
             "out_dir": out_dir, "ext": ext, "pattern": pattern, "overwrite": overwrite,
             "keep_structure": keep_structure, "threshold": threshold,
-            "colour_permille": colour_permille, "pick_model": pick_model,
+            "colour_percent": colour_percent, "pick_model": pick_model,
             "t_scale": t_scale, "t_w": t_w, "t_h": t_h, "fid": fid,
             "container": container_id, "model_count": len(models),
             "device": str(perf.get("device") or ""),
@@ -1803,7 +1887,9 @@ def run_job(job: dict) -> int:
     ctx, device, fp16 = make_context(perf)
     planner = TilePlanner(tile_mode, tile_fixed, device, fp16,
                           int(perf.get("budget_limit") or 0))
-    cache = ModelCache(ctx)
+    # Only a plain scale target has one fixed factor to compare models against;
+    # width/height/fit factors depend on each page, so no warning there.
+    cache = ModelCache(ctx, t_scale if mode == "scale" else 0.0)
 
     emit("start", total=total, out_dir=str(out_dir), device=device, fp16=fp16,
          tile=tile_label, format=fid, models=len(models), container=container_id,
@@ -1818,7 +1904,13 @@ def run_job(job: dict) -> int:
     def process_array(image, src_name: str):
         """Full single-image pipeline: (uint8 array, is_gray, model name, info)."""
         oh, ow = hwc(image)[:2]
-        gray, score, coloured = gray_stats(image, threshold, colour_permille)
+        gray, score, coloured = gray_stats(image, threshold, colour_percent)
+        if skip_long and is_long_strip(ow, oh, long_max_side, long_aspect, long_pixels):
+            log(f"{src_name}: {ow}x{oh} long strip, passed through without upscaling",
+                "warn")
+            return image, gray, "", {"w": ow, "h": oh, "src_w": ow, "src_h": oh,
+                                     "score": round(score, 2),
+                                     "colour": round(coloured, 2), "tile": 0}
         if gray and do_gray:
             image = to_grayscale(image)
         if pre_h and oh > pre_h:

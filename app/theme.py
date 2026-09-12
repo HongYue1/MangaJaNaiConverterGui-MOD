@@ -63,12 +63,27 @@ LIGHT = Palette(
 PALETTES = {"dark": DARK, "light": LIGHT}
 
 
-def pick_family() -> str:
+# Preference order for the interface face and the log face. Both lists end in
+# faces that ship with mainstream Linux desktops, so the app reads the same way
+# there as it does on Windows instead of falling back to a bitmap font.
+UI_FAMILIES = (
+    "Segoe UI Variable Text", "Segoe UI", "Inter", "SF Pro Text",
+    "Noto Sans", "Ubuntu", "Cantarell", "DejaVu Sans", "Arial",
+)
+MONO_FAMILIES = (
+    "Cascadia Mono", "Cascadia Code", "Consolas", "JetBrains Mono",
+    "SF Mono", "Liberation Mono", "DejaVu Sans Mono", "Menlo", "Courier New",
+)
+
+
+def pick_family(candidates: tuple[str, ...] = UI_FAMILIES,
+                fallback: str = "TkDefaultFont") -> str:
+    """First installed family from ``candidates``, else ``fallback``."""
     families = set(tkfont.families())
-    for name in ("Segoe UI Variable Text", "Segoe UI", "Inter", "Ubuntu", "DejaVu Sans"):
+    for name in candidates:
         if name in families:
             return name
-    return "TkDefaultFont"
+    return fallback
 
 
 class Theme:
@@ -82,15 +97,32 @@ class Theme:
         except tk.TclError:
             pass
         self.family = pick_family()
+        self.mono_family = pick_family(MONO_FAMILIES, "TkFixedFont")
+        # One ramp used everywhere: 9 for supporting text, 10 for body and the
+        # log, 11 and 15 for the two heading levels. Nothing sits at 8 any more,
+        # which was too small to read on a scaled display.
         self.fonts = {
             "body": tkfont.Font(family=self.family, size=10),
             "bold": tkfont.Font(family=self.family, size=10, weight="bold"),
             "small": tkfont.Font(family=self.family, size=9),
-            "tiny": tkfont.Font(family=self.family, size=8),
-            "title": tkfont.Font(family=self.family, size=13, weight="bold"),
+            "tiny": tkfont.Font(family=self.family, size=9),
+            "title": tkfont.Font(family=self.family, size=15, weight="bold"),
             "card": tkfont.Font(family=self.family, size=11, weight="bold"),
-            "mono": tkfont.Font(family="Consolas", size=9),
+            "mono": tkfont.Font(family=self.mono_family, size=10),
+            "mono_bold": tkfont.Font(family=self.mono_family, size=10, weight="bold"),
         }
+        # Plain tk widgets (the log text area, tooltips, menus) read the named
+        # fonts rather than a ttk style, so point those at the same faces.
+        for named, key in (("TkDefaultFont", "body"), ("TkTextFont", "body"),
+                           ("TkMenuFont", "body"), ("TkHeadingFont", "bold"),
+                           ("TkTooltipFont", "small"), ("TkFixedFont", "mono")):
+            try:
+                target = tkfont.nametofont(named, root=root)
+            except tk.TclError:
+                continue
+            src = self.fonts[key]
+            target.configure(family=src.cget("family"), size=src.cget("size"),
+                             weight=src.cget("weight"))
         self.p = PALETTES.get(mode, DARK)
         self.apply(mode)
 

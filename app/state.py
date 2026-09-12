@@ -48,10 +48,17 @@ def defaults() -> dict[str, Any]:
             "auto_levels": True,
             "grayscale_convert": True,
             "grayscale_threshold": 12,
-            # per-mille of sampled pixels that may be clearly coloured before a
+            # percent of sampled pixels that may be clearly coloured before a
             # page is treated as colour, even when the average says gray
-            "grayscale_colour_permille": 2.5,
+            "grayscale_colour_percent": 0.25,
             "pre_downscale_height": 0,
+            # webtoon-style mega strips: off by default because the adaptive
+            # tiler copes with them; when on they are copied straight through
+            # in the chosen output format instead of being upscaled
+            "skip_long_strips": False,
+            "long_strip_max_side": 3000,
+            "long_strip_min_aspect": 2.8,
+            "long_strip_min_pixels": 9000000,
         },
         "perf": {
             "device": "",
@@ -64,7 +71,10 @@ def defaults() -> dict[str, Any]:
             "torch_threads": 0,
             "io_workers": 2,
             "vips_concurrency": 0,
-            "cudnn_benchmark": True,
+            # cuDNN autotune re-benchmarks each new tile shape, and the tile
+            # planner varies tile size per page, so the cost never amortises
+            # (measured 21-23s/page on, ~17s off). Opt-in only.
+            "cudnn_benchmark": False,
             "allow_tf32": True,
             "gpu_wake_lock": True,
         },
@@ -98,6 +108,26 @@ def _merge(base: dict, patch: Any) -> dict:
     return out
 
 
+def _migrate(raw: Any) -> Any:
+    """Carry older settings files forward.
+
+    The colour-pixel guard used to be stored in per-mille and labelled with a
+    per-mille sign, which read as a stray glyph in the UI. It is a percentage
+    now, so an existing per-mille value is converted instead of dropped.
+    """
+    if not isinstance(raw, dict):
+        return raw
+    ups = raw.get("upscale")
+    if isinstance(ups, dict) and "grayscale_colour_permille" in ups:
+        old = ups.pop("grayscale_colour_permille")
+        if "grayscale_colour_percent" not in ups:
+            try:
+                ups["grayscale_colour_percent"] = round(float(old) / 10.0, 4)
+            except (TypeError, ValueError):
+                pass
+    return raw
+
+
 class Settings:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -106,7 +136,7 @@ class Settings:
     def load(self) -> "Settings":
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            self.data = _merge(defaults(), raw)
+            self.data = _merge(defaults(), _migrate(raw))
         except FileNotFoundError:
             pass
         except Exception:
