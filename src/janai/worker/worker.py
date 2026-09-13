@@ -76,31 +76,21 @@ from janai.core.formats import (
     CONTAINERS,
     FORMATS,
     merged,
-    packs_archive,
     save_kwargs,
 )
 from janai.worker.control import CTRL, Cancelled
 from janai.worker.events import emit, log
 from janai.worker.pipeline import BundleWriter, WritePool, prefetch
+from janai.worker.planning import (
+    IMAGE_EXTS,
+    build_tasks,
+    format_name,
+    gather_units,
+    natural_key,
+    resolve_out,
+    unique_path,
+)
 
-IMAGE_EXTS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".jfif",
-    ".webp",
-    ".avif",
-    ".jxl",
-    ".bmp",
-    ".tif",
-    ".tiff",
-    ".gif",
-    ".heic",
-    ".heif",
-    ".ppm",
-    ".pgm",
-}
-ARCHIVE_EXTS = {".zip", ".cbz", ".rar", ".cbr"}
 MODEL_EXTS = {".pth", ".safetensors", ".pt", ".ckpt"}
 
 _warnings_installed = False
@@ -1553,144 +1543,8 @@ def no_window() -> int:
 
 
 # --------------------------------------------------------------------------- #
-# job plumbing
-# --------------------------------------------------------------------------- #
-def natural_key(name: str):
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
-
-
-def gather_units(inp: dict) -> list[dict]:
-    raw = Path(str(inp.get("path") or "")).expanduser()
-    mode = str(inp.get("mode") or ("single" if raw.is_file() else "bulk"))
-    include_archives = bool(inp.get("include_archives", True))
-    recursive = bool(inp.get("recursive", True))
-    units: list[dict] = []
-
-    def add(p: Path, base: Path) -> None:
-        ext = p.suffix.lower()
-        if ext in IMAGE_EXTS:
-            units.append({"path": p, "base": base, "kind": "image"})
-        elif include_archives and ext in ARCHIVE_EXTS:
-            units.append({"path": p, "base": base, "kind": "archive"})
-
-    if raw.is_file():
-        add(raw, raw.parent)
-    elif raw.is_dir():
-        it = raw.rglob("*") if recursive else raw.glob("*")
-        for p in sorted(
-            (q for q in it if q.is_file()),
-            key=lambda q: (str(q.parent).lower(), natural_key(q.name)),
-        ):
-            add(p, raw)
-    else:
-        raise FileNotFoundError(f"input not found: {raw}")
-    if mode == "single" and len(units) > 1:
-        units = units[:1]
-    return units
-
-
-def format_name(pattern: str, src: Path, index: int, total: int) -> str:
-    width = max(3, len(str(total)))
-    out = pattern or "{name}"
-    repl = {
-        "{name}": src.stem,
-        "{parent}": src.parent.name,
-        "{index}": str(index),
-        "{index0}": str(index).zfill(width),
-    }
-    for key, value in repl.items():
-        out = out.replace(key, value)
-    return re.sub(r'[<>:"/\\|?*]', "_", out).strip() or src.stem
-
-
-def resolve_out(
-    unit: dict, out_dir: Path, pattern: str, ext: str, keep_structure: bool, index: int, total: int
-) -> Path:
-    src: Path = unit["path"]
-    base: Path = unit["base"]
-    sub = Path()
-    if keep_structure:
-        try:
-            sub = src.parent.relative_to(base)
-        except ValueError:
-            sub = Path()
-    return out_dir / sub / (format_name(pattern, src, index, total) + ext)
-
-
-def unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    stem, suffix = path.stem, path.suffix
-    for n in range(1, 10000):
-        cand = path.with_name(f"{stem} ({n}){suffix}")
-        if not cand.exists():
-            return cand
-    return path
-
-
-# --------------------------------------------------------------------------- #
 # job execution
 # --------------------------------------------------------------------------- #
-def safe_name(name: Any) -> str:
-    return re.sub(r'[<>:"/\\|?*]', "_", str(name)).strip() or "output"
-
-
-def relative_dir(unit: dict) -> Path:
-    """Where this file sits inside the input folder."""
-    try:
-        return unit["path"].parent.relative_to(unit["base"])
-    except ValueError:
-        return Path()
-
-
-def chapter_dest(unit: dict, out_dir: Path, keep_structure: bool) -> Path:
-    """The .cbz that this file's own folder becomes."""
-    rel = relative_dir(unit)
-    name = rel.name or Path(str(unit["base"])).name or unit["path"].stem
-    parent = out_dir / (rel.parent if keep_structure else Path())
-    return parent / f"{safe_name(name)}.cbz"
-
-
-def build_tasks(
-    units: list[dict], out_dir: Path, keep_structure: bool, container_id: str
-) -> list[dict]:
-    """Group the units into the things this run will actually produce.
-
-    Loose images stay in one run of consecutive units so the decoder can read
-    ahead across the whole batch. With a cbz container they are grouped by the
-    folder they came from instead, which is what turns "one folder per chapter"
-    into one archive per chapter.
-    """
-    pack = packs_archive(container_id)
-    tasks: list[dict] = []
-    groups: dict[str, dict] = {}
-    for index, unit in enumerate(units, 1):
-        unit["index"] = index
-        if unit["kind"] == "archive":
-            tasks.append({"kind": "archive", "unit": unit})
-            continue
-        if not pack:
-            if tasks and tasks[-1]["kind"] == "images":
-                tasks[-1]["units"].append(unit)
-            else:
-                tasks.append({"kind": "images", "key": "", "dest": None, "units": [unit]})
-            continue
-        key = "" if container_id == "cbz_single" else relative_dir(unit).as_posix()
-        group = groups.get(key)
-        if group is None:
-            if container_id == "cbz_single":
-                base = Path(str(unit["base"]))
-                stem = base.name if base.is_dir() else unit["path"].stem
-                dest = out_dir / f"{safe_name(stem)}.cbz"
-            else:
-                dest = chapter_dest(unit, out_dir, keep_structure)
-            group = {"kind": "bundle", "key": key, "dest": dest, "units": []}
-            groups[key] = group
-            tasks.append(group)
-        group["units"].append(unit)
-    return tasks
-
-
 def predict_size(ow: int, oh: int, t_scale: float, t_w: int, t_h: int) -> tuple[int, int]:
     """The size final_resize() lands on, without touching a pixel."""
     if t_w and t_h:  # fit: whichever side runs out first wins
