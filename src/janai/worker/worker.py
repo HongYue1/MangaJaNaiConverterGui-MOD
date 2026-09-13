@@ -81,6 +81,7 @@ from janai.core.formats import (
     packs_archive,
     save_kwargs,
 )
+from janai.worker.events import emit, log
 
 IMAGE_EXTS = {
     ".png",
@@ -101,27 +102,6 @@ IMAGE_EXTS = {
 }
 ARCHIVE_EXTS = {".zip", ".cbz", ".rar", ".cbr"}
 MODEL_EXTS = {".pth", ".safetensors", ".pt", ".ckpt"}
-
-_stdout_lock = threading.Lock()
-
-
-# --------------------------------------------------------------------------- #
-# events
-# --------------------------------------------------------------------------- #
-def emit(kind: str, **payload: Any) -> None:
-    payload["type"] = kind
-    try:
-        line = json.dumps(payload, ensure_ascii=False, default=str)
-    except Exception:  # pragma: no cover - defensive
-        line = json.dumps({"type": "log", "level": "warn", "message": "unserialisable event"})
-    with _stdout_lock:
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
-
-
-def log(message: Any, level: str = "info") -> None:
-    emit("log", level=level, message=str(message))
-
 
 _warnings_installed = False
 
