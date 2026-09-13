@@ -101,6 +101,10 @@ def defaults() -> dict[str, Any]:
             "geometry": "",
         },
         "probe": None,
+        # What the one-off hardware profile measured, and the fingerprint of
+        # the machine it was measured on. None means never profiled, which is
+        # what makes a first run offer to measure rather than guess.
+        "profile": None,
     }
 
 
@@ -111,7 +115,7 @@ def _merge(base: dict, patch: Any) -> dict:
     for key, value in patch.items():
         if key in out and isinstance(out[key], dict) and isinstance(value, dict):
             out[key] = _merge(out[key], value)
-        elif key in out or key == "probe":
+        elif key in out or key in ("probe", "profile"):
             out[key] = value
     return out
 

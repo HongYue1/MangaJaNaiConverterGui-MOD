@@ -510,6 +510,111 @@ def check_geometry_clamp(window: MainWindow, app: QApplication) -> None:
     pump(app)
 
 
+def check_profile(window: MainWindow, app: QApplication) -> None:
+    """The one-off measurement: offered when missing, refused when it is stale.
+
+    Hardware is described here rather than taken from the machine running the
+    checks, so the same assertions hold on a CI box with no GPU.
+    """
+    from janai.core import hardware
+
+    print()
+    print("hardware profile")
+    was_profile, was_probe = window.profile, window.probe
+
+    window.profile = {}
+    window.render_profile()
+    pump(app)
+    check(
+        "an unmeasured machine says so",
+        "not measured" in window.lbl_profile.text(),
+        window.lbl_profile.text(),
+    )
+    check("nothing measured is handed to a run", window.profile_for_run() == {})
+
+    gpu = {"value": "cuda:0", "label": "Test GPU 9000 (cuda:0)", "vram": 6 * 1024**3}
+    here = {
+        "devices": [{"value": "cpu", "label": "CPU"}, gpu],
+        "torch": "2.6.0",
+        "cuda": "12.4",
+    }
+    elsewhere = dict(here, devices=[dict(gpu, label="Other GPU (cuda:0)")])
+    mine = {
+        "version": hardware.PROFILE_VERSION,
+        "fingerprint": hardware.fingerprint(here),
+        "fp16": True,
+        "created": "2026-01-01T00:00:00",
+        "hardware": {"name": "Test GPU 9000"},
+        "models": {
+            "m.safetensors": {
+                "per_px": 12.5,
+                "fixed_bytes": 900 * 1024**2,
+                "max_pixels": 5_000_000,
+                "best_tile": 1152,
+            }
+        },
+    }
+
+    window.probe, window.profile = here, mine
+    window.chk_fp16.setChecked(True)
+    check("a profile for this machine is used", bool(window.profile_for_run()))
+    window.render_profile()
+    pump(app)
+    check(
+        "it reports the fastest tile measured",
+        "1152px" in window.lbl_profile.text(),
+        window.lbl_profile.text(),
+    )
+
+    window.probe = elsewhere
+    check("a profile from other hardware is refused", window.profile_for_run() == {})
+    window.render_profile()
+    pump(app)
+    check(
+        "and it says so rather than going quiet",
+        "not in use" in window.lbl_profile.text(),
+        window.lbl_profile.text(),
+    )
+
+    window.probe = here
+    window.chk_fp16.setChecked(False)
+    check("the other precision is refused", window.profile_for_run() == {})
+    window.chk_fp16.setChecked(True)
+    check(
+        "an older profile version is refused",
+        window.__setattr__("profile", dict(mine, version=hardware.PROFILE_VERSION + 1)) is None
+        and window.profile_for_run() == {},
+    )
+
+    window.profile = {}
+    window.on_profile({"type": "profile", "ok": True, "elapsed": 42.0, "profile": mine})
+    pump(app)
+    check(
+        "a finished measurement is stored",
+        bool(hardware.profile_models(window.settings.data.get("profile"))),
+    )
+    check("the control then offers a re-measure", window.btn_profile.text() == "Measure again")
+
+    window._profiling = True
+    window.btn_profile.setEnabled(False)
+    window.on_exit({"type": "exit", "code": 0})
+    pump(app)
+    check("a worker that leaves quietly cannot strand the control", window.btn_profile.isEnabled())
+
+    window.profile, window._profile_offered = {}, False
+    window.models = [{"name": "m.safetensors", "path": "m.safetensors", "scale": 4}]
+    window.devices = here["devices"]
+    window.offer_profile()
+    offered = window._profile_offered
+    window.offer_profile()
+    check("a first run is offered the measurement once", offered and window._profile_offered)
+    check("only installed models are measured", window.profile_model_paths() == ["m.safetensors"])
+
+    window.profile, window.probe = was_profile, was_probe
+    window.render_profile()
+    pump(app)
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
 
@@ -552,6 +657,7 @@ def main() -> int:
         check_page_kind(window, app)
         check_row_numbers(window)
         check_geometry_clamp(window, app)
+        check_profile(window, app)
 
         window.close()
         pump(app)

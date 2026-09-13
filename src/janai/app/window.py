@@ -68,7 +68,7 @@ from janai.app.widgets import (
     spin_float,
     spin_int,
 )
-from janai.core import displays, presets, rules
+from janai.core import displays, hardware, presets, rules
 from janai.core.formats import (
     CONTAINER_IDS,
     CONTAINERS,
@@ -197,6 +197,14 @@ class MainWindow(QMainWindow):
         self.models: list = self.probe.get("models", []) or []
         self.devices: list = self.probe.get("devices", []) or []
 
+        # What this machine measured about itself, if it ever has. It sits
+        # next to the probe because it answers the same question - what the
+        # hardware can do - only by measurement rather than by asking.
+        stored = self.settings.data.get("profile") or {}
+        self.profile: dict = stored if isinstance(stored, dict) else {}
+        self._profiling = False
+        self._profile_offered = False
+
         self.total = 0
         self.completed = 0
         self.failed = 0
@@ -231,6 +239,7 @@ class MainWindow(QMainWindow):
         self.render_rules()
         self.update_start_state()
         self.update_wake_lock()
+        self.render_profile()
 
         self._timer = QTimer(self)
         self._timer.setInterval(90)
@@ -850,6 +859,25 @@ class MainWindow(QMainWindow):
             ),
         )
         body.field("Tile size", "Splits large images so they fit in VRAM.", self.cb_tile)
+
+        self.btn_profile = button(
+            "Measure this machine",
+            self.on_profile_clicked,
+            tip=(
+                "Runs each installed model over a ladder of tile sizes and records what "
+                "it costs and how fast it is. Auto then sizes the first page from "
+                "measurements instead of holding it at 1024px, and a tile this card "
+                "has already refused is never planned again. Writes no images, and is "
+                "only needed once per machine."
+            ),
+        )
+        body.field(
+            "Hardware profile",
+            "Measured once per machine, then reused.",
+            row(self.btn_profile),
+        )
+        self.lbl_profile = label("", "hint", wrap=True)
+        body.control(self.lbl_profile)
 
         self.sp_budget = spin_int(
             0,
@@ -1903,6 +1931,192 @@ class MainWindow(QMainWindow):
             self.log(f"GPU wake lock unavailable: {event.get('error', 'unknown reason')}", "warn")
 
     # ------------------------------------------------------------------ #
+    # hardware profile
+    # ------------------------------------------------------------------ #
+    def profile_for_run(self) -> dict:
+        """The measurements this run may use, or ``{}`` to plan cautiously."""
+        return hardware.profile_for_run(self.profile, self.probe, self.chk_fp16.isChecked())
+
+    def profile_model_paths(self) -> list[str]:
+        """The models this table would actually run.
+
+        What gets measured is per model, so measuring a model no rule names
+        buys nothing. Measured on a real machine: picking one model per scale
+        chose the file that sorts first at 4x, while the table ran a different
+        4x file, so every page still fell back to the cautious first-page tile
+        and the measurement bought nothing at all.
+
+        So: one model per way a page can be routed - grayscale or colour, at
+        each factor - taken from the rules that are switched on. Then one per
+        factor the rules never mention, so a table of only 2x rows still
+        learns something about a 4x file. Capped, because every model costs a
+        ladder of real passes.
+        """
+        by_name: dict[str, str] = {}
+        scale_of: dict[str, Any] = {}
+        for entry in self.models:
+            if isinstance(entry, dict) and entry.get("path"):
+                by_name[str(entry.get("name"))] = str(entry["path"])
+                scale_of[str(entry["path"])] = entry.get("scale")
+        routes: dict[tuple[str, int], str] = {}
+        for rule in self.rules:
+            if not rule.enabled or rule.action == rules.PASSTHROUGH or rule.is_auto:
+                continue
+            path = by_name.get(rule.model)
+            if not path:
+                continue
+            factor = rules.bucket_scale(rule.scale or rules.model_scale(rule.model))
+            routes.setdefault((rule.kind, factor), path)
+        paths: list[str] = []
+        for path in routes.values():
+            if path not in paths:
+                paths.append(path)
+        covered = {scale_of.get(path) for path in paths}
+        for entry in self.models:
+            if not (isinstance(entry, dict) and entry.get("path")):
+                continue
+            if entry.get("scale") in covered:
+                continue
+            covered.add(entry.get("scale"))
+            paths.append(str(entry["path"]))
+        # Four is the number of routes a page can take (grayscale/colour at
+        # 2x/4x); past that the wait stops being worth the measurement.
+        return paths[:4]
+
+    def build_profile_job(self) -> dict:
+        """A job that measures this machine and converts nothing.
+
+        Only ``perf`` matters here: there is no input, output or format,
+        because nothing is written. The models come from the probe, and the
+        fingerprint records which machine the numbers belong to so they are
+        dropped rather than trusted once it changes.
+        """
+        self.sync_settings()
+        perf = dict(self.settings.data["perf"])
+        perf["profile"] = None
+        return {
+            "perf": perf,
+            "models": self.profile_model_paths(),
+            "fingerprint": hardware.fingerprint(self.probe),
+        }
+
+    def on_profile_clicked(self) -> None:
+        if self.runner.running:
+            self.log("something is already running, so the measurement has to wait", "warn")
+            return
+        job = self.build_profile_job()
+        if not job["models"]:
+            self.show_banner("No models are installed, so there is nothing to measure.")
+            return
+        self._profiling = True
+        self.btn_profile.setEnabled(False)
+        self.lbl_profile.setText("measuring\u2026")
+        self.started_at = time.time()
+        self.log("measuring this machine - no images are written")
+        if not self.runner.start_profile(job):
+            self._profiling = False
+            self.btn_profile.setEnabled(True)
+            self.render_profile()
+            self.log("the worker would not start", "error")
+            return
+        self.update_start_state()
+
+    def on_profile_progress(self, event: dict) -> None:
+        """One line per step, in the panel rather than the log.
+
+        The worker reports each step twice: once on the way in, which is what
+        the label follows, and once on the way out carrying the result.
+        """
+        index = int(event.get("index") or 0)
+        total = max(1, int(event.get("total") or 1))
+        name = str(event.get("model") or "")
+        tile = int(event.get("tile") or 0)
+        if "ok" not in event:
+            self.lbl_profile.setText(f"measuring {index}/{total}: {name} at {tile}px")
+        elif not event.get("ok"):
+            self.log(f"{name}: {tile}px did not fit, so that is the ceiling", "debug")
+
+    def on_profile(self, event: dict) -> None:
+        self._profiling = False
+        self.btn_profile.setEnabled(True)
+        profile = event.get("profile")
+        if not event.get("ok") or not isinstance(profile, dict):
+            reason = "cancelled" if event.get("cancelled") else ""
+            reason = reason or str(event.get("error") or "nothing could be measured")
+            self.log(f"the measurement did not finish: {reason}", "warn")
+            self.render_profile()
+            return
+        self.profile = profile
+        self.settings.data["profile"] = profile
+        self.settings.save()
+        count = len(hardware.profile_models(profile))
+        elapsed = fmt_secs(float(event.get("elapsed") or 0.0))
+        self.log(
+            f"measured {count} model(s) in {elapsed} \u2014 Auto now sizes tiles from this",
+            "ok",
+        )
+        self.render_profile()
+        self.update_summary()
+
+    def render_profile(self) -> None:
+        """Say what the measurements know, and whether they still apply."""
+        models = hardware.profile_models(self.profile)
+        if not models:
+            self.btn_profile.setText("Measure this machine")
+            self.lbl_profile.setText(
+                "not measured \u2014 Auto holds the first page of an unseen model at "
+                "1024px until it has measured it"
+            )
+            return
+        if not hardware.profile_is_current(self.profile, self.probe):
+            self.btn_profile.setText("Measure this machine")
+            was = str((self.profile.get("hardware") or {}).get("name") or "another machine")
+            self.lbl_profile.setText(
+                f"measured on {was}, which is not what is here now \u2014 not in use"
+            )
+            return
+        self.btn_profile.setText("Measure again")
+        best = max(
+            (int(e.get("best_tile") or 0) for e in models.values() if isinstance(e, dict)),
+            default=0,
+        )
+        bits = [f"{len(models)} model(s) measured"]
+        if best:
+            bits.append(f"fastest tile {best}px")
+        created = str(self.profile.get("created") or "")[:10]
+        if created:
+            bits.append(created)
+        self.lbl_profile.setText("   \u00b7   ".join(bits))
+
+    def offer_profile(self) -> None:
+        """A first run, or new hardware: say so once, and never block on it."""
+        if self._profile_offered or self._profiling or not self.models:
+            return
+        if hardware.profile_is_current(self.profile, self.probe):
+            return
+        gpus = [d for d in self.devices if isinstance(d, dict) and str(d.get("value")) != "cpu"]
+        if not gpus:
+            # Nothing to size against: the CPU path has no VRAM budget.
+            return
+        self._profile_offered = True
+        what = (
+            "The hardware changed since the last measurement"
+            if hardware.profile_models(self.profile)
+            else "This machine has not been measured yet"
+        )
+        press = self.btn_profile.text()
+        self.log(
+            f"{what}. Open Performance and press \u201c{press}\u201d so Auto can size"
+            " tiles from measurements instead of a cautious guess.",
+            "warn",
+        )
+        if not (self.probe.get("errors") or []):
+            self.show_banner(
+                f"{what}. Performance \u203a Hardware profile \u2192 \u201c{press}\u201d"
+                " measures it once, in about a minute, and writes no images."
+            )
+
+    # ------------------------------------------------------------------ #
     # probe
     # ------------------------------------------------------------------ #
     def refresh_probe(self) -> None:
@@ -1953,6 +2167,11 @@ class MainWindow(QMainWindow):
         self.update_summary()
         self.update_start_state()
         self.update_wake_lock()
+        self.render_profile()
+        if not cached:
+            # Only meaningful once the real probe has arrived: a cached probe
+            # cannot tell whether the hardware changed underneath it.
+            self.offer_profile()
 
     def _refresh_device_list(self) -> None:
         """Refill the device picker, keeping the current choice selected."""
@@ -2106,6 +2325,10 @@ class MainWindow(QMainWindow):
         elif kind == "bundle":
             text, level = format_bundle(event)
             self.log(text, level)
+        elif kind == "profile":
+            self.on_profile(event)
+        elif kind == "profile_progress":
+            self.on_profile_progress(event)
         elif kind == "log":
             self.log(str(event.get("message", "")), str(event.get("level", "info")))
         elif kind == "done":
@@ -2214,6 +2437,12 @@ class MainWindow(QMainWindow):
     def on_exit(self, event: dict) -> None:
         self.update_start_state()
         self.update_wake_lock()
+        if self._profiling:
+            # The worker left without reporting. Whatever went wrong, the
+            # control must not be left dead.
+            self._profiling = False
+            self.btn_profile.setEnabled(True)
+            self.render_profile()
         if int(event.get("code") or 0) not in (0, 1, 2):
             self.lbl_status.setText("Worker stopped unexpectedly")
             self.log(f"worker exited with code {event.get('code')}", "error")
@@ -2328,7 +2557,9 @@ class MainWindow(QMainWindow):
             },
             "format": {"id": fid, "options": d["format"]["options"][fid]},
             "upscale": dict(d["upscale"], models_dir=str(self.runner.paths().models_dir or "")),
-            "perf": d["perf"],
+            # Measurements taken on this machine, in this precision - or {},
+            # which leaves the worker on its cautious first-page path.
+            "perf": dict(d["perf"], profile=self.profile_for_run()),
         }
         if dry:
             job["dry_run"] = True

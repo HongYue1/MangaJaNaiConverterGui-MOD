@@ -216,7 +216,8 @@ class Runner:
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, job: dict) -> bool:
+    def start(self, job: dict, extra: tuple[str, ...] = ()) -> bool:
+        """Run a job. ``extra`` adds worker flags, e.g. ``("--profile",)``."""
         with self._lock:
             if self.running:
                 return False
@@ -224,6 +225,7 @@ class Runner:
             tmp.write_text(json.dumps(job, indent=2), encoding="utf-8")
             self._job_file = tmp
             cmd = [str(self.python_exe()), str(self.worker_script()), "--job", str(tmp)]
+            cmd += [str(flag) for flag in extra]
             try:
                 self.proc = subprocess.Popen(
                     cmd,
@@ -256,6 +258,15 @@ class Runner:
         threading.Thread(target=self._read_stdout, name="worker-out", daemon=True).start()
         threading.Thread(target=self._read_stderr, name="worker-err", daemon=True).start()
         return True
+
+    def start_profile(self, job: dict) -> bool:
+        """Measure this machine instead of converting anything.
+
+        Deliberately the same process slot as a real job: profiling owns the
+        GPU while it runs, so Start has to be unavailable for the duration and
+        Cancel has to reach it. Both fall out of ``running``.
+        """
+        return self.start(job, ("--profile",))
 
     def _read_stdout(self) -> None:
         proc = self.proc
