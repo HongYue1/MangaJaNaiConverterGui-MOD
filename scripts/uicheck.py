@@ -8,7 +8,10 @@ all three have regressed at least once:
   first and hands the page the gesture once it reaches either end;
 * every rules column must be fully inside the table, with the scrollbar
   outside the cells rather than on top of the last one;
-* checkbuttons must draw a real indicator rather than a missing-glyph box.
+* checkbuttons must draw a real indicator rather than a missing-glyph box, and
+  the fonts must come straight from the ramp - Tk already multiplies every
+  point size by the display's scaling, so a second factor in the theme made
+  the text roughly twice too big.
 
 Run it with the bundled interpreter:
 
@@ -30,7 +33,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 os.environ.setdefault("JANAI_SMOKE", "1")
 
-from janai.app.theme import Theme
+from janai.app.theme import BASE_SIZES, Theme
 from janai.app.ui import App
 from janai.app.widgets import WHEEL_EVENTS, ScrollArea, Table
 
@@ -192,7 +195,12 @@ def main() -> int:
         f"= {body.metrics('linespace')}px · rowheight {style.lookup('Rules.Treeview', 'rowheight')}"
     )
     check(
-        body.metrics("linespace") >= 17, "body text is readable", f"{body.metrics('linespace')}px"
+        body.cget("size") == BASE_SIZES["body"],
+        "body font is the ramp, not scaled twice",
+        f"{body.cget('size')}pt vs ramp {BASE_SIZES['body']}pt",
+    )
+    check(
+        body.metrics("linespace") >= 15, "body text is readable", f"{body.metrics('linespace')}px"
     )
     rowheight = int(style.lookup("Rules.Treeview", "rowheight") or 0)
     check(
