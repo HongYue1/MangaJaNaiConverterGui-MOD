@@ -25,24 +25,23 @@ job, streams its events, and can cancel it.
 
 ## Stale-brief warning (read before planning a refactor)
 
-Older task briefs and `backend/src/README.md` describe a design this repo no
-longer uses. Verified as of this commit:
+Older task briefs describe a design this repo no longer uses. Verified against
+the tree:
 
-- **`backend/src/run_upscale.py` (1943 lines) is unreachable.** No entry point,
-  launcher, setup script or workflow invokes it; the only thing CI does with it
-  is `python -m compileall -q backend/src`. It is chaiNNer-era legacy kept next
-  to the vendored backend it was written against.
-- **`PROGRESS=…` and `TOTALZIP=…` are not the wire format.** Those strings exist
-  only inside `run_upscale.py`. The live protocol is JSON Lines (below).
+- **`PROGRESS=…` and `TOTALZIP=…` are not the wire format.** They appear nowhere
+  in the live app. The protocol is JSON Lines (below).
 - **`PipelineQueue`, `put_sentinel()`, `consumer_exited()` and
-  `PipelineConsumerGone` exist only in `run_upscale.py`.** The live worker
-  expresses the same "never hang a job" requirement with different primitives
-  (`prefetch()`, `WritePool`, `BundleWriter`, `Control`) — documented below.
+  `PipelineConsumerGone` do not exist here.** The live worker expresses the same
+  "never hang a job" requirement with different primitives (`prefetch()`,
+  `WritePool`, `BundleWriter`, `Control`) — documented below.
+- Both belonged to `backend/src/run_upscale.py`, the chaiNNer-era CLI that had no
+  caller left: no entry point, launcher, setup script or workflow invoked it, and
+  CI only byte-compiled it. **It was deleted** rather than kept as a misleading
+  second copy of the pipeline; recover it from git history if ever needed.
 
 So: do not "restore" the old protocol or the old pipeline classes into
-`src/janai/`, and do not treat `run_upscale.py` as the monolith to split. The
-real large files are `src/janai/worker/worker.py` (3264 lines) and
-`src/janai/app/window.py` (2764 lines).
+`src/janai/`. The real large files are `src/janai/worker/worker.py` (3264 lines)
+and `src/janai/app/window.py` (2764 lines).
 
 ## Architecture map
 
@@ -82,7 +81,7 @@ scripts/                   the project's own harnesses (see Verification)
 backend/
   python/                  the interpreter and its packages (uv venv) — gitignored, per machine
   models/                  model weights — gitignored
-  src/                     vendored chaiNNer-derived backend the worker imports (plus legacy run_upscale.py)
+  src/                     vendored chaiNNer-derived backend the worker imports
   ImageMagick/, tools/, resources/
 ```
 
@@ -252,8 +251,7 @@ There is no type checker configured yet.
   They are not repo content; never commit them, never assume a fresh clone has
   them.
 - **`setup.sh` refuses to run if `backend/src` is missing** — the worker imports
-  the vendored backend from there, so it is not optional even though
-  `run_upscale.py` inside it is dead.
+  the vendored backend from there, so it is not optional.
 - **`sanic==24.6.0` is in `requirements.txt` only because vendored backend
   modules import `sanic.log`.** It is not a web server here.
 - **ruff excludes `backend/`, `logs/` and `.tmp/`** (`pyproject.toml`); vendored
