@@ -34,7 +34,6 @@ import math
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -61,7 +60,7 @@ from janai.core.formats import (
     merged,
     save_kwargs,
 )
-from janai.worker import devices, runtime
+from janai.worker import capabilities, devices, runtime
 from janai.worker.control import CTRL, Cancelled
 
 # Importing environment resolves the install layout, puts the vendored backend
@@ -666,48 +665,15 @@ class TilePlanner:
 
 
 # --------------------------------------------------------------------------- #
-# encoder + tool capability probe
+# encoder capability probe
 # --------------------------------------------------------------------------- #
-def vips_has(op: str) -> bool:
-    try:
-        return bool(pyvips.type_find("VipsOperation", op))
-    except Exception:
-        return False
-
-
-def find_tool(name: str) -> str:
-    """A tool bundled in the tools folder, else whatever PATH offers."""
-    if PATHS.tools_dir:
-        for cand in (PATHS.tools_dir / f"{name}.exe", PATHS.tools_dir / name):
-            if cand.is_file():
-                return str(cand)
-    return shutil.which(name) or ""
-
-
-def find_cjxl() -> str:
-    return find_tool("cjxl")
-
-
-def find_djxl() -> str:
-    return find_tool("djxl")
-
-
-def pillow_jxl_available() -> bool:
-    try:
-        import pillow_jxl  # noqa: F401
-
-        return True
-    except Exception:
-        return False
-
-
 def encode_capabilities() -> dict:
     """What this install can really write, checked by encoding a 1x1 image."""
     caps: dict[str, dict] = {}
     probe = np.zeros((1, 1), dtype=np.uint8)
     for fid, spec in FORMATS.items():
         entry = {"ok": False, "via": "", "reason": ""}
-        if vips_has(spec.probe):
+        if capabilities.vips_has(spec.probe):
             try:
                 vips_from_array(probe).write_to_buffer(spec.suffix)
                 entry.update(ok=True, via="libvips")
@@ -716,9 +682,9 @@ def encode_capabilities() -> dict:
         else:
             entry["reason"] = f"libvips has no {spec.probe}"
         if not entry["ok"] and fid == "jxl":
-            if pillow_jxl_available():
+            if capabilities.pillow_jxl_available():
                 entry.update(ok=True, via="pillow-jxl", reason="")
-            elif find_cjxl():
+            elif capabilities.find_cjxl():
                 entry.update(ok=True, via="cjxl", reason="")
         caps[fid] = entry
     return caps
@@ -797,11 +763,11 @@ def do_probe(models_dir: Path) -> int:
     gpu = next((d for d in info["devices"] if d["value"] != "cpu"), None)
     info["default_device"] = gpu["value"] if gpu else "cpu"
     info["formats"] = encode_capabilities()
-    info["read_jxl"] = vips_has("jxlload") or bool(find_djxl())
-    info["read_heif"] = vips_has("heifload")
+    info["read_jxl"] = capabilities.vips_has("jxlload") or bool(capabilities.find_djxl())
+    info["read_heif"] = capabilities.vips_has("heifload")
     info["models"] = list_models(models_dir)
     info["icc"] = PATHS.icc() is not None
-    info["tools"] = {name: find_tool(name) for name in ("cjxl", "djxl")}
+    info["tools"] = {name: capabilities.find_tool(name) for name in ("cjxl", "djxl")}
     try:
         import rarfile
 
@@ -834,7 +800,7 @@ def vips_from_array(arr):
 
 
 def read_image(path: Path):
-    if path.suffix.lower() == ".jxl" and not vips_has("jxlload"):
+    if path.suffix.lower() == ".jxl" and not capabilities.vips_has("jxlload"):
         return read_jxl_djxl(path)
     return (
         pyvips.Image.new_from_file(str(path), access="sequential", fail=True)
@@ -844,7 +810,7 @@ def read_image(path: Path):
 
 
 def read_image_bytes(data: bytes, name: str = ""):
-    if name.lower().endswith(".jxl") and not vips_has("jxlload"):
+    if name.lower().endswith(".jxl") and not capabilities.vips_has("jxlload"):
         with tempfile.TemporaryDirectory(prefix="janai-jxl-") as td:
             src = Path(td) / "in.jxl"
             src.write_bytes(data)
@@ -854,7 +820,7 @@ def read_image_bytes(data: bytes, name: str = ""):
 
 def read_jxl_djxl(path: Path):
     """Decode JPEG XL through djxl, for a libvips built without jxlload."""
-    exe = find_djxl()
+    exe = capabilities.find_djxl()
     if not exe:
         raise RuntimeError(
             "this libvips cannot read JPEG XL; put djxl.exe in the tools folder "
@@ -1245,7 +1211,7 @@ def encode_jxl_pillow(image, opts: dict) -> bytes:
 
 
 def encode_jxl_cjxl(image, opts: dict) -> bytes:
-    exe = find_cjxl()
+    exe = capabilities.find_cjxl()
     if not exe:
         raise RuntimeError("cjxl not found")
     vals = merged("jxl", opts)
