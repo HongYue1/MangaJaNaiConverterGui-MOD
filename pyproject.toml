@@ -119,10 +119,13 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# The worker resolves sys.path before it can import anything of its own, so its
-# imports legitimately follow executable statements.
-# `Cancelled` is control flow rather than an error, so it keeps its name.
-"src/janai/worker/worker.py" = ["E402", "N818"]
+# The worker CLI resolves sys.path before it can import anything of its own, so
+# its imports legitimately follow executable statements. Only the entry file
+# does this; the modules it imports are ordinary modules.
+"src/janai/worker/worker.py" = ["E402"]
+# `Cancelled` is control flow rather than an error, so it keeps its name. The
+# ignore lives with the class, not with whoever imports it.
+"src/janai/worker/control.py" = ["N818"]
 # Same for the dev scripts, which run straight from a checkout.
 "scripts/*.py" = ["E402", "T201"]
 # Qt's own API is camelCase, so the methods that override it are camelCase too.

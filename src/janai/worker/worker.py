@@ -81,6 +81,7 @@ from janai.core.formats import (
     packs_archive,
     save_kwargs,
 )
+from janai.worker.control import CTRL, Cancelled
 from janai.worker.events import emit, log
 
 IMAGE_EXTS = {
@@ -139,75 +140,6 @@ def hwc(image: Any) -> tuple[int, int, int]:
     if image.ndim == 2:
         return int(image.shape[0]), int(image.shape[1]), 1
     return int(image.shape[0]), int(image.shape[1]), int(image.shape[2])
-
-
-class Control:
-    """Cancel/pause flags fed by stdin, mirrored into the backend progress token."""
-
-    def __init__(self) -> None:
-        self._cancel = threading.Event()
-        self._pause = threading.Event()
-        self.progress = None  # backend ProgressController, attached later
-
-    def start(self) -> None:
-        threading.Thread(target=self._pump, name="stdin", daemon=True).start()
-
-    def _pump(self) -> None:
-        try:
-            for raw in sys.stdin:
-                cmd = raw.strip().lower()
-                if not cmd:
-                    continue
-                if cmd in ("cancel", "abort", "stop"):
-                    self.cancel()
-                elif cmd == "pause":
-                    self.pause()
-                elif cmd == "resume":
-                    self.resume()
-        except Exception:
-            pass
-
-    def cancel(self) -> None:
-        self._cancel.set()
-        self._pause.clear()
-        self._call("abort")
-        self._call("resume")
-
-    def pause(self) -> None:
-        self._pause.set()
-        self._call("pause")
-
-    def resume(self) -> None:
-        self._pause.clear()
-        self._call("resume")
-
-    def _call(self, name: str) -> None:
-        fn = getattr(self.progress, name, None)
-        if callable(fn):
-            try:
-                fn()
-            except Exception:
-                pass
-
-    @property
-    def cancelled(self) -> bool:
-        return self._cancel.is_set()
-
-    @property
-    def paused(self) -> bool:
-        return self._pause.is_set()
-
-    def gate(self) -> None:
-        """Block while paused; returns immediately when cancelled."""
-        while self._pause.is_set() and not self._cancel.is_set():
-            time.sleep(0.05)
-
-
-CTRL = Control()
-
-
-class Cancelled(Exception):
-    pass
 
 
 # --------------------------------------------------------------------------- #
