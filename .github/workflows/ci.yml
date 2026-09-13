@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  check:
-    # The app is Windows-only, so the checks run where it actually ships.
-    runs-on: windows-latest
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -17,11 +17,37 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Byte-compile the interface, worker and tools
-        run: python -m compileall -q app common worker tools
+      # Pinned so a new ruff release cannot fail an unrelated pull request.
+      - name: Install ruff
+        run: pip install ruff==0.16.7
+
+      - name: Check formatting
+        run: ruff format --check --diff .
+
+      - name: Lint
+        run: ruff check --output-format=github .
+
+  check:
+    # Packaging is Windows-first, but the engine has to keep working on Linux,
+    # so the import-level checks run on both.
+    name: compile and smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Byte-compile the app, worker and scripts
+        run: python -m compileall -q src scripts
 
       - name: Byte-compile the upscaling backend
         run: python -m compileall -q backend/src
 
       - name: Smoke-test the dependency-free modules
-        run: python tools/smoke.py
+        run: python scripts/smoke.py
