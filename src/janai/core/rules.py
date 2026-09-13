@@ -171,6 +171,14 @@ def is_manga_model(name: str) -> bool:
 # --------------------------------------------------------------------------- #
 # the rule
 # --------------------------------------------------------------------------- #
+#: What a matching rule does with the page. PASSTHROUGH is the size-exclusion
+#: case: the page skips the model entirely and is only re-encoded, which is what
+#: the old hardcoded long-strip switch did with numbers nobody could see.
+UPSCALE = "upscale"
+PASSTHROUGH = "passthrough"
+ACTIONS = (UPSCALE, PASSTHROUGH)
+
+
 @dataclass(frozen=True, slots=True)
 class Rule:
     """One row of the table: conditions on the left, outcomes on the right."""
@@ -180,6 +188,7 @@ class Rule:
     width: str = ANY
     height: str = ANY
     model: str = AUTO
+    action: str = UPSCALE  # upscale | passthrough (size exclusion)
     auto_levels: bool | None = None  # grayscale only; None = inherit
     enabled: bool = True
     note: str = field(default="", compare=False)
@@ -194,6 +203,8 @@ class Rule:
         }
         if self.scale:
             data["scale"] = self.scale
+        if self.action != UPSCALE:
+            data["action"] = self.action
         if self.auto_levels is not None:
             data["auto_levels"] = bool(self.auto_levels)
         if not self.enabled:
@@ -219,6 +230,7 @@ class Rule:
             width=dim_spec(*parse_dim(raw.get("width"))),
             height=dim_spec(*parse_dim(raw.get("height"))),
             model=str(raw.get("model") or AUTO).strip() or AUTO,
+            action=_as_action(raw.get("action")),
             auto_levels=None if levels is None else bool(levels),
             enabled=bool(raw.get("enabled", True)),
             note=str(raw.get("note") or ""),
@@ -257,16 +269,22 @@ class Rule:
         """The on/off dot the table shows in its first column."""
         return "\u25cf" if self.enabled else "\u25cb"
 
+    def model_label(self) -> str:
+        """What the Model cell shows: the file, or that the page is excluded."""
+        if self.action == PASSTHROUGH:
+            return "no upscale \u2014 re-encode only"
+        return self.model
+
     def columns(self) -> tuple[str, str, str, str]:
         """The four content cells the interface shows for this rule."""
-        return (self.when_label(), self.size_label(), self.model, self.levels_label())
+        return (self.when_label(), self.size_label(), self.model_label(), self.levels_label())
 
     def cells(self) -> tuple[str, str, str, str, str]:
         """Every cell of the table row, including the enabled indicator."""
         return (self.enabled_mark(), *self.columns())
 
     def describe(self) -> str:
-        return f"{self.when_label()} / {self.size_label()} -> {self.model}"
+        return f"{self.when_label()} / {self.size_label()} -> {self.model_label()}"
 
     def specificity(self) -> tuple[int, int, int]:
         """Higher sorts first: size, then factor, then colour/grayscale."""
@@ -279,6 +297,13 @@ def _as_float(value: object) -> float:
         return max(0.0, float(value))  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0.0
+
+
+def _as_action(value: object) -> str:
+    action = str(value or UPSCALE).strip().lower()
+    if action in {"skip", "exclude", "excluded", "passthrough", "pass-through", "re-encode"}:
+        return PASSTHROUGH
+    return action if action in ACTIONS else UPSCALE
 
 
 # --------------------------------------------------------------------------- #
@@ -484,8 +509,9 @@ def default_working_set(
     Every row names a real file from the models actually installed - the table
     is the only thing that picks a model, so it must never ship a placeholder.
     Adjacent height bands that resolve to the same file are merged into one row
-    to keep it readable, and two unsized catch-alls at the end cover targets
-    that are neither 2x nor 4x.
+    to keep it readable. Every row names its factor: a target that is neither 2x
+    nor 4x falls into the nearest bucket, and a model with some other factor -
+    3x, say - is a row the user adds, with that factor typed into the rule.
     """
     names = [str(n) for n in installed]
     out: list[Rule] = []
@@ -516,17 +542,10 @@ def default_working_set(
                 Rule(kind=COLOUR, scale=float(scale), model=colour, note="default working set")
             )
 
-    # Width, height and fit targets produce factors like 1.8 or 3.7, so keep an
-    # unsized row per page kind as the last resort. They are the least specific
-    # rules in the table, so they can never shadow a sized one.
-    gray_any = gray_model(names, 2, GRAY_TOP_BUCKET) or gray_model(names, 4, GRAY_TOP_BUCKET)
-    if gray_any:
-        out.append(
-            Rule(kind=GRAYSCALE, model=gray_any, auto_levels=True, note="catch-all: any target")
-        )
-    colour_any = colour_model(names, 2) or colour_model(names, 4)
-    if colour_any:
-        out.append(Rule(kind=COLOUR, model=colour_any, note="catch-all: any target"))
+    # No unsized catch-all rows: every shipped model is 2x or 4x, and a factor
+    # in between (1.8 from a width target, say) buckets to one of them. A row
+    # that matched any target could only repeat a decision already made, while
+    # warning that its model does not match the target it never chose.
     return out
 
 

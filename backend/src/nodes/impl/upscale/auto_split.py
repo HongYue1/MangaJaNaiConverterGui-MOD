@@ -18,6 +18,13 @@ class Split:
 
 SplitImageOp = Callable[[np.ndarray, Region], np.ndarray | Split]
 
+# A caller that plans a tile before the pass starts cannot tell that a page was
+# re-tiled in here, so the plan is what its run summary reports even when a
+# smaller tile is what actually ran. Kept in a dict so this stays a report
+# rather than shared state behind a global statement. 0 means nothing was
+# lowered, so the requested tile is what ran.
+retile_report: dict[str, int] = {"tile": 0}
+
 
 def auto_split(
     img: np.ndarray,
@@ -86,6 +93,7 @@ def _exact_split(
             )
         except _SplitEx:
             starting_tile_size = split_tile_size(starting_tile_size)
+            retile_report["tile"] = starting_tile_size[0]
 
     raise ValueError(f"Aborting after {MAX_ITER} splits. Unable to upscale image.")
 
@@ -120,6 +128,7 @@ def _max_split(
 
         # the image was too large
         max_tile_size = split_tile_size(max_tile_size)
+        retile_report["tile"] = max_tile_size[0]
 
         # Say which tile was planned as well as the one being retried: the run
         # summary reports the planned tile, and reporting only the fallback here
@@ -180,6 +189,7 @@ def _max_split(
 
                 if isinstance(upscale_result, Split):
                     max_tile_size = split_tile_size(max_tile_size)
+                    retile_report["tile"] = max_tile_size[0]
 
                     new_tile_count_y = math.ceil(h / max_tile_size[1])
                     new_tile_size_y = math.ceil(h / new_tile_count_y)

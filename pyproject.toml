@@ -1,7 +1,7 @@
 # JaNai Upscaler - project metadata, packaging and tooling.
 #
 # Layout:
-#   src/janai/app      the Tk interface (standard library only)
+#   src/janai/app      the Qt interface (PySide6)
 #   src/janai/core     code shared by both processes
 #   src/janai/worker   the out-of-process upscaling pipeline
 #   scripts/           developer tools (smoke, selftest, bench)
@@ -21,15 +21,17 @@ license = { file = "LICENSE" }
 keywords = ["upscaling", "manga", "esrgan", "spandrel", "jpeg-xl"]
 classifiers = [
   "Environment :: Win32 (MS Windows)",
-  "Environment :: X11 Applications",
+  "Environment :: X11 Applications :: Qt",
   "Intended Audience :: End Users/Desktop",
   "Programming Language :: Python :: 3",
   "Topic :: Multimedia :: Graphics :: Graphics Conversion",
 ]
 # The upscaling dependencies are pinned in requirements.txt because torch has
 # to be resolved against a GPU-specific index; setup.ps1 / setup.sh install
-# them into backend/python. The interface itself needs nothing but Tkinter.
-dependencies = []
+# them into backend/python, along with the interface's single dependency: Qt.
+# PySide6-Essentials is the trimmed wheel (~77 MB) - the full PySide6 adds
+# WebEngine, 3D, Charts and Multimedia, none of which this interface uses.
+dependencies = ["PySide6-Essentials>=6.7,<7"]
 
 [project.optional-dependencies]
 dev = ["ruff>=0.6"]
@@ -123,8 +125,10 @@ ignore = [
 "src/janai/worker/worker.py" = ["E402", "N818"]
 # Same for the dev scripts, which run straight from a checkout.
 "scripts/*.py" = ["E402", "T201"]
-# ctypes aliases are types, so they are spelled like types.
-"src/janai/app/dnd.py" = ["N806"]
+# Qt's own API is camelCase, so the methods that override it are camelCase too.
+"src/janai/app/widgets.py" = ["N802"]
+"src/janai/app/rules_table.py" = ["N802"]
+"src/janai/app/window.py" = ["N802"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["janai"]

@@ -8,7 +8,7 @@
     (about 20 MB), and from then on everything goes through it:
 
       uv venv   backend\python      the interpreter, a managed CPython
-      uv pip    requirements.txt    torch, spandrel, libvips and friends
+      uv pip    requirements.txt    Qt, torch, spandrel, libvips and friends
 
     Nothing is installed machine-wide and nothing is written outside this
     folder: uv's download cache and its managed interpreters are redirected
@@ -311,8 +311,8 @@ if (-not (Invoke-Uv 'pip' 'install' '--python' $PyExe '--torch-backend' $Torch '
 
 # --------------------------------------------------------------------------- #
 Step 'Interpreter'
-& $PyExe -c "import sys, tkinter; print('python', sys.version.split()[0], '- tkinter', tkinter.TkVersion)"
-if ($LASTEXITCODE -ne 0) { Die 'the interpreter does not run, or has no Tkinter' }
+& $PyExe -c "import sys; print('python', sys.version.split()[0])"
+if ($LASTEXITCODE -ne 0) { Die 'the interpreter does not run' }
 Info $PyExe
 
 # --------------------------------------------------------------------------- #

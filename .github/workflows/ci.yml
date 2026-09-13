@@ -30,7 +30,7 @@ jobs:
   check:
     # Packaging is Windows-first, but the engine has to keep working on Linux,
     # so the import-level checks run on both.
-    name: compile and smoke (${{ matrix.os }})
+    name: compile, smoke and interface (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -51,3 +51,20 @@ jobs:
 
       - name: Smoke-test the dependency-free modules
         run: python scripts/smoke.py
+
+      # Qt links against X11 and EGL even when it renders offscreen, and the
+      # Linux runner does not ship those libraries.
+      - name: Install the system libraries Qt links against
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libxkbcommon-x11-0
+
+      - name: Install Qt
+        run: pip install PySide6-Essentials==6.11.2
+
+      # Builds the real window with no display attached and measures it, so a
+      # layout or styling regression fails here instead of on someone's
+      # desktop.
+      - name: Build the window and check its geometry
+        run: python scripts/uicheck.py
+        env:
+          QT_QPA_PLATFORM: offscreen

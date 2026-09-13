@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Dependency-free checks for the parts that must never break.
 
-Nothing here imports torch, pyvips or tkinter, so it runs on a bare Python
+Nothing here imports torch, pyvips or Qt, so it runs on a bare Python
 install in a second or two - which is what makes it usable in CI::
 
     python scripts/smoke.py

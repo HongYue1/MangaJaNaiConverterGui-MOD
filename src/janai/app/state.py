@@ -22,7 +22,7 @@ def defaults() -> dict[str, Any]:
             "dir": "",
             "same_as_input": True,
             "subfolder": "upscaled",
-            "pattern": "{name}",
+            "pattern": "{name}_JaNai",
             "overwrite": False,
             "keep_structure": True,
             # files | cbz (one archive per folder) | cbz_single (one archive total)
@@ -47,6 +47,9 @@ def defaults() -> dict[str, Any]:
             # hidden behind an "auto" switch.
             "rules": [],
             "auto_levels": True,
+            # detect | grayscale | colour. grayscale_convert is kept in step
+            # with it so an older build reading this file still behaves.
+            "page_kind": "detect",
             "grayscale_convert": True,
             "grayscale_threshold": 12,
             # percent of sampled pixels that may be clearly coloured before a
@@ -55,7 +58,9 @@ def defaults() -> dict[str, Any]:
             "pre_downscale_height": 0,
             # webtoon-style mega strips: off by default because the adaptive
             # tiler copes with them; when on they are copied straight through
-            # in the chosen output format instead of being upscaled
+            # in the chosen output format instead of being upscaled. Superseded
+            # by a rule whose action is "passthrough", and kept only so that a
+            # settings file written by an earlier build still loads unchanged.
             "skip_long_strips": False,
             "long_strip_max_side": 3000,
             "long_strip_min_aspect": 2.8,
@@ -76,7 +81,9 @@ def defaults() -> dict[str, Any]:
             # planner varies tile size per page, so the cost never amortises
             # (measured 21-23s/page on, ~17s off). Opt-in only.
             "cudnn_benchmark": False,
-            "allow_tf32": True,
+            # measured at 0.1-0.2 s on a 17 s image, with no pixel difference,
+            # so it is not on unless it is asked for
+            "allow_tf32": False,
             "gpu_wake_lock": True,
         },
         "log": {
@@ -118,12 +125,17 @@ RETIRED_UPSCALE_KEYS = ("model", "model_gray", "rules_enabled")
 def _migrate(raw: Any) -> Any:
     """Carry older settings files forward.
 
-    Two changes need translating rather than dropping:
+    These changes need translating rather than dropping:
 
     * the colour-pixel guard used to be stored in per-mille and labelled with a
       per-mille sign, which read as a stray glyph in the UI;
     * the model pickers are gone, so their values are handed to the rules table
-      as a starting point when that table has not been written yet.
+      as a starting point when that table has not been written yet;
+    * grayscale detection was a checkbox and is now one of three exclusive page
+      kinds, so the old flag is read into ``page_kind``;
+    * the two unsized catch-all rules the app used to seed are dropped;
+    * the old default file name is renamed to the new default, so the change is
+      seen instead of hiding behind a saved copy of the value it replaces.
     """
     if not isinstance(raw, dict):
         return raw
@@ -139,8 +151,23 @@ def _migrate(raw: Any) -> Any:
                 pass
     if not ups.get("rules"):
         ups["rules"] = _rules_from_pickers(ups)
+    else:
+        # The shipped table used to end in two unsized catch-alls. They could
+        # only repeat a choice the sized rows had already made, while warning
+        # that their model did not match a target they never chose, so rows the
+        # app seeded itself go. A row the user wrote is left alone.
+        ups["rules"] = [
+            r
+            for r in ups["rules"]
+            if not (isinstance(r, dict) and str(r.get("note") or "").startswith("catch-all"))
+        ]
+    if "page_kind" not in ups:
+        ups["page_kind"] = "detect" if bool(ups.get("grayscale_convert", True)) else "colour"
     for key in RETIRED_UPSCALE_KEYS:
         ups.pop(key, None)
+    out = raw.get("output")
+    if isinstance(out, dict) and str(out.get("pattern") or "") in {"", "{name}"}:
+        out["pattern"] = "{name}_JaNai"
     return raw
 
 

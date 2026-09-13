@@ -1,630 +1,587 @@
-"""Small reusable ttk widgets: cards, segmented controls, tables, tooltips.
+"""The small widget kit the window is assembled from.
 
-Two things in here are load-bearing beyond looking tidy:
-
-* **Wheel routing.** Tk's own class bindings make the wheel *change the value*
-  of a combobox or spinbox. Inside a scrolling page that means a flick of the
-  wheel silently edits a setting. Every control built here swallows the wheel
-  and scrolls the page instead (see ``wheel_guard``).
-* **Tables scroll themselves.** ``Table`` owns a scrollbar that hides when it
-  is not needed, and the wheel over it moves the rows, handing the gesture back
-  to the page only once the rows are at the end.
+Everything here is a thin wrapper over a real Qt widget: cards, a collapsible
+panel, a segmented control, a drop target, a log view and the field factories.
+The old build had to draw these by hand on a canvas; the point of this module
+is that it no longer does, so each class is mostly layout and naming.
 """
 
 from __future__ import annotations
 
-import tkinter as tk
-from collections.abc import Callable, Iterable, Sequence
-from tkinter import ttk
-from typing import Any, NamedTuple
+from collections.abc import Callable, Sequence
+from html import escape
+from typing import Any
 
-WHEEL_EVENTS = ("<MouseWheel>", "<Button-4>", "<Button-5>")
-#: Most a single wheel event may scroll. A fast flick reports several notches
-#: at once, and a forty-line jump reads as a broken window rather than speed.
-WHEEL_MAX_UNITS = 5
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
+from PySide6.QtGui import QFont, QMouseEvent
+from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QButtonGroup,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLayout,
+    QLineEdit,
+    QPlainTextEdit,
+    QPushButton,
+    QSizePolicy,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
 
 
-def _event_int(value: Any) -> int:
-    """Read a Tk event field that is not guaranteed to hold a number.
+def repolish(widget: QWidget) -> None:
+    """Re-read the stylesheet after a dynamic property changed."""
+    style = widget.style()
+    style.unpolish(widget)
+    style.polish(widget)
+    widget.update()
 
-    Tk fills in every field for every event, so a Windows ``<MouseWheel>``
-    arrives with ``num == '??'``. ``int('??')`` raises, and an exception inside
-    a wheel handler costs twice: the scroll is lost *and* the ``break`` that
-    stops Tk from editing the control underneath never gets returned. That one
-    conversion is what stopped the whole page scrolling and let the wheel start
-    changing dropdowns again - so nothing in here may raise.
+
+def clear_layout(layout: QLayout) -> None:
+    """Delete every child of ``layout``, rows and spacers included."""
+    while layout.count():
+        item = layout.takeAt(0)
+        child = item.widget()
+        if child is not None:
+            child.setParent(None)
+            child.deleteLater()
+        sub = item.layout()
+        if sub is not None:
+            clear_layout(sub)
+
+
+class WheelGuard(QObject):
+    """Let the page scroll even when the pointer rests on a control.
+
+    Qt delivers the wheel to whatever sits under the pointer, so scrolling the
+    page with the cursor over a dropdown would silently change its value. An
+    unfocused control hands the gesture back, which the scroll area then takes;
+    click or tab into the control and the wheel adjusts it as usual.
     """
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
 
-
-def wheel_units(event: tk.Event) -> int:
-    """Scroll units for a wheel event: negative up, positive down.
-
-    Windows and macOS report ``delta`` (120 per notch, and as little as 1 per
-    event on precision trackpads); X11 reports buttons 4 and 5 instead.
-    """
-    num = _event_int(getattr(event, "num", 0))
-    if num == 4:
-        return -1
-    if num == 5:
-        return 1
-    delta = _event_int(getattr(event, "delta", 0))
-    if delta == 0:
-        return 0
-    if abs(delta) >= 120:
-        notches = int(delta / 120)
-        return -max(-WHEEL_MAX_UNITS, min(WHEEL_MAX_UNITS, notches))
-    return -1 if delta > 0 else 1
-
-
-def _is_inside(parent: tk.Misc, widget: Any) -> bool:
-    """True when ``widget`` is ``parent`` or one of its descendants.
-
-    Compares Tk path names, so it works even when the event carries a widget
-    that has already been destroyed.
-    """
-    if widget is None:
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            event.type() == QEvent.Type.Wheel
+            and isinstance(watched, QWidget)
+            and not watched.hasFocus()
+        ):
+            # Left unaccepted, so Qt passes the gesture up to the scroll area.
+            event.ignore()
+            return True
         return False
-    top = str(parent)
-    name = str(widget)
-    return name == top or name.startswith(top + ".")
 
 
-def find_scroll_area(widget: tk.Misc | None) -> ScrollArea | None:
-    """The nearest scrolling page above ``widget``, if any."""
-    node: tk.Misc | None = widget
-    while node is not None:
-        if isinstance(node, ScrollArea):
-            return node
-        node = getattr(node, "master", None)
-    return None
-
-
-def _inner_scroller(widget: Any, stop: tk.Misc) -> Table | None:
-    """A widget between ``widget`` and ``stop`` that scrolls itself.
-
-    The rules table has its own rows to move, so a wheel gesture over it
-    belongs to the table and only falls through to the page at either end.
-    """
-    node: Any = widget
-    while node is not None and node is not stop:
-        if isinstance(node, Table):
-            return node
-        node = getattr(node, "master", None)
-    return None
-
-
-def wheel_guard(widget: tk.Misc) -> tk.Misc:
-    """Stop the wheel from editing a control; scroll the page instead.
-
-    The binding is installed on the widget itself, which runs before Tk's class
-    binding, and returns ``break`` so the class binding (the one that would
-    change the value) never runs.
-    """
-
-    def handler(event: tk.Event) -> str:
-        # Nothing in here may escape: that "break" is the only thing between a
-        # stray flick of the wheel and a silently edited setting.
-        try:
-            area = find_scroll_area(widget)
-            if area is not None:
-                area.route_wheel(event)
-        except tk.TclError:
-            pass
-        return "break"
-
-    for seq in WHEEL_EVENTS:
-        widget.bind(seq, handler, add="+")
+def guard_wheel(widget: QWidget) -> QWidget:
+    """Install :class:`WheelGuard` on ``widget`` and hand it back."""
+    widget.installEventFilter(WheelGuard(widget))
+    if isinstance(widget, QComboBox | QAbstractSpinBox):
+        widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     return widget
 
 
-class ScrollArea(ttk.Frame):
-    """Vertically scrollable container that stretches its inner frame."""
-
-    def __init__(self, master: tk.Misc, theme: Any, **kw: Any) -> None:
-        super().__init__(master, **kw)
-        self.theme = theme
-        self.canvas = tk.Canvas(
-            self, highlightthickness=0, bd=0, background=theme.p.bg, takefocus=0
-        )
-        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self._on_scroll)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.vbar.grid(row=0, column=1, sticky="ns")
-        self.rowconfigure(0, weight=1)
-        self.columnconfigure(0, weight=1)
-
-        self.body = ttk.Frame(self.canvas)
-        self._win = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
-        self.body.bind("<Configure>", self._on_body)
-        self.canvas.bind("<Configure>", self._on_canvas)
-        # One global wheel binding, filtered by "is the pointer over us". The
-        # old Enter/Leave pair broke as soon as the pointer moved onto a child
-        # widget, which is most of the page.
-        for seq in WHEEL_EVENTS:
-            self.bind_all(seq, self._wheel, add="+")
-
-    def _on_scroll(self, first: str, last: str) -> None:
-        self.vbar.set(first, last)
-        if float(first) <= 0.0 and float(last) >= 1.0:
-            self.vbar.grid_remove()
-        else:
-            self.vbar.grid()
-
-    def _on_body(self, _e: tk.Event) -> None:
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-
-    def _on_canvas(self, e: tk.Event) -> None:
-        self.canvas.itemconfigure(self._win, width=e.width)
-
-    def _pointer_widget(self, e: tk.Event) -> Any:
-        """The widget under the pointer, falling back to the event's own.
-
-        Tk 8.6 on Windows delivers ``<MouseWheel>`` to the *focused* widget
-        rather than the one under the pointer, so trusting ``event.widget``
-        alone makes the page refuse to scroll whenever focus happens to sit in
-        the log or on a footer button. X11 is already pointer-based, and its
-        button events keep working through the fallback.
-        """
-        try:
-            found = self.winfo_containing(e.x_root, e.y_root)
-        except (tk.TclError, AttributeError):
-            found = None
-        return found if found is not None else getattr(e, "widget", None)
-
-    def _wheel(self, e: tk.Event) -> None:
-        target = self._pointer_widget(e)
-        if not _is_inside(self, target):
-            return  # another toplevel (a dialog) owns this gesture
-        self._route(target, wheel_units(e))
-
-    def route_wheel(self, e: tk.Event) -> None:
-        """Scroll on behalf of a control that swallowed the wheel itself."""
-        target = self._pointer_widget(e)
-        self._route(target if _is_inside(self, target) else None, wheel_units(e))
-
-    def _route(self, target: Any, units: int) -> None:
-        if not units:
-            return
-        inner = _inner_scroller(target, self) if target is not None else None
-        if inner is not None and inner.wheel_scroll(units):
-            return
-        self.scroll_by(units)
-
-    def scroll_by(self, units: int) -> None:
-        """Scroll the page, unless everything already fits."""
-        if not units:
-            return
-        first, last = self.canvas.yview()
-        if first <= 0.0 and last >= 1.0:
-            return
-        self.canvas.yview_scroll(units, "units")
-
-    def restyle(self) -> None:
-        self.canvas.configure(background=self.theme.p.bg)
+# --------------------------------------------------------------------------- #
+# factories
+# --------------------------------------------------------------------------- #
+def label(text: str, role: str = "", wrap: bool = False, tip: str = "") -> QLabel:
+    out = QLabel(text)
+    if role:
+        out.setProperty("role", role)
+    out.setWordWrap(wrap)
+    if tip:
+        out.setToolTip(tip)
+    return out
 
 
-class Card(ttk.Frame):
-    """Titled surface panel. Content goes into ``.body``."""
-
-    def __init__(
-        self, master: tk.Misc, title: str, subtitle: str = "", badge: str = "", **kw: Any
-    ) -> None:
-        super().__init__(master, style="CardShell.TFrame", padding=(18, 15, 18, 18), **kw)
-        self.columnconfigure(0, weight=1)
-        head = ttk.Frame(self, style="Plain.TFrame")
-        head.grid(row=0, column=0, sticky="ew")
-        head.columnconfigure(1, weight=1)
-        ttk.Label(head, text=title, style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        self.badge = ttk.Label(head, text=badge, style="Chip.TLabel")
-        if badge:
-            self.badge.grid(row=0, column=2, sticky="e")
-        self.subtitle = ttk.Label(head, text=subtitle, style="Muted.TLabel")
-        if subtitle:
-            self.subtitle.grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
-        self.body = ttk.Frame(self, style="Plain.TFrame")
-        self.body.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
-        self.body.columnconfigure(1, weight=1)
-        self.rowconfigure(1, weight=1)
-
-    def set_badge(self, text: str) -> None:
-        self.badge.configure(text=text)
-        if text:
-            self.badge.grid(row=0, column=2, sticky="e")
-        else:
-            self.badge.grid_remove()
-
-    def set_subtitle(self, text: str) -> None:
-        self.subtitle.configure(text=text)
-        if text:
-            self.subtitle.grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
-        else:
-            self.subtitle.grid_remove()
-
-
-class Segmented(ttk.Frame):
-    """Row of mutually exclusive flat buttons bound to one variable."""
-
-    def __init__(
-        self,
-        master: tk.Misc,
-        variable: tk.Variable,
-        options: Sequence[tuple[str, Any]],
-        command: Callable[[Any], None] | None = None,
-        **kw: Any,
-    ) -> None:
-        super().__init__(master, style="Inset.TFrame", padding=2, **kw)
-        self.var = variable
-        self.buttons: dict[Any, ttk.Radiobutton] = {}
-        for i, (label, value) in enumerate(options):
-            rb = ttk.Radiobutton(
-                self,
-                text=label,
-                value=value,
-                variable=variable,
-                style="Seg.Toolbutton",
-                command=(lambda v=value: command(v)) if command else None,
-            )
-            rb.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 2, 0))
-            self.columnconfigure(i, weight=1)
-            self.buttons[value] = rb
-            wheel_guard(rb)
-
-    def set_enabled(self, value: Any, enabled: bool) -> None:
-        btn = self.buttons.get(value)
-        if btn is not None:
-            btn.state(["!disabled"] if enabled else ["disabled"])
-
-
-class Collapsible(ttk.Frame):
-    """Disclosure panel with a clickable header. Content goes into ``.body``."""
-
-    def __init__(
-        self, master: tk.Misc, title: str, expanded: bool = False, subtitle: str = "", **kw: Any
-    ) -> None:
-        super().__init__(master, style="CardShell.TFrame", padding=(18, 13, 18, 13), **kw)
-        self.columnconfigure(0, weight=1)
-        self._open = tk.BooleanVar(value=expanded)
-        self.head = ttk.Frame(self, style="Plain.TFrame")
-        self.head.grid(row=0, column=0, sticky="ew")
-        self.head.columnconfigure(1, weight=1)
-        self.arrow = ttk.Label(
-            self.head, text="\u25be" if expanded else "\u25b8", style="Card.TLabel", width=2
-        )
-        self.arrow.grid(row=0, column=0, sticky="w")
-        self.title = ttk.Label(self.head, text=title, style="CardTitle.TLabel")
-        self.title.grid(row=0, column=1, sticky="w")
-        self.hint = ttk.Label(self.head, text=subtitle, style="Muted.TLabel")
-        self.hint.grid(row=0, column=2, sticky="e")
-        self.body = ttk.Frame(self, style="Plain.TFrame")
-        self.body.columnconfigure(1, weight=1)
-        if expanded:
-            self.body.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
-        for w in (self.head, self.arrow, self.title, self.hint):
-            w.bind("<Button-1>", lambda _e: self.toggle())
-            w.configure(cursor="hand2")
-
-    def toggle(self) -> None:
-        self.set_open(not self._open.get())
-
-    def set_open(self, value: bool) -> None:
-        self._open.set(value)
-        self.arrow.configure(text="\u25be" if value else "\u25b8")
-        if value:
-            self.body.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
-        else:
-            self.body.grid_remove()
-
-    def is_open(self) -> bool:
-        return bool(self._open.get())
-
-    def set_hint(self, text: str) -> None:
-        self.hint.configure(text=text)
-
-
-class Column(NamedTuple):
-    """One table column. ``minwidth`` is what it may shrink to, never past."""
-
-    key: str
-    heading: str
-    width: int
-    anchor: str
-    stretch: bool
-    minwidth: int
-
-
-def _column(spec: Sequence[Any]) -> Column:
-    key, heading, width, anchor, stretch = spec[:5]
-    floor = int(spec[5]) if len(spec) > 5 else max(32, min(int(width), 90))
-    return Column(str(key), str(heading), int(width), str(anchor), bool(stretch), floor)
-
-
-class Table(ttk.Frame):
-    """A Treeview that scrolls itself and keeps its columns inside the frame.
-
-    ``columns`` is a sequence of ``(key, heading, width, anchor, stretch)``,
-    with an optional sixth ``minwidth``. The tree is exposed as ``.tree`` so
-    callers keep the full Treeview API.
-
-    A Treeview never shrinks a column to fit its widget: it keeps the widths it
-    was handed and clips whatever hangs off the right edge, which is how the
-    last heading ended up sliced in half against the scrollbar. So the widths
-    are recomputed on every resize (:meth:`fit_columns`) to add up to exactly
-    the space available.
-    """
-
-    #: A hair of slack so the rightmost cell border stays inside the treearea.
-    TRIM = 2
-
-    def __init__(
-        self,
-        master: tk.Misc,
-        columns: Sequence[Sequence[Any]],
-        height: int = 8,
-        style: str = "Rules.Treeview",
-        **kw: Any,
-    ) -> None:
-        super().__init__(master, style="Plain.TFrame", **kw)
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
-        self.cols: list[Column] = [_column(spec) for spec in columns]
-        self.tree = ttk.Treeview(
-            self,
-            columns=[c.key for c in self.cols],
-            show="headings",
-            height=height,
-            selectmode="browse",
-            style=style,
-        )
-        for col in self.cols:
-            self.tree.heading(col.key, text=col.heading)
-            # stretch is honoured by fit_columns, not by Tk: Tk's own version
-            # only ever grows a column, and never below its requested width.
-            self.tree.column(
-                col.key,
-                width=col.width,
-                minwidth=col.minwidth,
-                anchor=col.anchor,
-                stretch=False,
-            )
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        self.vbar = ttk.Scrollbar(
-            self, orient="vertical", style="Card.Vertical.TScrollbar", command=self.tree.yview
-        )
-        self.vbar.grid(row=0, column=1, sticky="ns", padx=(3, 0))
-        self.tree.configure(yscrollcommand=self._on_scroll)
-        self.tree.bind("<Configure>", self._on_resize, add="+")
-        for seq in WHEEL_EVENTS:
-            self.tree.bind(seq, self._wheel, add="+")
-
-    def _on_scroll(self, first: str, last: str) -> None:
-        self.vbar.set(first, last)
-        if float(first) <= 0.0 and float(last) >= 1.0:
-            self.vbar.grid_remove()
-        else:
-            self.vbar.grid()
-
-    def _on_resize(self, e: tk.Event) -> None:
-        self.fit_columns(_event_int(getattr(e, "width", 0)))
-
-    def fit_columns(self, width: int = 0) -> None:
-        """Make the columns add up to exactly the visible width.
-
-        Slack goes to the flexible columns; when the frame is too narrow for
-        the requested widths, every column gives space back - flexible ones
-        first, then the rest from the right - down to its ``minwidth``, so the
-        last column stays inside the table instead of falling off the end.
-        """
-        avail = (width or self.tree.winfo_width()) - self.TRIM
-        if avail <= 0 or not self.cols:
-            return
-        widths = [c.width for c in self.cols]
-        slack = avail - sum(widths)
-        if slack > 0:
-            flexible = [i for i, c in enumerate(self.cols) if c.stretch] or [len(widths) - 1]
-            share, extra = divmod(slack, len(flexible))
-            for i in flexible:
-                widths[i] += share
-            widths[flexible[0]] += extra
-        elif slack < 0:
-            debt = -slack
-            order = [i for i, c in enumerate(self.cols) if c.stretch]
-            order += [i for i, c in enumerate(self.cols) if not c.stretch][::-1]
-            for i in order:
-                if debt <= 0:
-                    break
-                give = min(debt, widths[i] - self.cols[i].minwidth)
-                widths[i] -= give
-                debt -= give
-        for col, w in zip(self.cols, widths, strict=True):
-            self.tree.column(col.key, width=w)
-
-    def _wheel(self, e: tk.Event) -> str:
-        units = wheel_units(e)
-        if not self.wheel_scroll(units):
-            # Nothing left to scroll here - let the page keep moving.
-            area = find_scroll_area(self)
-            if area is not None:
-                area.scroll_by(units)
-        return "break"
-
-    def wheel_scroll(self, units: int) -> bool:
-        """Move the rows. ``False`` means "at the end, the page takes it"."""
-        if not units:
-            return False
-        first, last = self.tree.yview()
-        if (first <= 0.0 and last >= 1.0) or (units < 0 and first <= 0.0):
-            return False
-        if units > 0 and last >= 1.0:
-            return False
-        self.tree.yview_scroll(units, "units")
-        return True
-
-
-class Tooltip:
-    """Lightweight hover tooltip."""
-
-    def __init__(self, widget: tk.Misc, text: str, theme: Any, delay: int = 400) -> None:
-        self.widget = widget
-        self.text = text
-        self.theme = theme
-        self.delay = delay
-        self._after: str | None = None
-        self._tip: tk.Toplevel | None = None
-        widget.bind("<Enter>", self._enter, add="+")
-        widget.bind("<Leave>", self._leave, add="+")
-        widget.bind("<ButtonPress>", self._leave, add="+")
-
-    def set_text(self, text: str) -> None:
-        self.text = text
-
-    def _enter(self, _e: tk.Event) -> None:
-        if not self.text:
-            return
-        self._after = self.widget.after(self.delay, self._show)
-
-    def _leave(self, _e: tk.Event) -> None:
-        if self._after:
-            try:
-                self.widget.after_cancel(self._after)
-            except Exception:
-                pass
-            self._after = None
-        if self._tip is not None:
-            self._tip.destroy()
-            self._tip = None
-
-    def _show(self) -> None:
-        if self._tip is not None or not self.text:
-            return
-        p = self.theme.p
-        x = self.widget.winfo_rootx() + 10
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 7
-        tip = tk.Toplevel(self.widget)
-        tip.wm_overrideredirect(True)
-        tip.wm_geometry(f"+{x}+{y}")
-        tip.configure(background=p.border)
-        tk.Label(
-            tip,
-            text=self.text,
-            background=p.surface2,
-            foreground=p.text,
-            font=self.theme.fonts["small"],
-            justify="left",
-            wraplength=380,
-            padx=10,
-            pady=8,
-        ).pack(padx=1, pady=1)
-        try:
-            tip.wm_attributes("-topmost", True)
-        except Exception:
-            pass
-        self._tip = tip
-
-
-def row_label(
-    parent: tk.Misc,
-    row: int,
+def button(
     text: str,
-    hint: str = "",
-    theme: Any = None,
-    style: str = "Field.TLabel",
-) -> ttk.Label:
-    """Grid a field label in column 0, with its explanation on hover."""
-    lbl = ttk.Label(parent, text=text, style=style)
-    lbl.grid(row=row, column=0, sticky="w", padx=(0, 14), pady=5)
-    if hint and theme is not None:
-        Tooltip(lbl, hint, theme)
-    return lbl
+    on_click: Callable[[], None] | None = None,
+    variant: str = "",
+    tip: str = "",
+) -> QPushButton:
+    out = QPushButton(text)
+    if variant:
+        out.setProperty("variant", variant)
+    if tip:
+        out.setToolTip(tip)
+    if on_click is not None:
+        # clicked(bool) carries a checked flag that none of these want.
+        out.clicked.connect(lambda *_: on_click())
+    out.setCursor(Qt.CursorShape.PointingHandCursor)
+    return out
 
 
-def hint_label(
-    parent: tk.Misc,
-    row: int,
+def checkbox(
     text: str,
-    style: str = "Muted.TLabel",
-    column: int = 1,
-    columnspan: int = 1,
-) -> ttk.Label:
-    lbl = ttk.Label(parent, text=text, style=style, wraplength=560, justify="left")
-    lbl.grid(row=row, column=column, columnspan=columnspan, sticky="w", pady=(0, 6))
-    return lbl
-
-
-def int_spin(
-    parent: tk.Misc,
-    variable: tk.Variable,
-    lo: float,
-    hi: float,
-    step: float = 1,
-    width: int = 7,
+    checked: bool = False,
     on_change: Callable[[], None] | None = None,
-):
-    """Spinbox for a numeric field.
-
-    A fractional step gets an explicit format, so the arrows produce 0.25
-    instead of 0.30000000000000004. The wheel is disarmed: scrolling past a
-    spinbox scrolls the page instead of editing the number underneath.
-    """
-    extra: dict[str, Any] = {}
-    if float(step) != int(float(step)):
-        decimals = len(f"{float(step):.6f}".rstrip("0").split(".")[1]) or 2
-        extra["format"] = f"%.{decimals}f"
-    sp = ttk.Spinbox(
-        parent,
-        from_=lo,
-        to=hi,
-        increment=step,
-        textvariable=variable,
-        width=width,
-        justify="right",
-        **extra,
-    )
+    tip: str = "",
+) -> QCheckBox:
+    out = QCheckBox(text)
+    out.setChecked(bool(checked))
+    if tip:
+        out.setToolTip(tip)
     if on_change is not None:
-        sp.configure(command=on_change)
-        sp.bind("<FocusOut>", lambda _e: on_change(), add="+")
-        sp.bind("<Return>", lambda _e: on_change(), add="+")
-    wheel_guard(sp)
-    return sp
+        out.toggled.connect(lambda _checked: on_change())
+    return out
 
 
 def combo(
-    parent: tk.Misc,
-    variable: tk.Variable,
-    values: Iterable[str],
-    width: int = 28,
+    items: Sequence[str],
+    value: str = "",
     on_change: Callable[[], None] | None = None,
-) -> ttk.Combobox:
-    """Read-only dropdown. The wheel scrolls the page, it never picks a value."""
-    cb = ttk.Combobox(
-        parent, textvariable=variable, values=list(values), width=width, state="readonly"
-    )
+    width: int = 0,
+    tip: str = "",
+) -> QComboBox:
+    out = QComboBox()
+    out.addItems(list(items))
+    if value:
+        set_combo(out, value)
+    if width:
+        out.setMinimumWidth(width)
+    if tip:
+        out.setToolTip(tip)
     if on_change is not None:
-        cb.bind("<<ComboboxSelected>>", lambda _e: on_change(), add="+")
-    wheel_guard(cb)
-    return cb
+        out.currentIndexChanged.connect(lambda _index: on_change())
+    out.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+    guard_wheel(out)
+    return out
 
 
-def entry(
-    parent: tk.Misc,
-    variable: tk.Variable,
-    width: int | None = None,
+def set_combo(box: QComboBox, value: str) -> None:
+    """Select ``value``, adding it if the list does not offer it yet."""
+    index = box.findText(value)
+    if index < 0 and value:
+        box.addItem(value)
+        index = box.count() - 1
+    if index >= 0:
+        box.setCurrentIndex(index)
+
+
+def spin_int(
+    lo: int,
+    hi: int,
+    value: int,
+    step: int = 1,
     on_change: Callable[[], None] | None = None,
-) -> ttk.Entry:
-    """Text field that reports edits and does not react to the wheel."""
-    kw: dict[str, Any] = {"textvariable": variable}
-    if width is not None:
-        kw["width"] = width
-    e = ttk.Entry(parent, **kw)
+    suffix: str = "",
+    special: str = "",
+    tip: str = "",
+) -> QSpinBox:
+    out = QSpinBox()
+    out.setRange(lo, hi)
+    out.setSingleStep(step)
+    out.setValue(int(value))
+    out.setKeyboardTracking(False)
+    if suffix:
+        out.setSuffix(suffix)
+    if special:
+        out.setSpecialValueText(special)
+    if tip:
+        out.setToolTip(tip)
     if on_change is not None:
-        e.bind("<KeyRelease>", lambda _e: on_change(), add="+")
-    wheel_guard(e)
-    return e
+        out.valueChanged.connect(lambda _value: on_change())
+    guard_wheel(out)
+    return out
 
 
-def clear(container: tk.Misc) -> None:
-    for child in list(container.winfo_children()):
-        child.destroy()
+def spin_float(
+    lo: float,
+    hi: float,
+    value: float,
+    step: float = 0.25,
+    decimals: int = 2,
+    on_change: Callable[[], None] | None = None,
+    suffix: str = "",
+    tip: str = "",
+) -> QDoubleSpinBox:
+    out = QDoubleSpinBox()
+    out.setRange(lo, hi)
+    out.setSingleStep(step)
+    out.setDecimals(decimals)
+    out.setValue(float(value))
+    out.setKeyboardTracking(False)
+    if suffix:
+        out.setSuffix(suffix)
+    if tip:
+        out.setToolTip(tip)
+    if on_change is not None:
+        out.valueChanged.connect(lambda _value: on_change())
+    guard_wheel(out)
+    return out
+
+
+def line_edit(
+    value: str = "",
+    placeholder: str = "",
+    on_change: Callable[[], None] | None = None,
+    width: int = 0,
+    tip: str = "",
+) -> QLineEdit:
+    out = QLineEdit(value)
+    if placeholder:
+        out.setPlaceholderText(placeholder)
+    if width:
+        out.setMaximumWidth(width)
+    if tip:
+        out.setToolTip(tip)
+    if on_change is not None:
+        out.textChanged.connect(lambda _text: on_change())
+    return out
+
+
+def separator() -> QFrame:
+    out = QFrame()
+    out.setProperty("role", "sep")
+    out.setFrameShape(QFrame.Shape.NoFrame)
+    out.setFixedHeight(1)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# containers
+# --------------------------------------------------------------------------- #
+class FieldGrid(QWidget):
+    """A two-column body: a label with its explanation, then the control."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setHorizontalSpacing(16)
+        self.grid.setVerticalSpacing(9)
+        self.grid.setColumnStretch(0, 0)
+        self.grid.setColumnStretch(1, 1)
+        self.grid.setColumnMinimumWidth(0, 132)
+        self._row = 0
+
+    def reset(self) -> None:
+        """Empty the grid so it can be rebuilt from scratch."""
+        clear_layout(self.grid)
+        self._row = 0
+
+    def field(self, title: str, hint: str, widget: QWidget, tip: str = "") -> QWidget:
+        """Add one labelled row and return the control.
+
+        ``hint`` is not drawn any more. A line of explanation under every label
+        crowds the page and pushes the controls apart, so it becomes the hover
+        tooltip of both the label and the control instead. A control that
+        already carries its own tooltip keeps it: that text is the more
+        specific of the two.
+        """
+        explain = tip or hint
+        head = label(title, "field", tip=explain)
+        if explain and not widget.toolTip():
+            widget.setToolTip(explain)
+        self.grid.addWidget(head, self._row, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.grid.addWidget(widget, self._row, 1)
+        self._row += 1
+        return widget
+
+    def full(self, widget: QWidget) -> QWidget:
+        """Add a row that spans both columns."""
+        self.grid.addWidget(widget, self._row, 0, 1, 2)
+        self._row += 1
+        return widget
+
+    def control(self, widget: QWidget) -> QWidget:
+        """Add a row in the control column only, with no label beside it."""
+        self.grid.addWidget(widget, self._row, 1)
+        self._row += 1
+        return widget
+
+    def rule(self) -> None:
+        self.full(separator())
+
+
+def row(*widgets: QWidget, spacing: int = 8, stretch: bool = True) -> QWidget:
+    """Lay widgets out left to right in a transparent container."""
+    out = QWidget()
+    box = QHBoxLayout(out)
+    box.setContentsMargins(0, 0, 0, 0)
+    box.setSpacing(spacing)
+    for widget in widgets:
+        box.addWidget(widget)
+    if stretch:
+        box.addStretch(1)
+    return out
+
+
+class Card(QFrame):
+    """A titled panel. Fields go into :attr:`body`."""
+
+    def __init__(
+        self,
+        title: str,
+        subtitle: str = "",
+        badge: str = "",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("card")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 14, 16, 16)
+        outer.setSpacing(12)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(10)
+        titles = QVBoxLayout()
+        titles.setContentsMargins(0, 0, 0, 0)
+        titles.setSpacing(2)
+        titles.addWidget(label(title, "title", tip=subtitle))
+        # The card's description is a tooltip on its title, not a second line
+        # of prose: it repeats what the fields already say, and it costs every
+        # card a row of height.
+        self.lbl_subtitle = label(subtitle, "muted", wrap=True)
+        self.lbl_subtitle.setVisible(False)
+        titles.addWidget(self.lbl_subtitle)
+        head.addLayout(titles, 1)
+        self.lbl_badge = label(badge, "badge")
+        self.lbl_badge.setVisible(bool(badge))
+        head.addWidget(self.lbl_badge, 0, Qt.AlignmentFlag.AlignTop)
+        outer.addLayout(head)
+
+        self.body = FieldGrid(self)
+        outer.addWidget(self.body)
+
+    def set_badge(self, text: str) -> None:
+        self.lbl_badge.setText(text)
+        self.lbl_badge.setVisible(bool(text))
+
+
+class ClickFrame(QFrame):
+    """A frame that reports clicks, so a whole header row is a hit target."""
+
+    clicked = Signal()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class Collapsible(QFrame):
+    """A card that folds away, for the settings most runs never touch."""
+
+    toggled = Signal(bool)
+
+    def __init__(
+        self,
+        title: str,
+        subtitle: str = "",
+        expanded: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("card")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 8, 10, 10)
+        outer.setSpacing(10)
+
+        self.head = ClickFrame(self)
+        self.head.setObjectName("cardhead")
+        self.head.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.head.clicked.connect(self.toggle)
+        head = QHBoxLayout(self.head)
+        head.setContentsMargins(6, 6, 8, 6)
+        head.setSpacing(9)
+        self.chevron = label("", "muted")
+        head.addWidget(self.chevron)
+        head.addWidget(label(title, "title"))
+        self.lbl_hint = label(subtitle, "muted", wrap=False)
+        head.addWidget(self.lbl_hint, 1)
+        outer.addWidget(self.head)
+
+        self.body = FieldGrid(self)
+        wrapper = QWidget(self)
+        inner = QVBoxLayout(wrapper)
+        inner.setContentsMargins(6, 0, 6, 2)
+        inner.setSpacing(0)
+        inner.addWidget(self.body)
+        self._wrapper = wrapper
+        outer.addWidget(wrapper)
+
+        self._open = bool(expanded)
+        self._render()
+
+    def toggle(self) -> None:
+        self.set_open(not self._open)
+
+    def _render(self) -> None:
+        self.chevron.setText("\u25be" if self._open else "\u25b8")
+        self._wrapper.setVisible(self._open)
+
+    def set_open(self, open_: bool) -> None:
+        self._open = bool(open_)
+        self._render()
+        self.toggled.emit(self._open)
+
+    def is_open(self) -> bool:
+        return self._open
+
+    def set_hint(self, text: str) -> None:
+        self.lbl_hint.setText(text)
+
+
+class Segmented(QWidget):
+    """Two to five exclusive choices, shown side by side."""
+
+    changed = Signal(object)
+
+    def __init__(
+        self,
+        options: Sequence[tuple[str, Any]],
+        value: Any = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        box = QHBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(6)
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        self._buttons: list[tuple[Any, QPushButton]] = []
+        for text, option in options:
+            btn = button(text, variant="seg")
+            btn.setCheckable(True)
+            btn.setChecked(option == value)
+            self._group.addButton(btn)
+            box.addWidget(btn)
+            self._buttons.append((option, btn))
+            btn.clicked.connect(lambda _checked=False, opt=option: self._pick(opt))
+        box.addStretch(1)
+        if value is None and self._buttons:
+            self._buttons[0][1].setChecked(True)
+
+    def _pick(self, option: Any) -> None:
+        self.set_value(option)
+        self.changed.emit(option)
+
+    def value(self) -> Any:
+        for option, btn in self._buttons:
+            if btn.isChecked():
+                return option
+        return self._buttons[0][0] if self._buttons else None
+
+    def set_value(self, value: Any) -> None:
+        for option, btn in self._buttons:
+            btn.setChecked(option == value)
+
+    def set_option_enabled(self, value: Any, enabled: bool) -> None:
+        for option, btn in self._buttons:
+            if option == value:
+                btn.setEnabled(bool(enabled))
+
+
+class DropZone(QFrame):
+    """The input target: drop files or folders anywhere on it.
+
+    Qt gives drag and drop on every platform, so this replaces the Windows-only
+    ctypes shim the old build needed.
+    """
+
+    dropped = Signal(list)
+
+    def __init__(self, hint: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("drop")
+        self.setAcceptDrops(True)
+        self.setProperty("active", "false")
+        box = QVBoxLayout(self)
+        box.setContentsMargins(16, 18, 16, 18)
+        box.setSpacing(6)
+        self.lbl_hint = label(hint, "", wrap=True)
+        self.lbl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_path = label("No input selected", "muted", wrap=True)
+        self.lbl_path.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        box.addWidget(self.lbl_hint)
+        box.addWidget(self.lbl_path)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+    def set_hint(self, text: str) -> None:
+        self.lbl_hint.setText(text)
+
+    def set_path(self, text: str) -> None:
+        self.lbl_path.setText(text or "No input selected")
+
+    def _highlight(self, on: bool) -> None:
+        self.setProperty("active", "true" if on else "false")
+        repolish(self)
+
+    def dragEnterEvent(self, event: Any) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self._highlight(True)
+
+    def dragLeaveEvent(self, event: Any) -> None:
+        self._highlight(False)
+        event.accept()
+
+    def dropEvent(self, event: Any) -> None:
+        self._highlight(False)
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            event.acceptProposedAction()
+            self.dropped.emit(paths)
+        else:
+            event.ignore()
+
+
+class LogView(QPlainTextEdit):
+    """The run log: colour per level, capped length, and it follows the tail
+    only while the reader is already at the bottom."""
+
+    def __init__(self, font: QFont, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setUndoRedoEnabled(False)
+        self.setMaximumBlockCount(4000)
+        self.setFont(font)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+
+    def at_bottom(self) -> bool:
+        bar = self.verticalScrollBar()
+        return bar.value() >= bar.maximum() - 4
+
+    def add_line(self, text: str, colour: str) -> None:
+        follow = self.at_bottom()
+        body = escape(text).replace("  ", "&nbsp;&nbsp;")
+        self.appendHtml(f'<span style="color:{colour}">{body}</span>')
+        if follow:
+            bar = self.verticalScrollBar()
+            bar.setValue(bar.maximum())
+
+    def set_wrap(self, wrap: bool) -> None:
+        self.setLineWrapMode(
+            QPlainTextEdit.LineWrapMode.WidgetWidth if wrap else QPlainTextEdit.LineWrapMode.NoWrap
+        )
+
+
+class Banner(QFrame):
+    """One line of bad news across the top of the page, with a dismiss button."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("banner")
+        box = QHBoxLayout(self)
+        box.setContentsMargins(12, 9, 8, 9)
+        box.setSpacing(10)
+        self.lbl = label("", "err", wrap=True)
+        box.addWidget(self.lbl, 1)
+        self.btn_close = button("\u2715", self.hide, variant="ghost", tip="Dismiss")
+        self.btn_close.setFixedWidth(30)
+        box.addWidget(self.btn_close, 0, Qt.AlignmentFlag.AlignTop)
+        self.hide()
+
+    def show_text(self, text: str) -> None:
+        self.lbl.setText(text)
+        self.setVisible(bool(text))

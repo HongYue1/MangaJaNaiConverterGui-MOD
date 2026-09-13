@@ -1,7 +1,7 @@
 # JaNai Upscaler
 
 A small, fast desktop GUI for the MangaJaNai / IllustrationJaNai upscaling
-models. It replaces the Avalonia/C# app with plain Python + Tk: no workflows,
+models. It replaces the Avalonia/C# app with plain Python + Qt: no workflows,
 no chains, no profiles. Pick an input, pick a target size, pick an output
 format, press Start.
 
@@ -26,7 +26,10 @@ MangaJaNaiConverterGui-MOD\
   janai.config.json      written by setup: python version, torch backend
   janai.runtime.txt      written by setup: which interpreter to launch
   settings.json          your last-used settings (created on first exit)
-  src\janai\app\         the GUI - standard library only, never imports torch
+  src\janai\app\         the GUI - Python + Qt (PySide6), never imports torch
+    window.py            the window: cards, rules table, run log panel
+    theme.py             palette, type ramp and the one stylesheet
+    widgets.py           the widget vocabulary the window is built from
     runlog.py            the pretty run log written to logs\Run_*.log
   src\janai\core\        shared, torch-free logic used by GUI and worker
     formats.py           the encoder / option table
@@ -37,6 +40,7 @@ MangaJaNaiConverterGui-MOD\
   src\janai\worker\      the upscaling process (torch, pyvips, spandrel)
   scripts\selftest.py    end-to-end check: probe, encoders, models, upscale
   scripts\bench.py       throughput harness (tile sizes, baseline compare)
+  scripts\uicheck.py     interface geometry harness (offscreen Qt)
   scripts\smoke.py       dependency-free checks, also run by CI
   logs\                  Run_YYYYMMDD-HHMMSS.log, one per run, auto-pruned
   presets\               your saved presets (*.janai.json)
@@ -118,16 +122,18 @@ auto|cpu|cu126|cu128|cu129`, `--models all|manga|illustration|none`,
 `nvidia-smi` and falls back to the CPU wheels when there is none, installs uv
 into `backend/tools` if you do not have it, falls back to `python3 -m venv`
 when even that is impossible, and finishes by probing the runtime exactly like
-the Windows installer. Tk is the one thing it cannot install for you: the
-CPython that uv downloads brings its own, but if setup falls back to a system
-interpreter you may need `sudo apt install python3-tk` (or your
-distribution's equivalent).
+the Windows installer. Qt arrives from PyPI with everything else - the
+interface's only dependency is the `PySide6-Essentials` wheel - so there is no
+system package to install by hand. A minimal container may still need the X11
+runtime libraries distributions split out of their base image
+(`libxkbcommon-x11`, `libegl1`); on a normal desktop they are already there.
 
-The Python side is platform-neutral by design: the GUI is Tk, the worker is
-torch + pyvips, paths go through `pathlib`, and the Windows-only calls (DPI
-awareness, WM_DROPFILES drag & drop, `CREATE_NO_WINDOW`) are guarded with
-POSIX fallbacks - "open output folder" uses `xdg-open`, and the JPEG XL tool
-finder falls back to `PATH`.
+The Python side is platform-neutral by design: the GUI is Qt, the worker is
+torch + pyvips, and paths go through `pathlib`. Qt also removed the two places
+that used to need Windows-only C calls - display scaling and drag & drop are
+the toolkit's job on every platform now - so the only guarded calls left are
+`CREATE_NO_WINDOW` when the worker is spawned, "open output folder" falling
+back to `xdg-open`, and the JPEG XL tool finder falling back to `PATH`.
 
 **NVIDIA T4** (Turing, sm_75, 16 GB) is a good fit. FP16 runs on its tensor
 cores, so the default half precision is a genuine speed-up, and 16 GB lets the
@@ -362,7 +368,7 @@ for comparing against a known-good number.
 
 ## Development
 
-The code is a plain `src` layout package: `src\janai\app` (Tk GUI),
+The code is a plain `src` layout package: `src\janai\app` (Qt GUI),
 `src\janai\core` (torch-free shared logic) and `src\janai\worker` (the
 upscaling process), described by `pyproject.toml`, with the harnesses in
 `scripts\`. Nothing under `app` or `core` imports torch, which is what keeps
@@ -384,8 +390,10 @@ order and `TID` to ban relative imports. Four are deliberately off, each for a
 performance or architecture reason: `PLC0415` (deferred imports are how torch
 stays out of the GUI process), `SIM105` (`try`/`except`/`pass` is cheaper than
 `contextlib.suppress` on the per-tile path), `PLW0603` (the worker's module
-state is intentional) and `BLE001`. CI runs `ruff format --check`,
-`ruff check` and the dependency-free smoke checks on both Windows and Ubuntu.
+state is intentional) and `BLE001`. `N802` is switched off per file for the
+three interface modules, because a method that overrides Qt's own API has to
+carry Qt's camelCase name. CI runs `ruff format --check`, `ruff check` and the
+dependency-free smoke checks on both Windows and Ubuntu.
 
 ## Parity with the original
 
@@ -460,9 +468,9 @@ Velopack packaging, the bundled updater, the workflow/chain state in
 
 **New or rewritten:**
 
-- **the interface** - `src\janai\app`, Python + Tk, standard library only. It
-  never imports torch; `src\janai\worker\worker.py` is a separate process that
-  does.
+- **the interface** - `src\janai\app`, Python + Qt (PySide6): one dependency,
+  no bundled runtime, no web view. It never imports torch;
+  `src\janai\worker\worker.py` is a separate process that does.
 - **a proper package layout** - `src\janai\{app,core,worker}` with
   `pyproject.toml` and `scripts\` for the harnesses, plus ruff enforcing
   format and lint in CI on Windows and Ubuntu.
@@ -472,21 +480,23 @@ Velopack packaging, the bundled updater, the workflow/chain state in
   Explicit sizes always outrank `any`, unusable rows are flagged under the
   table, each row can be switched off from the table itself, and the old auto
   behaviour ships as the editable default set.
-- **a redesigned interface** - flatter palette and one type ramp, a rules table
-  that scrolls by scrollbar and wheel, wheel-guarded dropdowns and number
-  fields so the wheel scrolls the page instead of quietly changing a value,
-  useful help text on every control, and a **Reset all** button.
-- **drawn checkbox and radio indicators** - painted by the app instead of
-  borrowed from the theme's font, so they cannot come out as missing-glyph
-  boxes; they are sized from the body font's measured line height and carry
-  the hover and disabled states of the surface they sit on. Point sizes stay a
-  fixed ramp: Tk already applies the display's scaling to them, so the app
-  never multiplies them again.
-- **scrolling that follows the pointer** - the wheel scrolls whatever is under
-  the cursor rather than whatever holds focus; the rules table takes the
-  gesture while it has rows left and hands it back to the page at either end.
-  Its columns are redistributed to the width the table actually has, so the
-  last one always ends inside the frame instead of under the scrollbar.
+- **one stylesheet instead of a hand-rolled design system** - the palette,
+  the type ramp, the cards, the inputs, the focus rings, the hover states and
+  the indicators are declared once as Qt styling over the Fusion style.
+  Nothing is hand-painted and nothing is borrowed from a font, so nothing can
+  arrive as a missing-glyph box, and both themes are the same declaration with
+  a different palette.
+- **display scaling that works** - Qt scales the whole interface by the
+  monitor's factor, fractional ones included, with rounding set to pass 125%,
+  150% and 175% straight through. The type ramp stays a fixed five-step scale
+  in points, because the toolkit does the multiplying.
+- **a redesigned interface** - flatter palette and one type ramp, the rules
+  table as a real model/view with an editing dialog, wheel-guarded dropdowns
+  and number fields so the wheel scrolls the page instead of quietly changing
+  a value, useful help text on every control, and a **Reset all** button.
+- **drag & drop on every platform** - dropping a folder, an image or a `.cbz`
+  onto the input card is handled by Qt's own drop events rather than a
+  Windows-only `WM_DROPFILES` subclass.
 - **presets** - export and import everything you have set up as
   `presets\<name>.janai.json`, minus machine-specific paths and the pinned
   device; settings are remembered between runs regardless.

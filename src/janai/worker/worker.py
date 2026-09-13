@@ -532,6 +532,7 @@ class TilePlanner:
         self._retries = 0
         self._pressure: dict[int, int] = {}
         self._good: dict[int, int] = {}
+        self._last_page: tuple[int, int, int, int] | None = None
 
     # -- memory ------------------------------------------------------------ #
     def _free_bytes(self) -> int:
@@ -665,6 +666,7 @@ class TilePlanner:
         # one tile that covers the page is the fastest case there is
         tile = max(self.MIN_TILE, min(tile, self._align(max(w, h) + self.ALIGN)))
         self.last = tile
+        self._last_page = (key, w, h, c)
         # The whole-page input and output tensors are allocated whatever the
         # tile size is. Keeping them out of the per-pixel cost stops a large
         # page from inflating the estimate and shrinking every later tile.
@@ -743,6 +745,38 @@ class TilePlanner:
         if capped < (self._cap.get(key) or tile):
             self._cap[key] = capped
             log(f"tile capped at {capped}px after {why}", "debug")
+
+    def retiled(self, tile: int) -> None:
+        """Correct the plan with the tile auto_split actually finished with.
+
+        `choose` hands out a plan. A page that turns out not to fit is re-tiled
+        inside auto_split, which the planner never hears about: the result line
+        then reported a tile that never ran, contradicting the splitter's own
+        warning in the same log. Called before `after()` so the calibration
+        measures the tiles that did run, and so the next page starts at the
+        size that worked instead of repeating the failed full-page attempt.
+        """
+        if tile <= 0 or self.last <= 0 or tile >= self.last:
+            return
+        self.last = tile
+        if self._last_page is None:
+            return
+        key, w, h, c = self._last_page
+        if self._pending is not None:
+            pending_key, _pixels, _planned, budget, page_bytes, free = self._pending
+            self._pending = (
+                pending_key,
+                self._tile_pixels(w, h, tile, c),
+                tile,
+                budget,
+                page_bytes,
+                free,
+            )
+        self._good[key] = min(self._good.get(key) or tile, tile)
+        cap = self._cap.get(key) or 0
+        if not cap or tile < cap:
+            self._cap[key] = tile
+            log(f"tile capped at {tile}px: the page had to be re-tiled mid-pass", "debug")
 
 
 # --------------------------------------------------------------------------- #
@@ -1293,9 +1327,27 @@ def choose_model(models: list[dict], is_gray: bool, src_h: int, target_scale: fl
     return pick
 
 
+def _split_report() -> dict | None:
+    """auto_split's note of a page it had to re-tile, when it is reachable."""
+    try:
+        from nodes.impl.upscale.auto_split import retile_report
+    except Exception:
+        return None
+    return retile_report
+
+
+def tile_actually_used() -> int:
+    """The tile the last upscale finished with, or 0 if nothing was lowered."""
+    report = _split_report()
+    return int((report or {}).get("tile", 0) or 0)
+
+
 def upscale_array(ctx, image, model, tile):
     if model is None:
         return image
+    report = _split_report()
+    if report is not None:
+        report["tile"] = 0
     result = _upscale_image_node(ctx, image, model, False, 0, tile, 256, False)
     if hwc(image)[2] == 1 and result.ndim == 3:
         result = np.squeeze(result, axis=-1)
@@ -1944,7 +1996,13 @@ def run_job(job: dict) -> int:
     height = int(ups.get("height") or 0)
     threshold = float(ups.get("grayscale_threshold", 12))
     colour_percent = float(ups.get("grayscale_colour_percent", 0.25))
-    do_gray = bool(ups.get("grayscale_convert", True))
+    # Three exclusive cases, with the old flag as the fallback so a settings
+    # file written by an earlier build still means what it meant.
+    page_kind = str(ups.get("page_kind") or "").strip().lower()
+    if page_kind not in {"detect", "grayscale", "colour"}:
+        page_kind = "detect" if bool(ups.get("grayscale_convert", True)) else "colour"
+    do_gray = page_kind != "colour"
+    force_gray = page_kind == "grayscale"
     do_levels = bool(ups.get("auto_levels", True))
     pre_h = int(ups.get("pre_downscale_height") or 0)
     # The rules table is the only chooser the interface exposes. These two
@@ -2013,7 +2071,7 @@ def run_job(job: dict) -> int:
         built-in picker, which is exactly what the shipped table's catch-all
         rows do explicitly.
         """
-        is_gray = gray and do_gray
+        is_gray = force_gray or (gray and do_gray)
         levels = do_levels
         if not models:
             return None, levels
@@ -2031,6 +2089,21 @@ def run_job(job: dict) -> int:
     def pick_model(gray: bool, oh: int, ow: int) -> dict | None:
         """Model only; the dry run reports models without touching levels."""
         return page_plan(gray, oh, ow)[0]
+
+    def excluded_by_rule(gray: bool, oh: int, ow: int) -> bool:
+        """A rule can exclude a page from the model instead of choosing one.
+
+        The row's page-size condition decides which pages skip upscaling and
+        are only re-encoded - the same outcome as the old long-strip switch,
+        with the sizes visible and editable instead of hardcoded.
+        """
+        hit = rule_set.match(
+            gray=force_gray or (gray and do_gray),
+            width=ow,
+            height=oh,
+            scale=page_factor(oh, ow),
+        )
+        return hit is not None and str(getattr(hit, "action", "upscale")) == "passthrough"
 
     if dry:
         return dry_run(
@@ -2087,8 +2160,13 @@ def run_job(job: dict) -> int:
         """Full single-image pipeline: (uint8 array, is_gray, model name, info)."""
         oh, ow = hwc(image)[:2]
         gray, score, coloured = gray_stats(image, threshold, colour_percent)
-        if skip_long and is_long_strip(ow, oh, long_max_side, long_aspect, long_pixels):
-            log(f"{src_name}: {ow}x{oh} long strip, passed through without upscaling", "warn")
+        if force_gray:
+            gray = True
+        by_rule = excluded_by_rule(gray, oh, ow)
+        by_size = skip_long and is_long_strip(ow, oh, long_max_side, long_aspect, long_pixels)
+        if by_rule or by_size:
+            why = "excluded by a rule" if by_rule else "long strip"
+            log(f"{src_name}: {ow}x{oh} {why}, passed through without upscaling", "warn")
             return (
                 image,
                 gray,
@@ -2116,6 +2194,7 @@ def run_job(job: dict) -> int:
         tile = planner.choose(model, image)
         planner.before()
         image = upscale_array(ctx, image, model, tile)
+        planner.retiled(tile_actually_used())
         planner.after()
         image = _to_uint8(image, normalized=True)
         image = final_resize(image, t_scale, t_w, t_h, ow, oh, gray and do_gray)

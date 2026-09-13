@@ -1,234 +1,373 @@
-"""Interface geometry harness: page scrolling, table columns, indicator styling.
+#!/usr/bin/env python3
+"""Interface geometry harness for the Qt window.
 
-These three things are invisible to ``compileall`` and to the smoke test, and
-all three have regressed at least once:
+Builds the real window and asserts the things that actually went wrong in the
+Tk build: cards that did not lay out, a page that did not scroll, wheel
+gestures eaten by combo boxes and spin boxes, rules columns that did not fit
+their viewport, and a type ramp that drifted from the one theme.py declares.
 
-* the wheel must scroll the page from anywhere on it, including from on top of
-  a dropdown or a number field, while the rules table scrolls its own rows
-  first and hands the page the gesture once it reaches either end;
-* every rules column must be fully inside the table, with the scrollbar
-  outside the cells rather than on top of the last one;
-* checkbuttons must draw a real indicator rather than a missing-glyph box, and
-  the fonts must come straight from the ramp - Tk already multiplies every
-  point size by the display's scaling, so a second factor in the theme made
-  the text roughly twice too big.
+The window is built against a throwaway folder, so running this never touches
+your settings.json, your logs, or your models.
 
-Run it with the bundled interpreter:
+    python scripts/uicheck.py                      # offscreen, nothing appears
+    JANAI_UICHECK_SHOW=1 python scripts/uicheck.py  # on the real display
 
-    backend\\python\\python.exe scripts\\uicheck.py
-
-It needs a display; it never touches the GPU, the backend or your settings.
+Exits non-zero if any check fails, so CI can run it.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import sys
-import tkinter as tk
+import tempfile
 from pathlib import Path
-from tkinter import ttk
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
-os.environ.setdefault("JANAI_SMOKE", "1")
+# Offscreen by default, so this runs in CI and over SSH with no display.
+if not os.environ.get("JANAI_UICHECK_SHOW"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtGui import QFontMetrics, QWheelEvent
+from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
+    QComboBox,
+    QHeaderView,
+    QScrollArea,
+    QWidget,
+)
+
+from janai.app.rules_table import RulesTable
 from janai.app.theme import BASE_SIZES, Theme
-from janai.app.ui import App
-from janai.app.widgets import WHEEL_EVENTS, ScrollArea, Table
+from janai.app.widgets import Card, Collapsible, DropZone, LogView
+from janai.app.window import MainWindow
 
-failures: list[str] = []
-notes: list[str] = []
+FAILURES: list[str] = []
 
 
-def check(ok: bool, label: str, detail: str = "") -> None:
-    mark = "ok  " if ok else "FAIL"
-    print(f"  [{mark}] {label}{(' - ' + detail) if detail else ''}")
+def check(name: str, ok: bool, detail: str = "") -> bool:
+    print(f"  {'ok  ' if ok else 'FAIL'}  {name}" + (f"   {detail}" if detail else ""))
     if not ok:
-        failures.append(label)
+        FAILURES.append(name)
+    return ok
 
 
-def wheel(widget: tk.Misc, delta: int = -120) -> None:
-    """Send one wheel notch to ``widget`` the way Windows does."""
-    widget.event_generate("<MouseWheel>", delta=delta, x=5, y=5)
-    widget.update_idletasks()
+def pump(app: QApplication, rounds: int = 3) -> None:
+    """Let Qt finish laying out before anything is measured."""
+    for _ in range(rounds):
+        app.processEvents()
 
 
-def find(root: tk.Misc, cls: type) -> list[tk.Misc]:
-    out: list[tk.Misc] = []
-    stack = [root]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, cls):
-            out.append(node)
-        stack.extend(node.winfo_children())
-    return out
+def send_wheel(app: QApplication, widget: QWidget, notches: int = -1) -> bool:
+    """One wheel notch over a widget. False if Qt will not build the event."""
+    centre = widget.rect().center()
+    try:
+        event = QWheelEvent(
+            QPointF(centre),
+            QPointF(widget.mapToGlobal(centre)),
+            QPoint(0, notches * 40),
+            QPoint(0, notches * 120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+    except Exception as exc:
+        print(f"  skip  synthetic wheel events unavailable ({exc})")
+        return False
+    QApplication.sendEvent(widget, event)
+    pump(app)
+    return True
+
+
+def check_fonts(theme: Theme) -> None:
+    print("type ramp")
+    check(
+        "the ramp has exactly the declared roles",
+        set(theme.fonts) == set(BASE_SIZES),
+        ", ".join(sorted(theme.fonts)),
+    )
+    for key, size in sorted(BASE_SIZES.items()):
+        font = theme.fonts.get(key)
+        if font is None:
+            check(f"{key} font exists", False)
+            continue
+        check(
+            f"{key} is {size}pt",
+            font.pointSize() == size,
+            f"{font.family()!r} {font.pointSize()}pt",
+        )
+
+
+def check_cards(window: MainWindow) -> None:
+    print("cards")
+    cards = [c for c in window.findChildren(Card) if c.isVisible()]
+    # Input, Upscale and Output are cards; Performance is a collapsible panel.
+    check("the three cards are laid out", len(cards) == 3, f"{len(cards)} visible")
+    panels = [p for p in window.findChildren(Collapsible) if p.isVisible()]
+    check("the collapsible section is laid out", len(panels) >= 1, f"{len(panels)} visible")
+    narrow = [c for c in cards if c.width() < 320]
+    check("no card collapsed narrower than 320px", not narrow, f"{len(narrow)} too narrow")
+    short = [c for c in cards if c.height() < 48]
+    check("no card collapsed shorter than 48px", not short, f"{len(short)} too short")
+    zones = window.findChildren(DropZone)
+    check("the drop zone accepts drops", bool(zones) and zones[0].acceptDrops())
+
+
+def check_scrolling(window: MainWindow, app: QApplication) -> None:
+    print("scrolling")
+    areas = window.findChildren(QScrollArea)
+    if not check("the page has a scroll area", bool(areas)):
+        return
+    bar = areas[0].verticalScrollBar()
+    pump(app)
+    check("the page is taller than its viewport", bar.maximum() > 0, f"max {bar.maximum()}")
+    bar.setValue(bar.maximum())
+    pump(app)
+    check("the page scrolls", bar.value() > 0, f"at {bar.value()}")
+    bar.setValue(0)
+    pump(app)
+
+
+def check_wheel_guard(window: MainWindow, app: QApplication) -> None:
+    """A wheel gesture must scroll the page, not silently retune a control."""
+    print("wheel guard")
+    combos = [w for w in window.findChildren(QComboBox) if w.isVisible() and w.count() > 1]
+    if check("a combo box is on screen", bool(combos)):
+        combo = combos[0]
+        combo.clearFocus()
+        before = combo.currentIndex()
+        if send_wheel(app, combo):
+            check(
+                "an unfocused combo box ignores the wheel",
+                combo.currentIndex() == before,
+                f"index {before} -> {combo.currentIndex()}",
+            )
+    spins = [w for w in window.findChildren(QAbstractSpinBox) if w.isVisible()]
+    if check("a spin box is on screen", bool(spins)):
+        spin = spins[0]
+        spin.clearFocus()
+        before_text = spin.text()
+        if send_wheel(app, spin):
+            check(
+                "an unfocused spin box ignores the wheel",
+                spin.text() == before_text,
+                f"{before_text!r} -> {spin.text()!r}",
+            )
+
+
+def check_rules_table(window: MainWindow, theme: Theme, app: QApplication) -> None:
+    print("rules table")
+    tables = window.findChildren(RulesTable)
+    if not check("the rules table is present", bool(tables)):
+        return
+    table = tables[0]
+    pump(app)
+    model = table.model()
+    columns = model.columnCount() if model is not None else 0
+    check("five columns", columns == 5, f"{columns} columns")
+    header = table.horizontalHeader()
+    stretching = [
+        c for c in range(columns) if header.sectionResizeMode(c) == QHeaderView.ResizeMode.Stretch
+    ]
+    check("the Model column takes the slack", stretching == [3], f"stretching {stretching}")
+    used = sum(header.sectionSize(c) for c in range(columns))
+    room = table.viewport().width()
+    check("every column fits the viewport", used <= room + 2, f"{used}px in {room}px")
+    line = QFontMetrics(theme.fonts["body"]).height()
+    row_h = table.verticalHeader().defaultSectionSize()
+    check("row height clears the body font", row_h >= line + 4, f"{row_h}px row, {line}px text")
+
+
+def check_log_panel(window: MainWindow, app: QApplication) -> None:
+    print("log panel")
+    window.show_log(True)
+    pump(app)
+    check("the log panel opens", window.log_panel.isVisible())
+    sizes = window.splitter.sizes()
+    check("the splitter gives both halves room", all(s > 0 for s in sizes), str(sizes))
+    window.log("uicheck reached the log", "info")
+    pump(app)
+    views = window.findChildren(LogView)
+    text = views[0].toPlainText() if views else ""
+    check("a line reaches the log view", "uicheck reached the log" in text)
+    window.show_log(False)
+    pump(app)
+
+
+def check_theme_toggle(window: MainWindow, app: QApplication) -> None:
+    print("theme")
+    was = window.theme.p.name
+    before = app.styleSheet()
+    window.toggle_theme()
+    pump(app)
+    check(
+        "toggling swaps the palette", window.theme.p.name != was, f"{was} -> {window.theme.p.name}"
+    )
+    check("toggling restyles the whole application", app.styleSheet() != before)
+    window.toggle_theme()
+    pump(app)
+    check("toggling back restores it", window.theme.p.name == was)
+
+
+def check_text_entry(window: MainWindow, app: QApplication) -> None:
+    """Typing has to reach the file-name field - a dead text box was reported."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+
+    print()
+    print("text entry")
+    field = window.ed_pattern
+    check(
+        "the name pattern defaults to {name}_JaNai",
+        field.text() == "{name}_JaNai",
+        field.text(),
+    )
+    check("the field is editable", field.isEnabled() and not field.isReadOnly())
+    check("the field can take focus", field.focusPolicy() != Qt.FocusPolicy.NoFocus)
+    field.setFocus(Qt.FocusReason.MouseFocusReason)
+    pump(app)
+    check("focus lands on the field", field.hasFocus())
+    was = field.text()
+    field.selectAll()
+    for char in "ZQ":
+        for kind in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            app.sendEvent(
+                field, QKeyEvent(kind, Qt.Key.Key_Z, Qt.KeyboardModifier.NoModifier, char)
+            )
+    pump(app)
+    check("typed keys reach the field", field.text() == "ZQ", f"{was!r} -> {field.text()!r}")
+    field.setText(was)
+    pump(app)
+
+
+def check_page_kind(window: MainWindow, app: QApplication) -> None:
+    """The page kind is one exclusive choice, and it drives the table and summary."""
+    print()
+    print("page kind")
+    check("three exclusive page kinds", window.cb_pagekind.count() == 3)
+    was = window.page_kind()
+    window.set_page_kind("colour")
+    window.on_pagekind_change()
+    pump(app)
+    check("declaring colour reads back", window.page_kind() == "colour")
+    check("declaring colour stands down the grayscale rules", not window.gray_rules_live())
+    check(
+        "the summary says every page is colour",
+        "every page colour" in window.lbl_upscale_sum.text(),
+        window.lbl_upscale_sum.text(),
+    )
+    window.set_page_kind("grayscale")
+    window.on_pagekind_change()
+    pump(app)
+    check("declaring grayscale keeps the grayscale rules live", window.gray_rules_live())
+    window.set_page_kind(was)
+    window.on_pagekind_change()
+    pump(app)
+
+
+def check_row_numbers(window: MainWindow) -> None:
+    """Warnings name row numbers, so the table has to show them."""
+    from PySide6.QtCore import Qt
+
+    print()
+    print("rule rows")
+    tables = window.findChildren(RulesTable)
+    if not check("the rules table is present", bool(tables)):
+        return
+    table = tables[0]
+    check("row numbers are shown", table.verticalHeader().isVisible())
+    model = table.model()
+    first = model.headerData(0, Qt.Orientation.Vertical, Qt.ItemDataRole.DisplayRole)
+    check("the first row is numbered 1", str(first) == "1", repr(first))
+    notes = [r.note for r in window.rules]
+    left = [n for n in notes if "catch-all" in n]
+    check("no unsized catch-all rows survive", not left, f"{len(left)} left")
+    check("no scale warnings on the shipped table", not window.scale_mismatches())
+
+
+def check_geometry_clamp(window: MainWindow, app: QApplication) -> None:
+    """A saved size larger than the desktop must be clamped, not restored as-is."""
+    print()
+    print("geometry")
+    was = window._geometry_text()
+    screen = app.primaryScreen()
+    area = screen.availableGeometry() if screen is not None else None
+    window._apply_geometry("4000x3000+0+0")
+    pump(app)
+    check(
+        "an oversized saved size is clamped",
+        window.width() < 4000 and window.height() < 3000,
+        f"{window.width()}x{window.height()}",
+    )
+    if area is not None and area.width() >= 1040 and area.height() >= 760:
+        check(
+            "the clamped window leaves desktop around it",
+            window.width() < area.width() and window.height() < area.height(),
+            f"{window.width()}x{window.height()} in {area.width()}x{area.height()}",
+        )
+    window._apply_geometry("")
+    pump(app)
+    check("an unsaved window still opens workably", window.width() >= 920, f"{window.width()}px")
+    window._apply_geometry(was)
+    pump(app)
 
 
 def main() -> int:
-    root = tk.Tk()
-    root.withdraw()
-    app = App(root, ROOT)
-    root.geometry("1040x700")
-    root.deiconify()
-    root.update()
-    root.update_idletasks()
+    app = QApplication.instance() or QApplication(sys.argv)
 
-    print("\nscroll area")
-    area = app.scroll
-    canvas = area.canvas
-    print(
-        f"  canvas {canvas.winfo_width()}x{canvas.winfo_height()} "
-        f"body req {area.body.winfo_reqheight()} "
-        f"region {canvas.cget('scrollregion')!r} yview {canvas.yview()}"
-    )
-    first, last = canvas.yview()
-    check(last - first < 0.999, "page has something to scroll", f"yview {first:.3f}-{last:.3f}")
+    # Qt can still hold a handle inside the folder after the window goes, and
+    # Windows will not delete a folder that is in use. Every check is done by
+    # then, so a leftover temp folder must not fail the run.
+    with tempfile.TemporaryDirectory(prefix="janai-uicheck-", ignore_cleanup_errors=True) as tmp:
+        root = Path(tmp)
+        saved = ROOT / "settings.json"
+        if saved.exists():  # same layout as the real thing, none of the writes
+            shutil.copy2(saved, root / "settings.json")
 
-    # The wheel has to work from every kind of widget on the page, not just
-    # from the bare canvas: in practice the pointer is always over a child.
-    targets: list[tuple[str, tk.Misc]] = [("canvas", canvas)]
-    for label, cls in (("label", ttk.Label), ("combobox", ttk.Combobox), ("spinbox", ttk.Spinbox)):
-        found = [w for w in find(area, cls) if w.winfo_ismapped()]
-        if found:
-            targets.append((label, found[0]))
-    for label, widget in targets:
-        canvas.yview_moveto(0.0)
-        root.update_idletasks()
-        before = canvas.yview()[0]
-        wheel(widget)
-        after = canvas.yview()[0]
-        check(
-            after > before, f"wheel over {label} scrolls the page", f"{before:.3f} -> {after:.3f}"
+        theme = Theme("dark")
+        theme.apply(app)
+        window = MainWindow(root, theme, app)
+        window.resize(1180, 900)
+        window.show()
+        pump(app, 6)
+
+        screen = app.primaryScreen()
+        size = screen.geometry() if screen is not None else None
+        print(
+            f"platform {app.platformName()!r}  "
+            f"screen {size.width() if size else 0}x{size.height() if size else 0}  "
+            f"ratio {window.devicePixelRatio():.2f}  "
+            f"window {window.width()}x{window.height()}"
         )
 
-    # The rules table has rows of its own, so it takes the gesture first and
-    # only hands it to the page once it runs out - assert that nested
-    # behaviour instead of demanding the page move from on top of it.
-    tables = find(area, Table)
-    if tables:
-        rows_tree = tables[0].tree
-        canvas.yview_moveto(0.0)
-        rows_tree.yview_moveto(0.0)
-        root.update_idletasks()
-        span = rows_tree.yview()
-        print(f"  table rows yview {span[0]:.3f}-{span[1]:.3f}")
-        page_before, rows_before = canvas.yview()[0], rows_tree.yview()[0]
-        wheel(rows_tree)
-        page_after, rows_after = canvas.yview()[0], rows_tree.yview()[0]
-        check(
-            rows_after > rows_before or page_after > page_before,
-            "wheel over the table moves something",
-            f"rows {rows_before:.3f}->{rows_after:.3f} page {page_before:.3f}->{page_after:.3f}",
-        )
-        rows_tree.yview_moveto(1.0)
-        root.update_idletasks()
-        page_before = canvas.yview()[0]
-        wheel(rows_tree)
-        check(
-            canvas.yview()[0] > page_before,
-            "table hands the page the wheel at its end",
-            f"{page_before:.3f} -> {canvas.yview()[0]:.3f}",
-        )
+        check_fonts(theme)
+        check_cards(window)
+        check_scrolling(window, app)
+        check_wheel_guard(window, app)
+        check_rules_table(window, theme, app)
+        check_log_panel(window, app)
+        check_theme_toggle(window, app)
+        check_text_entry(window, app)
+        check_page_kind(window, app)
+        check_row_numbers(window)
+        check_geometry_clamp(window, app)
 
-    canvas.yview_moveto(1.0)
-    root.update_idletasks()
-    bottom = canvas.yview()[0]
-    wheel(canvas, delta=120)
-    check(canvas.yview()[0] < bottom, "wheel scrolls back up")
-
-    # A dropdown must not change value when the wheel passes over it.
-    combos = [w for w in find(area, ttk.Combobox) if w.winfo_ismapped()]
-    if combos:
-        cb = combos[0]
-        values = list(cb.cget("values") or [])
-        if len(values) > 1:
-            cb.set(values[0])
-            wheel(cb)
-            check(cb.get() == values[0], "wheel does not change a dropdown", cb.get())
-
-    print("\nrules table")
-    table = app.rules_table
-    tree = table.tree
-    inner = tree.winfo_width()
-    cols = list(tree.cget("columns"))
-    widths = [int(tree.column(c, "width")) for c in cols]
-    total = sum(widths)
-    print(f"  tree width {inner} · columns {dict(zip(cols, widths, strict=True))} · total {total}")
-    check(inner > 1, "table has been laid out", str(inner))
-    check(total <= inner, "columns fit inside the table", f"{total} <= {inner}")
-    check(inner - total <= 2, "columns fill the table", f"gap {inner - total}")
-
-    # bbox of the last column tells us whether it is really on screen.
-    if tree.get_children():
-        item = tree.get_children()[0]
-        box = tree.bbox(item, cols[-1])
-        if box:
-            x, _y, w, _h = box
-            check(x + w <= inner, "last column ends inside the table", f"{x + w} <= {inner}")
-        heading = tree.heading(cols[-1], "text")
-        check(heading == "Auto levels", "last heading is intact", heading)
-    else:
-        notes.append("no rules installed, skipped the last-column bbox check")
-
-    check(
-        str(table.vbar.winfo_manager()) == "grid" or not table.vbar.winfo_ismapped(),
-        "table scrollbar is managed",
-    )
-    if table.vbar.winfo_ismapped():
-        check(
-            table.vbar.winfo_x() >= tree.winfo_x() + inner,
-            "scrollbar sits outside the cells",
-            f"bar x {table.vbar.winfo_x()} vs tree end {tree.winfo_x() + inner}",
-        )
-
-    print("\nstyling")
-    theme: Theme = app.theme
-    style = theme.style
-    layout = str(style.layout("TCheckbutton"))
-    print(f"  checkbutton layout {layout}")
-    check("indicator" in layout, "checkbutton has an indicator element")
-    scaling = float(root.tk.call("tk", "scaling"))
-    body = theme.fonts["body"]
-    print(
-        f"  tk scaling {scaling:.3f} · body {body.cget('family')!r} {body.cget('size')}pt "
-        f"= {body.metrics('linespace')}px · rowheight {style.lookup('Rules.Treeview', 'rowheight')}"
-    )
-    check(
-        body.cget("size") == BASE_SIZES["body"],
-        "body font is the ramp, not scaled twice",
-        f"{body.cget('size')}pt vs ramp {BASE_SIZES['body']}pt",
-    )
-    check(
-        body.metrics("linespace") >= 15, "body text is readable", f"{body.metrics('linespace')}px"
-    )
-    rowheight = int(style.lookup("Rules.Treeview", "rowheight") or 0)
-    check(
-        rowheight >= body.metrics("linespace") + 6,
-        "table rows clear the font",
-        f"{rowheight} vs {body.metrics('linespace')}",
-    )
-
-    # Every wheel-guarded control should still be reachable by the page.
-    guarded = 0
-    for cls in (ttk.Combobox, ttk.Spinbox, ttk.Entry):
-        for widget in find(area, cls):
-            binds = [seq for seq in WHEEL_EVENTS if widget.bind(seq)]
-            if binds:
-                guarded += 1
-    print(f"  wheel-guarded controls: {guarded}")
-    check(guarded > 0, "controls carry a wheel guard")
-    check(isinstance(area, ScrollArea), "page is a scroll area")
-
-    root.destroy()
+        window.close()
+        pump(app)
 
     print()
-    for note in notes:
-        print(f"  note: {note}")
-    if failures:
-        print(f"FAILED: {len(failures)} check(s): " + ", ".join(failures))
+    if FAILURES:
+        print(f"{len(FAILURES)} check(s) failed: " + ", ".join(FAILURES))
         return 1
-    print("ALL PASS")
+    print("all checks passed")
     return 0
 
 

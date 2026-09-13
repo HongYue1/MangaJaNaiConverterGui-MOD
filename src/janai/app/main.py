@@ -3,8 +3,13 @@
 Run via JaNaiUpscaler.cmd, or directly:
     backend\\python\\Scripts\\pythonw.exe -m janai
 
-The GUI imports nothing heavier than the Python standard library; torch and
-friends only ever live inside the worker process.
+The interface is Qt (PySide6). Nothing heavier is imported here, and nothing
+heavier is imported by the window either: torch and friends only ever live
+inside the worker process, which is started on demand.
+
+Everything in this file is work that has to happen before any widget exists -
+the display-scaling policy, the identity Windows uses for the taskbar, and a
+readable message if Qt is not installed yet.
 
 Environment:
     JANAI_SMOKE=1   build the whole window, then close it (used for self-tests)
@@ -26,94 +31,114 @@ ROOT = _HERE.parents[3]  # the app folder itself
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+ICON_NAMES = ("logo.png", "logo.ico", "assets/logo.png")
 
-def enable_dpi_awareness() -> None:
-    """Crisp text on high-DPI Windows displays."""
+NO_QT = (
+    "JaNai Upscaler needs Qt (PySide6) and this interpreter does not have it.\n\n"
+    "Run setup.cmd (Windows) or ./setup.sh (Linux) in the app folder, or install\n"
+    "it by hand:\n\n"
+    "    python -m pip install PySide6-Essentials\n"
+)
+
+
+def fatal(message: str) -> None:
+    """Say it on stderr, and in a dialog if Qt got far enough to show one."""
+    sys.stderr.write(message + "\n")
+    try:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        existing = QApplication.instance()
+        app = existing or QApplication(sys.argv)
+        QMessageBox.critical(None, "JaNai Upscaler", message)
+        if existing is None:
+            app.quit()
+    except Exception:
+        pass
+
+
+def declare_windows_identity() -> None:
+    """Give Windows an app id, so the taskbar groups and pins this window."""
     if sys.platform != "win32":
         return
     try:
         import ctypes
-    except Exception:
-        return
-    try:
-        user32 = ctypes.windll.user32
-        set_ctx = getattr(user32, "SetProcessDpiAwarenessContext", None)
-        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-        if set_ctx and set_ctx(ctypes.c_void_p(-4)):
-            return
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        return
-    except Exception:
-        pass
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("JaNai.Upscaler")
     except Exception:
         pass
 
 
-def fatal(message: str) -> None:
-    sys.stderr.write(message + "\n")
-    try:
-        import tkinter as tk
-        from tkinter import messagebox
+def find_icon() -> Path | None:
+    for name in ICON_NAMES:
+        candidate = ROOT / name
+        if candidate.exists():
+            return candidate
+    return None
 
-        tmp = tk.Tk()
-        tmp.withdraw()
-        messagebox.showerror("JaNai Upscaler", message)
-        tmp.destroy()
+
+def saved_theme() -> str:
+    """The palette the window was last left in, read before it is built."""
+    try:
+        from janai.app.state import Settings
+
+        return str(Settings(ROOT / "settings.json").load().data.get("theme") or "dark")
     except Exception:
-        pass
+        return "dark"
 
 
 def main() -> int:
-    enable_dpi_awareness()
+    declare_windows_identity()
 
     try:
-        import tkinter as tk
-    except Exception as exc:  # pragma: no cover - broken interpreter
-        fatal(
-            "This Python build has no Tkinter, so the interface cannot start.\n\n"
-            f"{exc}\n\nRun setup.cmd to install the bundled runtime."
-        )
+        from PySide6.QtCore import Qt, QTimer
+        from PySide6.QtGui import QIcon
+        from PySide6.QtWidgets import QApplication
+    except Exception as exc:  # pragma: no cover - depends on the install
+        sys.stderr.write(f"{NO_QT}\n{exc}\n")
         return 2
 
+    # Fractional display scales (125%, 150%, 175%) are passed through rather
+    # than rounded, so a 150% display gets 150% widgets and text stays crisp.
+    # Qt does the scaling itself, which is the thing the Tk build could never
+    # do; it is set explicitly here because it matters enough to be stated.
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("JaNai Upscaler")
+    app.setApplicationDisplayName("JaNai Upscaler")
+    app.setOrganizationName("JaNai")
+    app.setDesktopFileName("janai-upscaler")  # how Wayland/X11 find the icon
+
+    icon = find_icon()
+    if icon is not None:
+        app.setWindowIcon(QIcon(str(icon)))
+
     try:
-        from janai.app.ui import App
+        from janai.app.theme import Theme
+        from janai.app.window import MainWindow
     except Exception:
         fatal("Could not load the interface:\n\n" + traceback.format_exc())
         return 2
 
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        scaling = float(root.winfo_fpixels("1i")) / 72.0
-        if 0.5 < scaling < 6.0:
-            root.tk.call("tk", "scaling", scaling)
-    except Exception:
-        pass
+    theme = Theme(saved_theme())
+    theme.apply(app)  # one stylesheet for the whole application
 
     try:
-        App(root, ROOT)
+        window = MainWindow(ROOT, theme, app)
     except Exception:
-        try:
-            root.destroy()
-        except Exception:
-            pass
         fatal("JaNai Upscaler failed to start:\n\n" + traceback.format_exc())
         return 1
 
-    root.deiconify()
-    try:
-        root.lift()
-        root.focus_force()
-    except Exception:
-        pass
+    window.show()
+    window.raise_()
+    window.activateWindow()
 
     if os.environ.get("JANAI_SMOKE"):
-        root.after(900, root.destroy)
+        QTimer.singleShot(900, app.quit)
 
-    root.mainloop()
-    return 0
+    return int(app.exec())
 
 
 if __name__ == "__main__":

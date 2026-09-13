@@ -1,651 +1,434 @@
-"""Dark/light theme for ttk. Pure stdlib, no third-party dependencies.
+"""Palette, type ramp and stylesheet for the JaNai Upscaler interface.
 
-The look is deliberately minimal: one background, one card surface, one inset
-surface for controls, a single accent, and a 1px border instead of shadows or
-gradients. Everything is expressed as ttk styles so the widgets stay native -
-real focus rings, real DPI scaling, real keyboard behaviour.
+Qt does the pixel work the old Tk theme had to fake by hand: per-monitor DPI
+scaling, real controls, and one stylesheet for the whole window. Switching
+theme is therefore a single string swap instead of a walk over every widget.
 
-Point sizes are a plain fixed ramp. Tk already multiplies every point size by
-the display's own scaling (see ``main.enable_dpi_awareness`` and the ``tk
-scaling`` call next to it), so a second factor applied here made text come out
-roughly twice too large on a scaled display.
-
-One part is less obvious than it looks: **check boxes are drawn here.** clam's
-own indicator is a bevelled box that loses its outline once borders are
-flattened, which left the boxes hard to tell apart from their background. They
-are painted as small images instead, one set per surface, sized from the body
-font's measured line height and repainted whenever the palette changes.
+Colours live in :class:`Palette`. :meth:`Theme.apply` pushes them into the
+application twice over: as a QPalette, so the parts Qt draws itself (checkbox
+ticks, dropdown arrows, text cursors) follow the theme, and as targeted QSS
+for cards, tables, buttons and typography.
 """
 
 from __future__ import annotations
 
-import tkinter as tk
 from dataclasses import dataclass
-from itertools import pairwise
-from tkinter import font as tkfont, ttk
+from pathlib import Path
+
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
+from PySide6.QtWidgets import QApplication
+
+#: Small SVGs for the one part of a control a stylesheet has to redraw itself:
+#: the checkbox tick. Qt wants a URL, so the path is POSIX-style on Windows too.
+ASSETS = Path(__file__).resolve().parent / "assets"
 
 
-@dataclass(frozen=True)
-class Palette:
-    name: str
-    bg: str
-    surface: str
-    surface2: str
-    border: str
-    text: str
-    muted: str
-    accent: str
-    accent_hi: str
-    accent_text: str
-    ok: str
-    warn: str
-    err: str
-    sel: str
+def asset_url(name: str) -> str:
+    return ASSETS.joinpath(name).as_posix()
 
 
-DARK = Palette(
-    name="dark",
-    bg="#0f1115",
-    surface="#161920",
-    surface2="#1e222b",
-    border="#272c37",
-    text="#e6e9ef",
-    muted="#8b93a3",
-    accent="#6a8cff",
-    accent_hi="#88a3ff",
-    accent_text="#ffffff",
-    ok="#4ec38a",
-    warn="#e0b341",
-    err="#f36d64",
-    sel="#243050",
-)
+#: Point sizes for the type ramp. Qt multiplies points by the display scale
+#: itself, so these are written once and never touched again - the double
+#: scaling that made the old build's text twice too big cannot happen here.
+BASE_SIZES: dict[str, int] = {"display": 16, "title": 11, "body": 9, "small": 8, "mono": 9}
 
-LIGHT = Palette(
-    name="light",
-    bg="#f6f7f9",
-    surface="#ffffff",
-    surface2="#f0f2f6",
-    border="#e1e4ea",
-    text="#14171d",
-    muted="#5f6673",
-    accent="#3b6cf6",
-    accent_hi="#2a5be0",
-    accent_text="#ffffff",
-    ok="#147d45",
-    warn="#8a6200",
-    err="#c92a2a",
-    sel="#dde6ff",
-)
-
-PALETTES = {"dark": DARK, "light": LIGHT}
-
-
-# Preference order for the interface face and the log face. Both lists end in
-# faces that ship with mainstream Linux desktops, so the app reads the same way
-# there as it does on Windows instead of falling back to a bitmap font.
-UI_FAMILIES = (
+#: Preferred families, best first. Qt falls back per glyph, so a missing face
+#: degrades to the next one instead of drawing empty boxes.
+SANS: tuple[str, ...] = (
     "Segoe UI Variable Text",
     "Segoe UI",
     "Inter",
-    "SF Pro Text",
     "Noto Sans",
-    "Ubuntu",
-    "Cantarell",
     "DejaVu Sans",
-    "Arial",
+    "Helvetica Neue",
 )
-MONO_FAMILIES = (
+MONO: tuple[str, ...] = (
     "Cascadia Mono",
-    "Cascadia Code",
     "Consolas",
     "JetBrains Mono",
-    "SF Mono",
-    "Liberation Mono",
-    "DejaVu Sans Mono",
     "Menlo",
+    "DejaVu Sans Mono",
     "Courier New",
 )
 
 
-def pick_family(candidates: tuple[str, ...] = UI_FAMILIES, fallback: str = "TkDefaultFont") -> str:
-    """First installed family from ``candidates``, else ``fallback``."""
-    families = set(tkfont.families())
-    for name in candidates:
-        if name in families:
+@dataclass(frozen=True)
+class Palette:
+    """One theme's colours. Everything drawn comes from these fields."""
+
+    name: str
+    bg: str  # window behind the cards
+    surface: str  # card face
+    surface2: str  # inputs, headers, raised chips
+    line: str  # borders and separators
+    text: str
+    muted: str  # secondary text, disabled rows
+    accent: str
+    accent_text: str  # text drawn on top of the accent
+    accent_hi: str  # accent, hovered
+    ok: str
+    warn: str
+    err: str
+    sel: str  # selected table row
+    drop: str  # the drop target's face
+    row: str  # alternating table row
+
+
+DARK = Palette(
+    name="dark",
+    bg="#0f1116",
+    surface="#161a21",
+    surface2="#1d222b",
+    line="#272e3a",
+    text="#e7eaf0",
+    muted="#98a2b3",
+    accent="#4c8dff",
+    accent_text="#08101f",
+    accent_hi="#6ba2ff",
+    ok="#48d597",
+    warn="#f3c14b",
+    err="#ff6b6b",
+    sel="#24334d",
+    drop="#12161d",
+    row="#1a1f27",
+)
+
+LIGHT = Palette(
+    name="light",
+    bg="#f4f6f9",
+    surface="#ffffff",
+    surface2="#eef1f5",
+    line="#dce1e9",
+    text="#161a22",
+    muted="#5b6577",
+    accent="#2563eb",
+    accent_text="#ffffff",
+    accent_hi="#1d4ed8",
+    ok="#0f7b4f",
+    warn="#a4650a",
+    err="#c02626",
+    sel="#dce8ff",
+    drop="#f7f9fc",
+    row="#f8fafc",
+)
+
+PALETTES: dict[str, Palette] = {DARK.name: DARK, LIGHT.name: LIGHT}
+
+
+def _family(preferred: tuple[str, ...], fixed: bool = False) -> str:
+    """The first installed family from ``preferred``, else the system default."""
+    try:
+        installed = set(QFontDatabase.families())
+    except Exception:  # no QGuiApplication yet
+        installed = set()
+    for name in preferred:
+        if name in installed:
             return name
-    return fallback
+    role = QFontDatabase.SystemFont.FixedFont if fixed else QFontDatabase.SystemFont.GeneralFont
+    try:
+        return QFontDatabase.systemFont(role).family()
+    except Exception:
+        return "monospace" if fixed else "sans-serif"
 
 
-#: One ramp used everywhere: 9 for supporting text, 10 for body and the log,
-#: 11 and 16 for the two heading levels. Tk applies the display's scaling to
-#: these on its own - nothing multiplies them a second time.
-BASE_SIZES = {
-    "body": 10,
-    "bold": 10,
-    "small": 9,
-    "tiny": 9,
-    "title": 16,
-    "card": 11,
-    "mono": 10,
-    "mono_bold": 10,
-}
-BOLD_KEYS = frozenset({"bold", "title", "card", "mono_bold"})
-
-
-def _stamp_tick(rows: list[list[str]], box: int, colour: str, thick: int) -> None:
-    """Draw a check mark inside an already-painted box."""
-    weight = 1 if box < 22 else 2
-    corners = ((0.26, 0.54), (0.44, 0.71), (0.76, 0.31))
-    for (x0, y0), (x1, y1) in pairwise(corners):
-        for step in range(box + 1):
-            t = step / box
-            cx = round((x0 + (x1 - x0) * t) * box)
-            cy = round((y0 + (y1 - y0) * t) * box)
-            for dy in range(-weight, weight + 1):
-                for dx in range(-weight, weight + 1):
-                    x, y = cx + dx, cy + dy
-                    if thick <= x < box - thick and thick <= y < box - thick:
-                        rows[y][x] = colour
-
-
-def _check_matrix(
-    box: int,
-    gap: int,
-    *,
-    fill: str,
-    edge: str,
-    mark: str | None,
-    outside: str,
-    thick: int,
-) -> str:
-    """Photo-image data for one check-box state.
-
-    The box is opaque and the gap before the label is painted in the surface
-    behind it, so a single image works on any card without transparency.
-    Corner pixels take the surface colour, which reads as a rounded box.
-    """
-    rows: list[list[str]] = []
-    last = box - 1
-    for y in range(box):
-        row: list[str] = []
-        for x in range(box):
-            at_x = x < thick or x > last - thick
-            at_y = y < thick or y > last - thick
-            if at_x and at_y:
-                row.append(outside)
-            elif at_x or at_y:
-                row.append(edge)
-            else:
-                row.append(fill)
-        row.extend([outside] * gap)
-        rows.append(row)
-    if mark:
-        _stamp_tick(rows, box, mark, thick)
-    return " ".join("{" + " ".join(r) + "}" for r in rows)
+def _fonts() -> dict[str, QFont]:
+    """The type ramp as ready-made fonts."""
+    sans, mono = _family(SANS), _family(MONO, fixed=True)
+    out: dict[str, QFont] = {}
+    for key, size in BASE_SIZES.items():
+        font = QFont(mono if key == "mono" else sans)
+        font.setPointSize(size)
+        if key == "display" or key == "title":
+            font.setWeight(QFont.Weight.DemiBold)
+        out[key] = font
+    return out
 
 
 class Theme:
-    """Applies a palette to a root window and remembers it for redraws."""
+    """The active palette, and the means to put it on screen."""
 
-    #: Which surface each check-button style sits on, so the pixels around the
-    #: box match the background behind it exactly.
-    CHECK_STYLES = (
-        ("TCheckbutton", "surface"),
-        ("Inset.TCheckbutton", "surface2"),
-        ("Bg.TCheckbutton", "bg"),
-    )
+    def __init__(self, mode: str = "dark") -> None:
+        self.p = PALETTES.get(str(mode).lower().strip(), DARK)
+        self.fonts = _fonts()
 
-    def __init__(self, root: tk.Misc, mode: str = "dark") -> None:
-        self.root = root
-        self.style = ttk.Style(root)
-        try:
-            self.style.theme_use("clam")
-        except tk.TclError:
-            pass
-        self.family = pick_family()
-        self.mono_family = pick_family(MONO_FAMILIES, "TkFixedFont")
-        self.fonts = {
-            key: tkfont.Font(
-                family=self.mono_family if key.startswith("mono") else self.family,
-                size=BASE_SIZES[key],
-                weight="bold" if key in BOLD_KEYS else "normal",
-            )
-            for key in BASE_SIZES
-        }
-        self._sync_named_fonts()
-        self._images: dict[str, tk.PhotoImage] = {}
-        self._indicators: dict[str, str] = {}
-        self.p = PALETTES.get(mode, DARK)
-        self.apply(mode)
+    @property
+    def mode(self) -> str:
+        return self.p.name
 
-    # -- sizing --------------------------------------------------------- #
-    def line_height(self, key: str = "body") -> int:
-        """Measured line height of one of the shared fonts."""
-        try:
-            return int(self.fonts[key].metrics("linespace"))
-        except (tk.TclError, KeyError):
-            return 17
+    def apply(self, app: QApplication) -> None:
+        """Dress the whole application in the current palette."""
+        app.setStyle("Fusion")  # one predictable base on every platform
+        app.setFont(self.fonts["body"])
+        app.setPalette(self.qpalette())
+        app.setStyleSheet(self.qss())
 
-    def row_height(self) -> int:
-        """The original 26px table row, widened only if the font needs it."""
-        return max(26, self.line_height("small") + 6)
+    def toggle(self, app: QApplication) -> str:
+        """Swap dark and light, repaint everything, and report the new mode."""
+        self.p = LIGHT if self.p.name == DARK.name else DARK
+        self.apply(app)
+        return self.p.name
 
-    def _sync_named_fonts(self) -> None:
-        """Point Tk's named fonts at the same faces.
-
-        Plain tk widgets - the log text area, tooltips, menus - read the named
-        fonts rather than a ttk style.
-        """
-        for named, key in (
-            ("TkDefaultFont", "body"),
-            ("TkTextFont", "body"),
-            ("TkMenuFont", "body"),
-            ("TkHeadingFont", "bold"),
-            ("TkTooltipFont", "small"),
-            ("TkFixedFont", "mono"),
-        ):
-            try:
-                target = tkfont.nametofont(named, root=self.root)
-            except tk.TclError:
-                continue
-            src = self.fonts[key]
-            target.configure(
-                family=src.cget("family"), size=src.cget("size"), weight=src.cget("weight")
-            )
-
-    # -- check-box indicators ------------------------------------------- #
-    def _indicator_size(self) -> tuple[int, int]:
-        box = max(14, min(28, round(self.line_height("body") * 0.92)))
-        return box, max(6, round(box * 0.45))
-
-    def _paint_indicators(self) -> None:
-        """(Re)draw every indicator image for the current palette and size."""
+    # ------------------------------------------------------------------ #
+    def qpalette(self) -> QPalette:
+        """Colours for everything Qt draws without asking the stylesheet."""
         p = self.p
-        box, gap = self._indicator_size()
-        thick = 2 if box >= 20 else 1
-        for _style_name, surface in self.CHECK_STYLES:
-            outside = getattr(p, surface)
-            empty = p.bg if surface == "surface2" else p.surface2
-            states = {
-                "off": {"fill": empty, "edge": p.border, "mark": None},
-                "hover": {"fill": empty, "edge": p.accent, "mark": None},
-                "on": {"fill": p.accent, "edge": p.accent, "mark": p.accent_text},
-                "hover_on": {"fill": p.accent_hi, "edge": p.accent_hi, "mark": p.accent_text},
-                "off_off": {"fill": outside, "edge": p.border, "mark": None},
-                "on_off": {"fill": p.border, "edge": p.border, "mark": p.muted},
-            }
-            for state, kw in states.items():
-                key = f"{surface}:{state}"
-                img = self._images.get(key)
-                if img is None:
-                    img = tk.PhotoImage(master=self.root, width=box + gap, height=box)
-                    self._images[key] = img
-                elif img.width() != box + gap or img.height() != box:
-                    img.configure(width=box + gap, height=box)
-                img.blank()
-                img.put(_check_matrix(box, gap, outside=outside, thick=thick, **kw), to=(0, 0))
+        pal = QPalette()
+        role = QPalette.ColorRole
+        group = QPalette.ColorGroup
+        pal.setColor(role.Window, QColor(p.bg))
+        pal.setColor(role.WindowText, QColor(p.text))
+        pal.setColor(role.Base, QColor(p.surface2))
+        pal.setColor(role.AlternateBase, QColor(p.row))
+        pal.setColor(role.ToolTipBase, QColor(p.surface2))
+        pal.setColor(role.ToolTipText, QColor(p.text))
+        pal.setColor(role.Text, QColor(p.text))
+        pal.setColor(role.PlaceholderText, QColor(p.muted))
+        pal.setColor(role.Button, QColor(p.surface2))
+        pal.setColor(role.ButtonText, QColor(p.text))
+        pal.setColor(role.BrightText, QColor(p.err))
+        pal.setColor(role.Link, QColor(p.accent))
+        pal.setColor(role.Highlight, QColor(p.accent))
+        pal.setColor(role.HighlightedText, QColor(p.accent_text))
+        pal.setColor(role.Mid, QColor(p.line))
+        pal.setColor(role.Midlight, QColor(p.surface2))
+        pal.setColor(role.Dark, QColor(p.line))
+        pal.setColor(role.Shadow, QColor(p.bg))
+        for disabled in (role.WindowText, role.Text, role.ButtonText):
+            pal.setColor(group.Disabled, disabled, QColor(p.muted))
+        return pal
 
-    def _ensure_indicator_elements(self) -> None:
-        """Register the image elements and layouts once per interpreter.
+    def qss(self) -> str:
+        """The stylesheet for the parts worth styling by hand."""
+        p = self.p
+        body = BASE_SIZES["body"]
+        check = asset_url("check.svg")
+        return f"""
+* {{ outline: 0; }}
 
-        ttk element names are permanent, so the elements are created a single
-        time and the *same* images are repainted afterwards. If a Tk build
-        refuses the element, clam's own indicator stays in place.
-        """
-        if self._indicators:
-            return
-        for style_name, surface in self.CHECK_STYLES:
-            element = f"Janai{surface.capitalize()}.Checkbutton.indicator"
-            img = self._images
-            try:
-                self.style.element_create(
-                    element,
-                    "image",
-                    img[f"{surface}:off"],
-                    ("disabled", "selected", img[f"{surface}:on_off"]),
-                    ("disabled", img[f"{surface}:off_off"]),
-                    ("pressed", "selected", img[f"{surface}:hover_on"]),
-                    ("active", "selected", img[f"{surface}:hover_on"]),
-                    ("selected", img[f"{surface}:on"]),
-                    ("active", img[f"{surface}:hover"]),
-                    sticky="",
-                )
-            except (tk.TclError, KeyError):
-                continue
-            self.style.layout(
-                style_name,
-                [
-                    (
-                        "Checkbutton.padding",
-                        {
-                            "sticky": "nswe",
-                            "children": [
-                                (element, {"side": "left", "sticky": ""}),
-                                (
-                                    "Checkbutton.focus",
-                                    {
-                                        "side": "left",
-                                        "sticky": "w",
-                                        "children": [("Checkbutton.label", {"sticky": "nswe"})],
-                                    },
-                                ),
-                            ],
-                        },
-                    )
-                ],
-            )
-            self._indicators[style_name] = element
+/* Only the window, its dialogs and the scrolling page paint a background.
+   Every container inside a card stays transparent, so a field can never draw
+   a darker rectangle onto the card it sits on. */
+QWidget {{ color: {p.text}; }}
+QMainWindow, QDialog {{ background: {p.bg}; }}
+QToolTip {{
+    background: {p.surface2};
+    color: {p.text};
+    border: 1px solid {p.line};
+    border-radius: 6px;
+    padding: 6px 8px;
+}}
 
-    # ------------------------------------------------------------------ #
-    def apply(self, mode: str) -> None:
-        self.p = p = PALETTES.get(mode, DARK)
-        s = self.style
-        f = self.fonts
+/* ---- typography ------------------------------------------------- */
+QLabel {{ background: transparent; }}
+QLabel[role="display"] {{ font-size: {BASE_SIZES["display"]}pt; font-weight: 600; }}
+QLabel[role="title"] {{ font-size: {BASE_SIZES["title"]}pt; font-weight: 600; }}
+QLabel[role="field"] {{ font-weight: 600; }}
+QLabel[role="muted"] {{ color: {p.muted}; }}
+QLabel[role="hint"] {{ color: {p.muted}; font-size: {BASE_SIZES["small"]}pt; }}
+QLabel[role="ok"] {{ color: {p.ok}; }}
+QLabel[role="warn"] {{ color: {p.warn}; }}
+QLabel[role="err"] {{ color: {p.err}; }}
+QLabel[role="badge"] {{
+    background: {p.surface2};
+    color: {p.muted};
+    border: 1px solid {p.line};
+    border-radius: 9px;
+    padding: 2px 9px;
+    font-size: {BASE_SIZES["small"]}pt;
+}}
 
-        self.root.configure(background=p.bg)
-        for opt, val in (
-            ("*Toplevel.background", p.bg),
-            ("*TCombobox*Listbox.background", p.surface2),
-            ("*TCombobox*Listbox.foreground", p.text),
-            ("*TCombobox*Listbox.selectBackground", p.accent),
-            ("*TCombobox*Listbox.selectForeground", p.accent_text),
-            ("*TCombobox*Listbox.font", f["body"]),
-            ("*TCombobox*Listbox.borderWidth", "0"),
-            ("*Menu.background", p.surface2),
-            ("*Menu.foreground", p.text),
-            ("*Menu.activeBackground", p.accent),
-            ("*Menu.activeForeground", p.accent_text),
-            ("*Menu.relief", "flat"),
-        ):
-            self.root.option_add(opt, val)
+/* ---- cards ------------------------------------------------------- */
+QFrame#card {{
+    background: {p.surface};
+    border: 1px solid {p.line};
+    border-radius: 10px;
+}}
+QFrame#cardhead {{ background: transparent; border: 0; border-radius: 8px; }}
+QFrame#cardhead:hover {{ background: {p.surface2}; }}
+QFrame#drop {{
+    background: {p.drop};
+    border: 1px dashed {p.line};
+    border-radius: 9px;
+}}
+QFrame#drop[active="true"] {{ border: 1px dashed {p.accent}; background: {p.sel}; }}
+QFrame#banner {{
+    background: {p.surface2};
+    border: 1px solid {p.err};
+    border-left: 3px solid {p.err};
+    border-radius: 8px;
+}}
+QFrame[role="sep"] {{ background: {p.line}; border: 0; max-height: 1px; min-height: 1px; }}
 
-        s.configure(
-            ".",
-            background=p.bg,
-            foreground=p.text,
-            font=f["body"],
-            borderwidth=0,
-            focuscolor=p.accent,
-        )
-        s.configure("TFrame", background=p.bg)
-        s.configure("Surface.TFrame", background=p.surface)
-        # The card shell is a flat surface plus a hairline border - no shadow,
-        # no bevel. Card.TFrame and Plain.TFrame are the borderless surface used
-        # for everything nested inside a card, so nesting never draws lines.
-        s.configure(
-            "CardShell.TFrame",
-            background=p.surface,
-            bordercolor=p.border,
-            lightcolor=p.border,
-            darkcolor=p.border,
-            borderwidth=1,
-            relief="solid",
-        )
-        s.configure("Card.TFrame", background=p.surface, borderwidth=0, relief="flat")
-        s.configure("Plain.TFrame", background=p.surface, borderwidth=0, relief="flat")
-        s.configure("Inset.TFrame", background=p.surface2)
-        s.configure(
-            "Drop.TFrame",
-            background=p.surface2,
-            bordercolor=p.border,
-            lightcolor=p.border,
-            darkcolor=p.border,
-            borderwidth=1,
-            relief="solid",
-        )
-        s.configure("DropActive.TFrame", background=p.sel)
+/* ---- buttons ----------------------------------------------------- */
+QPushButton {{
+    background: {p.surface2};
+    color: {p.text};
+    border: 1px solid {p.line};
+    border-radius: 7px;
+    padding: 6px 13px;
+    min-height: 18px;
+}}
+QPushButton:hover {{ border-color: {p.muted}; }}
+QPushButton:pressed {{ background: {p.line}; }}
+QPushButton:disabled {{ color: {p.muted}; border-color: {p.line}; background: transparent; }}
+QPushButton[variant="accent"] {{
+    background: {p.accent};
+    color: {p.accent_text};
+    border: 1px solid {p.accent};
+    font-weight: 600;
+}}
+QPushButton[variant="accent"]:hover {{ background: {p.accent_hi}; border-color: {p.accent_hi}; }}
+QPushButton[variant="accent"]:disabled {{
+    background: transparent;
+    color: {p.muted};
+    border: 1px solid {p.line};
+}}
+QPushButton[variant="ghost"] {{ background: transparent; border-color: transparent; }}
+QPushButton[variant="ghost"]:hover {{ background: {p.surface2}; border-color: {p.line}; }}
+/* The weight is set once, for every state. A font that changes on :checked
+   widens the label but not the button, which is what clipped the text of the
+   selected option. */
+QPushButton[variant="seg"] {{
+    background: transparent;
+    border: 1px solid {p.line};
+    border-radius: 7px;
+    padding: 5px 13px;
+    color: {p.muted};
+    font-weight: 600;
+}}
+QPushButton[variant="seg"]:hover {{ color: {p.text}; }}
+QPushButton[variant="seg"]:checked {{
+    background: {p.accent};
+    border-color: {p.accent};
+    color: {p.accent_text};
+}}
+QPushButton[variant="seg"]:disabled {{ color: {p.muted}; border-color: {p.line}; }}
+QToolButton {{
+    background: transparent;
+    border: 0;
+    color: {p.text};
+    padding: 2px 4px;
+}}
 
-        s.configure("TLabel", background=p.bg, foreground=p.text)
-        s.configure("Card.TLabel", background=p.surface, foreground=p.text)
-        s.configure("CardTitle.TLabel", background=p.surface, foreground=p.text, font=f["card"])
-        s.configure("Field.TLabel", background=p.surface, foreground=p.text, font=f["body"])
-        s.configure("Muted.TLabel", background=p.surface, foreground=p.muted, font=f["small"])
-        s.configure("MutedBg.TLabel", background=p.bg, foreground=p.muted, font=f["small"])
-        s.configure("Inset.TLabel", background=p.surface2, foreground=p.text)
-        s.configure("InsetMuted.TLabel", background=p.surface2, foreground=p.muted, font=f["small"])
-        s.configure("Title.TLabel", background=p.bg, foreground=p.text, font=f["title"])
-        s.configure("Ok.TLabel", background=p.surface, foreground=p.ok, font=f["small"])
-        s.configure("Warn.TLabel", background=p.surface, foreground=p.warn, font=f["small"])
-        s.configure("Err.TLabel", background=p.surface, foreground=p.err, font=f["small"])
-        s.configure(
-            "Chip.TLabel", background=p.surface2, foreground=p.muted, font=f["tiny"], padding=(8, 3)
-        )
+/* ---- inputs ------------------------------------------------------ */
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
+    background: {p.surface2};
+    color: {p.text};
+    border: 1px solid {p.line};
+    border-radius: 7px;
+    padding: 5px 8px;
+    min-height: 18px;
+    selection-background-color: {p.accent};
+    selection-color: {p.accent_text};
+}}
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
+    border-color: {p.accent};
+}}
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{
+    color: {p.muted};
+    background: transparent;
+}}
+QComboBox::drop-down {{ border: 0; width: 20px; }}
+QComboBox QAbstractItemView {{
+    background: {p.surface2};
+    border: 1px solid {p.line};
+    border-radius: 8px;
+    padding: 4px;
+    selection-background-color: {p.accent};
+    selection-color: {p.accent_text};
+}}
+QSpinBox::up-button, QDoubleSpinBox::up-button,
+QSpinBox::down-button, QDoubleSpinBox::down-button {{ width: 15px; border: 0; }}
+QCheckBox {{ background: transparent; spacing: 8px; padding: 2px 0; }}
+QCheckBox:disabled {{ color: {p.muted}; }}
+/* An empty box still has to read as a box. Fusion draws a cleared indicator
+   in the base colour, which on a card face is all but invisible. */
+QCheckBox::indicator, QTableView::indicator {{
+    width: 15px;
+    height: 15px;
+    border: 1px solid {p.muted};
+    border-radius: 4px;
+    background: {p.surface2};
+}}
+QCheckBox::indicator:hover, QTableView::indicator:hover {{ border-color: {p.accent}; }}
+QCheckBox::indicator:checked, QTableView::indicator:checked {{
+    background: {p.accent};
+    border-color: {p.accent};
+    image: url("{check}");
+}}
+QCheckBox::indicator:disabled {{ border-color: {p.line}; background: transparent; }}
+QCheckBox::indicator:checked:disabled {{
+    background: {p.line};
+    border-color: {p.line};
+    image: url("{check}");
+}}
 
-        s.configure(
-            "TButton",
-            background=p.surface2,
-            foreground=p.text,
-            padding=(13, 7),
-            borderwidth=0,
-            relief="flat",
-            anchor="center",
-        )
-        s.map(
-            "TButton",
-            background=[("disabled", p.surface), ("pressed", p.border), ("active", p.border)],
-            foreground=[("disabled", p.muted)],
-        )
-        s.configure(
-            "Accent.TButton",
-            background=p.accent,
-            foreground=p.accent_text,
-            padding=(20, 8),
-            font=f["bold"],
-        )
-        s.map(
-            "Accent.TButton",
-            background=[("disabled", p.surface2), ("pressed", p.accent), ("active", p.accent_hi)],
-            foreground=[("disabled", p.muted)],
-        )
-        s.configure("Ghost.TButton", background=p.surface, foreground=p.muted, padding=(10, 5))
-        s.map(
-            "Ghost.TButton",
-            background=[("disabled", p.surface), ("active", p.surface2)],
-            foreground=[("disabled", p.border), ("active", p.text)],
-        )
-        # Same as Ghost, for toolbars that sit on the window background.
-        s.configure("GhostBg.TButton", background=p.bg, foreground=p.muted, padding=(10, 5))
-        s.map(
-            "GhostBg.TButton",
-            background=[("disabled", p.bg), ("active", p.surface2)],
-            foreground=[("disabled", p.border), ("active", p.text)],
-        )
-        s.configure(
-            "Link.TButton", background=p.bg, foreground=p.accent, padding=(4, 2), font=f["small"]
-        )
-        s.map("Link.TButton", background=[("active", p.bg)], foreground=[("active", p.accent_hi)])
+/* ---- table ------------------------------------------------------- */
+QTableView {{
+    background: {p.surface};
+    alternate-background-color: {p.row};
+    border: 1px solid {p.line};
+    border-radius: 8px;
+    gridline-color: transparent;
+    selection-background-color: {p.sel};
+    selection-color: {p.text};
+    font-size: {body}pt;
+}}
+QTableView::item {{ border: 0; padding: 2px 6px; }}
+QTableView::item:focus {{ border: 0; }}
+QHeaderView {{ background: transparent; border: 0; }}
+QHeaderView::section {{
+    background: {p.surface2};
+    color: {p.muted};
+    border: 0;
+    border-bottom: 1px solid {p.line};
+    padding: 6px 7px;
+    font-weight: 600;
+}}
 
-        # segmented control: radiobuttons drawn as flat toggle buttons
-        s.configure(
-            "Seg.Toolbutton",
-            background=p.surface2,
-            foreground=p.muted,
-            padding=(14, 6),
-            anchor="center",
-            font=f["small"],
-            relief="flat",
-            borderwidth=0,
-        )
-        s.map(
-            "Seg.Toolbutton",
-            background=[("selected", p.accent), ("active", p.border)],
-            foreground=[("selected", p.accent_text), ("active", p.text)],
-        )
+/* ---- log --------------------------------------------------------- */
+QPlainTextEdit {{
+    background: {p.surface};
+    color: {p.text};
+    border: 1px solid {p.line};
+    border-radius: 8px;
+    padding: 6px;
+    selection-background-color: {p.accent};
+    selection-color: {p.accent_text};
+}}
 
-        # The box itself is an image (see _paint_indicators); indicatorcolor is
-        # kept as the fallback for a Tk that refuses the custom element.
-        for style_name, surface in self.CHECK_STYLES:
-            background = getattr(p, surface)
-            s.configure(
-                style_name,
-                background=background,
-                foreground=p.text,
-                indicatorcolor=p.surface2 if surface != "surface2" else p.bg,
-                indicatorforeground=p.accent_text,
-                bordercolor=p.border,
-                focuscolor=p.accent,
-                padding=(0, 4),
-            )
-            s.map(
-                style_name,
-                background=[("active", background)],
-                indicatorcolor=[("selected", p.accent), ("pressed", p.accent_hi)],
-                foreground=[("disabled", p.muted)],
-            )
-        s.configure(
-            "TRadiobutton",
-            background=p.surface,
-            foreground=p.text,
-            indicatorcolor=p.surface2,
-            bordercolor=p.border,
-            padding=(0, 4),
-        )
-        s.map(
-            "TRadiobutton",
-            background=[("active", p.surface)],
-            indicatorcolor=[("selected", p.accent)],
-            foreground=[("disabled", p.muted)],
-        )
+/* ---- progress ---------------------------------------------------- */
+QProgressBar {{
+    background: {p.surface2};
+    border: 0;
+    border-radius: 4px;
+    max-height: 7px;
+    min-height: 7px;
+    text-align: center;
+    color: transparent;
+}}
+QProgressBar::chunk {{ background: {p.accent}; border-radius: 4px; }}
 
-        s.configure(
-            "TEntry",
-            fieldbackground=p.surface2,
-            foreground=p.text,
-            bordercolor=p.border,
-            lightcolor=p.surface2,
-            darkcolor=p.surface2,
-            insertcolor=p.text,
-            padding=(8, 6),
-        )
-        s.map(
-            "TEntry",
-            bordercolor=[("focus", p.accent)],
-            fieldbackground=[("disabled", p.surface)],
-            foreground=[("disabled", p.muted)],
-        )
+/* ---- scrolling --------------------------------------------------- */
+QScrollArea {{ background: {p.bg}; border: 0; }}
+QScrollArea > QWidget > QWidget {{ background: {p.bg}; }}
+QScrollBar:vertical {{ background: transparent; width: 11px; margin: 2px; }}
+QScrollBar:horizontal {{ background: transparent; height: 11px; margin: 2px; }}
+QScrollBar::handle:vertical {{ background: {p.line}; border-radius: 5px; min-height: 30px; }}
+QScrollBar::handle:horizontal {{ background: {p.line}; border-radius: 5px; min-width: 30px; }}
+QScrollBar::handle:hover {{ background: {p.muted}; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; border: 0; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+QSplitter::handle {{ background: transparent; height: 8px; }}
 
-        s.configure(
-            "TSpinbox",
-            fieldbackground=p.surface2,
-            foreground=p.text,
-            bordercolor=p.border,
-            arrowcolor=p.muted,
-            arrowsize=12,
-            insertcolor=p.text,
-            lightcolor=p.surface2,
-            darkcolor=p.surface2,
-            padding=(8, 5),
-        )
-        s.map(
-            "TSpinbox",
-            bordercolor=[("focus", p.accent)],
-            arrowcolor=[("active", p.text), ("disabled", p.border)],
-            foreground=[("disabled", p.muted)],
-        )
-
-        s.configure(
-            "TCombobox",
-            fieldbackground=p.surface2,
-            background=p.surface2,
-            foreground=p.text,
-            bordercolor=p.border,
-            arrowcolor=p.muted,
-            arrowsize=13,
-            lightcolor=p.surface2,
-            darkcolor=p.surface2,
-            padding=(8, 5),
-            selectbackground=p.surface2,
-            selectforeground=p.text,
-        )
-        s.map(
-            "TCombobox",
-            bordercolor=[("focus", p.accent)],
-            arrowcolor=[("active", p.text), ("disabled", p.border)],
-            fieldbackground=[("readonly", p.surface2), ("disabled", p.surface)],
-            foreground=[("disabled", p.muted)],
-        )
-
-        # the rules table: flat, no indent column, selection in the accent tint
-        s.configure(
-            "Rules.Treeview",
-            background=p.surface2,
-            fieldbackground=p.surface2,
-            foreground=p.text,
-            bordercolor=p.border,
-            borderwidth=0,
-            relief="flat",
-            rowheight=self.row_height(),
-            font=f["small"],
-        )
-        s.map(
-            "Rules.Treeview",
-            background=[("selected", p.sel), ("disabled", p.surface)],
-            foreground=[("selected", p.text), ("disabled", p.muted)],
-        )
-        s.configure(
-            "Rules.Treeview.Heading",
-            background=p.surface,
-            foreground=p.muted,
-            font=f["small"],
-            relief="flat",
-            padding=(8, 6),
-            borderwidth=0,
-        )
-        s.map("Rules.Treeview.Heading", background=[("active", p.surface2)])
-        s.layout("Rules.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
-
-        s.configure(
-            "TProgressbar",
-            background=p.accent,
-            troughcolor=p.surface2,
-            bordercolor=p.surface2,
-            lightcolor=p.accent,
-            darkcolor=p.accent,
-            thickness=5,
-        )
-        s.configure("TSeparator", background=p.border)
-        s.configure("TScale", background=p.surface, troughcolor=p.surface2)
-        for orient in ("Vertical", "Horizontal"):
-            s.configure(
-                f"{orient}.TScrollbar",
-                background=p.border,
-                troughcolor=p.bg,
-                bordercolor=p.bg,
-                arrowcolor=p.muted,
-                darkcolor=p.border,
-                lightcolor=p.border,
-                arrowsize=12,
-                relief="flat",
-            )
-            s.map(
-                f"{orient}.TScrollbar",
-                background=[("active", p.muted), ("disabled", p.surface2)],
-                arrowcolor=[("active", p.text)],
-            )
-        # Inside a card the scrollbar trough should read as the card, not as
-        # the window behind it.
-        s.configure(
-            "Card.Vertical.TScrollbar",
-            background=p.border,
-            troughcolor=p.surface2,
-            bordercolor=p.surface2,
-            darkcolor=p.border,
-            lightcolor=p.border,
-            arrowcolor=p.muted,
-            arrowsize=12,
-            relief="flat",
-        )
-        s.map(
-            "Card.Vertical.TScrollbar",
-            background=[("active", p.muted), ("disabled", p.surface2)],
-            arrowcolor=[("active", p.text)],
-        )
-
-        self._paint_indicators()
-        self._ensure_indicator_elements()
-
-    # ------------------------------------------------------------------ #
-    def toggle(self) -> str:
-        mode = "light" if self.p.name == "dark" else "dark"
-        self.apply(mode)
-        return mode
+/* ---- menus ------------------------------------------------------- */
+QMenu {{
+    background: {p.surface2};
+    border: 1px solid {p.line};
+    border-radius: 8px;
+    padding: 5px;
+}}
+QMenu::item {{ padding: 6px 18px 6px 12px; border-radius: 5px; }}
+QMenu::item:selected {{ background: {p.accent}; color: {p.accent_text}; }}
+QMenu::separator {{ height: 1px; background: {p.line}; margin: 5px 6px; }}
+"""

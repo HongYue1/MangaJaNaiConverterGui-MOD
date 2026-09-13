@@ -5,6 +5,12 @@
 #
 # torch and torchvision are resolved against the index uv picks for the GPU it
 # detects (setup passes --torch-backend); everything else comes from PyPI.
+#
+# PySide6-Essentials is the only thing here the interface itself needs. It is
+# the trimmed Qt wheel (~77 MB): the full PySide6 also ships WebEngine, 3D,
+# Charts and Multimedia, which this app never imports.
+
+PySide6-Essentials==6.11.2
 
 torch==2.9.1
 torchvision==0.24.1
