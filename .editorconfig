@@ -19,5 +19,9 @@ indent_size = 2
 [*.{cmd,bat,ps1}]
 end_of_line = crlf
 
+# Shell entry points must stay LF even when edited on Windows
+[*.sh]
+end_of_line = lf
+
 [*.md]
 trim_trailing_whitespace = false
