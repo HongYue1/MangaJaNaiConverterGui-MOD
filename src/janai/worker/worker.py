@@ -77,7 +77,7 @@ from janai.core.formats import (
     merged,
     save_kwargs,
 )
-from janai.worker import runtime
+from janai.worker import devices, runtime
 from janai.worker.control import CTRL, Cancelled
 from janai.worker.events import emit, log
 from janai.worker.pipeline import BundleWriter, WritePool, prefetch
@@ -127,9 +127,6 @@ _to_uint8 = None
 _get_h_w_c = None
 _upscale_image_node = None
 _load_model_node = None
-_SettingsParser = None
-_NodeContext = None
-_ProgressController = None
 TILE: dict[str, Any] = {}
 
 # Not a runtime handle: the ICC cache belongs to icc_transforms() and moves with
@@ -142,15 +139,12 @@ def _mirror_runtime() -> None:
     """Publish runtime's loaded handles under the names this file still uses."""
     global np, cv2, pyvips, torch, _PILImage, _ImageCms, _ImageFilter
     global _cx_resize, _ResizeFilter, _normalize, _to_uint8, _get_h_w_c
-    global _upscale_image_node, _load_model_node, _SettingsParser, _NodeContext
-    global _ProgressController, TILE
+    global _upscale_image_node, _load_model_node, TILE
     np, cv2, pyvips, torch = runtime.np, runtime.cv2, runtime.pyvips, runtime.torch
     _PILImage, _ImageCms, _ImageFilter = runtime.PILImage, runtime.ImageCms, runtime.ImageFilter
     _cx_resize, _ResizeFilter = runtime.cx_resize, runtime.ResizeFilter
     _normalize, _to_uint8, _get_h_w_c = runtime.normalize, runtime.to_uint8, runtime.get_h_w_c
     _upscale_image_node, _load_model_node = runtime.upscale_image_node, runtime.load_model_node
-    _SettingsParser, _NodeContext = runtime.SettingsParser, runtime.NodeContext
-    _ProgressController = runtime.ProgressController
     TILE = runtime.TILE
 
 
@@ -162,112 +156,6 @@ def load_imaging(perf: dict | None = None) -> None:
 def load_backend(perf: dict | None = None) -> None:
     runtime.load_backend(perf)
     _mirror_runtime()
-
-
-# --------------------------------------------------------------------------- #
-# node context (copied from the original backend, minus the chain executor)
-# --------------------------------------------------------------------------- #
-def make_context(perf: dict):
-
-    class ExecutorNodeContext(_NodeContext):
-        def __init__(self, progress, settings, storage_dir: Path) -> None:
-            super().__init__()
-            self.progress = progress
-            self.__settings = settings
-            self._storage_dir = storage_dir
-            self.chain_cleanup_fns = set()
-            self.node_cleanup_fns = set()
-
-        @property
-        def aborted(self) -> bool:
-            return self.progress.aborted
-
-        @property
-        def paused(self) -> bool:
-            time.sleep(0.001)
-            return self.progress.paused
-
-        def set_progress(self, progress: float) -> None:
-            self.check_aborted()
-
-        @property
-        def settings(self):
-            return self.__settings
-
-        @property
-        def storage_dir(self) -> Path:
-            return self._storage_dir
-
-        def add_cleanup(self, fn, after="chain") -> None:
-            if after == "node":
-                self.node_cleanup_fns.add(fn)
-            else:
-                self.chain_cleanup_fns.add(fn)
-
-    device = str(perf.get("device") or "").strip()
-    if not device:
-        # no device asked for: use the best available one, like the probe's default_device
-        device = next((d["value"] for d in device_objects() if d.get("value") != "cpu"), "cpu")
-    use_cpu = device == "cpu"
-    gpu_index = 0
-    accel_index = 0
-    if not use_cpu:
-        gpus = [d for d in device_objects() if d.get("value") != "cpu"]
-        match = [i for i, d in enumerate(gpus) if d.get("value") == device]
-        if match:
-            accel_index = match[0]
-            gpu_index = int(gpus[accel_index].get("index") or 0)
-        else:
-            log(f"device {device} not present, falling back to the first GPU", "warn")
-
-    want_fp16 = wants_fp16(perf.get("use_fp16", True))
-    fp16 = want_fp16 and not use_cpu and device_supports_fp16(device)
-    if want_fp16 and not fp16 and not use_cpu:
-        log(f"{device} has no usable FP16 path, running in FP32", "warn")
-    settings = _SettingsParser(
-        {
-            "use_cpu": use_cpu,
-            "use_fp16": fp16,
-            "gpu_index": int(gpu_index),
-            "accelerator_device_index": int(accel_index),
-            "budget_limit": int(perf.get("budget_limit") or 0),
-            "force_cache_wipe": bool(perf.get("force_cache_wipe", False)),
-        }
-    )
-    storage = Path(tempfile.gettempdir()) / "janai-upscaler"
-    storage.mkdir(parents=True, exist_ok=True)
-    progress = _ProgressController()
-    CTRL.progress = progress
-    if CTRL.cancelled:
-        CTRL.cancel()
-    return ExecutorNodeContext(progress, settings, storage), device, fp16
-
-
-def wants_fp16(value: Any) -> bool:
-    """FP16 is the default: only an explicit false/off turns it off."""
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return value.strip().lower() not in ("0", "false", "no", "off", "fp32")
-    return bool(value)
-
-
-def device_supports_fp16(device: str) -> bool:
-    """Whether this device has a half-precision path worth using."""
-    if not device or device == "cpu":
-        return False
-    for d in device_objects():
-        if str(d.get("value")) == device:
-            return bool(d.get("fp16"))
-    try:
-        if device.startswith("cuda") and torch.cuda.is_available():
-            index = int(device.split(":")[1]) if ":" in device else 0
-            major, minor = torch.cuda.get_device_capability(index)
-            # 5.3+ has real half math; everything since Pascal is fast at it
-            return (major, minor) >= (5, 3)
-    except Exception:
-        pass
-    return True
 
 
 def parse_tile(value: Any) -> tuple[str, int]:
@@ -789,60 +677,8 @@ class TilePlanner:
 
 
 # --------------------------------------------------------------------------- #
-# device + capability probe
+# encoder + tool capability probe
 # --------------------------------------------------------------------------- #
-def device_objects() -> list[dict]:
-    """Available compute devices, CPU first, in backend order."""
-    load_backend()
-    out: list[dict] = []
-    try:
-        from accelerator_detection import get_accelerator_detector
-
-        out.extend(
-            {
-                "value": d.device_string,
-                "label": ("CPU" if d.type.value == "cpu" else f"{d.name} ({d.device_string})"),
-                "kind": d.type.value,
-                "index": d.index,
-                "fp16": bool(d.supports_fp16),
-                "bf16": bool(d.supports_bf16),
-                "vram": int(d.memory_total or 0),
-            }
-            for d in get_accelerator_detector().available_devices
-        )
-    except Exception as exc:
-        log(f"accelerator detection failed ({exc}); using torch directly", "warn")
-        out.append(
-            {
-                "value": "cpu",
-                "label": "CPU",
-                "kind": "cpu",
-                "index": 0,
-                "fp16": False,
-                "bf16": True,
-                "vram": 0,
-            }
-        )
-        try:
-            if torch.cuda.is_available():
-                for i in range(torch.cuda.device_count()):
-                    props = torch.cuda.get_device_properties(i)
-                    out.append(
-                        {
-                            "value": f"cuda:{i}",
-                            "label": f"{props.name} (cuda:{i})",
-                            "kind": "cuda",
-                            "index": i,
-                            "fp16": True,
-                            "bf16": getattr(props, "major", 0) >= 8,
-                            "vram": int(props.total_memory),
-                        }
-                    )
-        except Exception:
-            pass
-    return out
-
-
 def vips_has(op: str) -> bool:
     try:
         return bool(pyvips.type_find("VipsOperation", op))
@@ -968,7 +804,7 @@ def do_probe(models_dir: Path) -> int:
     except Exception:
         pass
 
-    info["devices"] = device_objects()
+    info["devices"] = devices.device_objects()
     gpu = next((d for d in info["devices"] if d["value"] != "cpu"), None)
     info["default_device"] = gpu["value"] if gpu else "cpu"
     info["formats"] = encode_capabilities()
@@ -1834,13 +1670,13 @@ def run_job(job: dict) -> int:
                 "container": container_id,
                 "model_count": len(models),
                 "device": str(perf.get("device") or ""),
-                "fp16": wants_fp16(perf.get("use_fp16", True)),
+                "fp16": devices.wants_fp16(perf.get("use_fp16", True)),
                 "tile_label": tile_label,
             },
         )
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    ctx, device, fp16 = make_context(perf)
+    ctx, device, fp16 = devices.make_context(perf)
     stored_profile = perf.get("profile")
     planner = TilePlanner(
         tile_mode,
@@ -2602,7 +2438,7 @@ def do_profile(job: dict) -> int:
         return 1
     CTRL.start()
 
-    ctx, device, fp16 = make_context(perf)
+    ctx, device, fp16 = devices.make_context(perf)
     if not device.startswith(("cuda", "xpu")):
         emit(
             "profile",
