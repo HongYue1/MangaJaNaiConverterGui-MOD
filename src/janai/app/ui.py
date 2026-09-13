@@ -29,7 +29,7 @@ from janai.app.runlog import (
 )
 from janai.app.runner import Runner, open_in_explorer
 from janai.app.state import Settings, defaults
-from janai.app.theme import Theme
+from janai.app.theme import SCALE_CHOICES, Theme
 from janai.app.widgets import (
     Card,
     Collapsible,
@@ -115,7 +115,12 @@ class App:
         self.root = root
         self.dir = root_dir
         self.settings = Settings(root_dir / "settings.json").load()
-        self.theme = Theme(root, str(self.settings.data.get("theme", "dark")))
+        ui_cfg = self.settings.data.get("ui") or {}
+        self.theme = Theme(
+            root,
+            str(self.settings.data.get("theme", "dark")),
+            ui_cfg.get("scale", "auto"),
+        )
         self.runner = Runner(root_dir)
 
         log_cfg = self.settings.data.get("log") or {}
@@ -186,6 +191,7 @@ class App:
 
         self.var_fmt = tk.StringVar(value=str(d["format"].get("id", "png")))
         self.var_adv = tk.BooleanVar(value=bool(ui.get("advanced_format", False)))
+        self.var_scale = tk.StringVar(value=str(ui.get("scale", "auto") or "auto"))
         self.fmt_vars: dict[str, dict[str, tk.Variable]] = {}
         for fid, spec in FORMATS.items():
             saved = self.settings.format_options(fid)
@@ -544,11 +550,12 @@ class App:
         self.rules_table = Table(
             self.rules_box,
             (
-                ("on", "On", 40, "center", False),
-                ("when", "When", 150, "w", False),
-                ("size", "Page size", 120, "w", False),
-                ("model", "Model", 420, "w", True),
-                ("levels", "Auto levels", 86, "center", False),
+                # key, heading, width, anchor, takes slack, never narrower than
+                ("on", "On", 40, "center", False, 38),
+                ("when", "When", 150, "w", False, 86),
+                ("size", "Page size", 120, "w", False, 78),
+                ("model", "Model", 420, "w", True, 160),
+                ("levels", "Auto levels", 96, "center", False, 92),
             ),
             height=8,
         )
@@ -851,8 +858,22 @@ class App:
             row=7, column=1, sticky="w", pady=4
         )
 
+        row_label(b, 8, "Interface size", "Text and controls, if the app reads small.", self.theme)
+        cb_scale = combo(
+            b, self.var_scale, list(SCALE_CHOICES), width=24, on_change=self.on_scale_change
+        )
+        cb_scale.grid(row=8, column=1, sticky="w", pady=4)
+        Tooltip(
+            cb_scale,
+            "Auto follows the display's own DPI, which is right on most machines. "
+            "Pick a percentage if a monitor reports the wrong DPI, or simply to "
+            "make everything bigger \u2014 the window re-renders immediately, with "
+            "no restart, and the choice is remembered.",
+            self.theme,
+        )
+
         extra = ttk.Frame(b, style="Card.TFrame")
-        extra.grid(row=8, column=1, sticky="w", pady=(8, 0))
+        extra.grid(row=9, column=1, sticky="w", pady=(8, 0))
         c1 = ttk.Checkbutton(extra, text="cuDNN autotune", variable=self.var_cudnn)
         c1.grid(row=0, column=0, sticky="w")
         Tooltip(
@@ -883,6 +904,22 @@ class App:
             "released automatically while a job runs.",
             self.theme,
         )
+
+    def on_scale_change(self, *_a: object) -> None:
+        """Re-size the interface in place and remember the choice.
+
+        The theme re-configures the shared fonts, which re-renders every ttk
+        widget; the plain tk surfaces (the log, the scrolling page) and the
+        re-rendered lists have to be told separately.
+        """
+        value = str(self.var_scale.get() or "auto").strip() or "auto"
+        self.theme.set_scale(value)
+        self.settings.data["ui"] = dict(self.settings.data.get("ui") or {}, scale=value)
+        self.scroll.restyle()
+        self.restyle_log()
+        self.render_format_options()
+        self.render_rules()
+        self.rules_table.fit_columns()
 
     def _build_footer(self) -> None:
         foot = ttk.Frame(self.root, padding=(18, 8, 18, 10))
@@ -2126,6 +2163,7 @@ class App:
             perf_open=self.panel_perf.is_open(),
             log_open=self._log_visible,
             geometry=self.root.winfo_geometry(),
+            scale=str(self.var_scale.get() or "auto"),
         )
 
     def build_job(self, dry: bool = False) -> dict | None:
@@ -2523,8 +2561,14 @@ class App:
         out = old.get("output") or {}
         fresh["output"]["dir"] = str(out.get("dir", ""))
         fresh["output"]["same_as_input"] = bool(out.get("same_as_input", True))
+        old_ui = old.get("ui") or {}
+        # Window size and interface size describe this display rather than how
+        # to convert, so a reset leaves them alone instead of resizing the app
+        # under the user.
         fresh["ui"] = dict(
-            fresh.get("ui") or {}, geometry=(old.get("ui") or {}).get("geometry", "")
+            fresh.get("ui") or {},
+            geometry=old_ui.get("geometry", ""),
+            scale=old_ui.get("scale", "auto"),
         )
         self.settings.data = fresh
         self._rules_seeded = False
