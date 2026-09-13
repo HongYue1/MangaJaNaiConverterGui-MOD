@@ -91,8 +91,6 @@ def build_job(
         "upscale": {
             "mode": "scale",
             "scale": 2.0,
-            "model": "auto",
-            "model_gray": "auto",
             "grayscale_convert": True,
             "auto_levels": True,
             "grayscale_threshold": 12,
@@ -100,7 +98,6 @@ def build_job(
             "pre_downscale_height": 0,
             "skip_long_strips": False,
             "rules": list(rule_dicts or []),
-            "rules_enabled": bool(rule_dicts),
         },
         "perf": {
             "device": "",

@@ -55,7 +55,6 @@ def build_job(args: argparse.Namespace, tile: str, out_dir: Path) -> dict:
             "mode": "scale",
             "scale": args.scale,
             "model": args.model,
-            "model_gray": args.model_gray,
             "grayscale_convert": not args.no_grayscale,
             "auto_levels": True,
             "grayscale_threshold": 12,
@@ -122,8 +121,7 @@ def run_once(job: dict, verbose: bool) -> dict:
 def main() -> int:
     p = argparse.ArgumentParser(description="Benchmark worker tile settings.")
     p.add_argument("--input", required=True, help="image file or folder")
-    p.add_argument("--model", default="auto")
-    p.add_argument("--model-gray", dest="model_gray", default="auto")
+    p.add_argument("--model", default="auto", help="a model file name, or auto for the picker")
     p.add_argument("--scale", type=float, default=4.0)
     p.add_argument("--format", default="jxl")
     p.add_argument("--device", default="")

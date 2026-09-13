@@ -24,6 +24,17 @@ from janai.core import displays, formats, paths, presets, rules
 
 FAILED: list[str] = []
 
+#: A representative model set, so the rule checks do not depend on what this
+#: machine happens to have installed. The shipped table only ever names files
+#: that exist, so every rule check has to supply the files.
+INSTALLED = [
+    "2x_MangaJaNai_1200p_V1_ESRGAN_70k.pth",
+    "2x_MangaJaNai_1920p_V1_ESRGAN_70k.pth",
+    "4x_MangaJaNai_2048p_V1_ESRGAN_95k.pth",
+    "4x_IllustrationJaNai_V3denoise_FDAT_M_47k_fp16.safetensors",
+    "2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16.safetensors",
+]
+
 
 def check(name: str, fn) -> None:
     """Run one check and keep going, so one failure does not hide the rest."""
@@ -98,23 +109,33 @@ def path_resolution() -> None:
 
 
 def rule_engine() -> None:
-    installed = [
-        "2x_MangaJaNai_1200p_V1_ESRGAN_70k.pth",
-        "2x_MangaJaNai_1920p_V1_ESRGAN_70k.pth",
-        "4x_MangaJaNai_2048p_V1_ESRGAN_95k.pth",
-        "4x_IllustrationJaNai_V3denoise_FDAT_M_47k_fp16.safetensors",
-        "2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16.safetensors",
-    ]
+    installed = INSTALLED
     working = rules.default_working_set(installed)
     assert working, "the default working set is empty"
+    assert not rules.default_working_set([]), (
+        "the shipped table named a model with nothing installed"
+    )
     for rule in working:
         assert rules.Rule.from_dict(rule.to_dict()) == rule, f"{rule.describe()} did not round-trip"
         assert len(rule.columns()) == 4, f"{rule.describe()} did not produce four columns"
+        assert len(rule.cells()) == 5, f"{rule.describe()} did not produce five table cells"
+        assert rule.enabled_mark(), f"{rule.describe()} has no on/off indicator"
+        # The table is the only chooser, so nothing may ship unresolved.
+        assert not rule.is_auto, f"{rule.describe()} left its model on auto"
 
     ruleset = rules.RuleSet(working)
     gray = ruleset.match(gray=True, width=1350, height=1920, scale=2.0)
     assert gray is not None, "a 1920p grayscale page matched no rule"
-    assert gray.is_auto or "1920p" in gray.model, f"a 1920p page went to {gray.model}"
+    assert "1920p" in gray.model, f"a 1920p page went to {gray.model}"
+
+    # Settings from an older build carry "auto" rows; they have to resolve to a
+    # real file on load, or the table would still be hiding the choice.
+    legacy = rules.Rule(kind=rules.GRAYSCALE, scale=2.0, height="1920")
+    assert legacy.is_auto, "a rule with no model should read as auto"
+    resolved, notes = rules.materialise([legacy], installed)
+    assert resolved and not any(r.is_auto for r in resolved), "materialise() kept an auto rule"
+    assert all(r.model in installed for r in resolved), "materialise() named a missing model"
+    assert notes, "materialise() resolved a rule without reporting it"
     assert ruleset.match(gray=False, width=1920, height=1080, scale=4.0) is not None, (
         "a 4x colour page matched no rule"
     )
@@ -151,7 +172,7 @@ def preset_round_trip() -> None:
     data = defaults()
     data["output"]["dir"] = "/somewhere/private"
     data["perf"]["device"] = "cuda:1"
-    data["upscale"]["rules"] = rules.default_dicts()
+    data["upscale"]["rules"] = rules.default_dicts(INSTALLED)
     preset = presets.build("Manga 2x", data, app_version="test")
     kept = preset["settings"]
     assert presets.summary(preset), "a preset produced no summary"

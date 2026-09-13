@@ -155,37 +155,52 @@ optionally process archives; the header shows what the scan found.
   reMarkable, Boox, iPad, 1080p/1440p/4K) plus a portrait/landscape switch.
   Typing your own numbers flips the menu back to *Custom*.
 
-**Models** - with *Grayscale detection* off, one model handles everything.
-With it on you pick two: one for colour pages, one for grayscale pages, which
-is the entire point of telling them apart. Start refuses to run while a
-required model is empty and says which one is missing.
+**Model rules** - the table is the only thing that chooses a model. There are
+no separate model pickers and no `auto` entry: the app ships with a filled-in
+table, and if you want something else you edit the row. A rule is a condition
+and the model to use when it matches:
 
-**Rules** - above those pickers sits the rule table, which is how the app
-really decides. A rule is a condition and the model to use when it matches:
+| On | When | Page size | Model | Auto levels |
+| --- | --- | --- | --- | --- |
+| * | grayscale | `1920p` | `2x_MangaJaNai_1920p_V1_ESRGAN_70k.pth` | default |
+| * | grayscale | `1600-1759` | `2x_MangaJaNai_1600p_V1_ESRGAN_70k.pth` | default |
+| * | colour | any | `4x_IllustrationJaNai_V3denoise_FDAT_M_47k_fp16` | - |
+| o | grayscale | any | `2x_MangaJaNai_2048p_V1_ESRGAN_95k.pth` | on |
 
-| Page | Dimensions | Model | Auto levels |
-| --- | --- | --- | --- |
-| grayscale | `1920` | `2x_MangaJaNai_1920p_V1_ESRGAN_70k.pth` | yes |
-| grayscale | `1600-1919` | `2x_MangaJaNai_1600p_V1_ESRGAN_70k.pth` | yes |
-| colour | any | `4x_IllustrationJaNai_V3denoise_FDAT_M_47k_fp16` | - |
-| any | any | `auto` | - |
+The first column is the on/off state, drawn as a filled or hollow dot, so a
+rule that is switched off is visible in the table itself rather than only in
+the editor. Click the dot to toggle a row, press Space, or use the *Toggle*
+button; double-click anywhere else to edit. Rows greyed out without being off
+are grayscale rules while *Grayscale detection* is off - they cannot fire, and
+the hint under the table says so.
 
-Pages are matched from the top down, except that a rule with explicit
-dimensions always outranks an `any` rule, so a catch-all sitting too high
-cannot silently shadow a sized rule. Dimensions accept an exact height
-(`1920`, `1920p`), a range (`1600-1920`), an open end (`1985-`, `-1250`) or
-`any`; *Auto levels* applies to grayscale rules only; a model left on `auto`
-hands that page back to the built-in picker, so a rule can narrow the
-condition without pinning a file. The editor flags rules that cannot work - a
-4x model on a 2x rule, auto levels on a colour rule, a model that is not
-installed - and the log prints, once per run, which rule claimed each page.
+Pages are matched from the top down, except that a rule with an explicit page
+size always outranks an `any` rule, so a catch-all sitting too high cannot
+silently shadow a sized rule. Sizes accept an exact height (`1920`, `1920p`),
+a range (`1600-1920`), an open end (`1985-`, `-1250`) or `any`.
 
-**Defaults** rebuilds the *default working set*: exactly what used to be
-hidden inside "auto", now visible and editable. The MangaJaNai height bands
-(1200p, 1300p, 1400p, 1600p, 1920p, 2048p) for grayscale pages at the current
-scale, the IllustrationJaNai denoise model for colour pages, and a catch-all
-fallback - built from the models you actually have. Untick *Use rules* and the
-two pickers above apply to everything, as before.
+*Auto levels* applies to grayscale rules only and has three settings:
+`default` follows the **Auto levels** checkbox on the card, while `on` and
+`off` override it for the pages that rule claims. (`default` was called
+`inherit` in the first build, which never said what it inherited from.)
+
+The table flags anything that cannot work - a 4x model where the target is 2x,
+auto levels on a colour rule, a model that is not installed, a row with no
+model - on one line underneath it, and the log prints once per run which rule
+claimed each page. Start stays disabled while no row is switched on, because
+then nothing would run.
+
+**Defaults** (beside the table) rewrites it as the shipped set: the MangaJaNai
+height bands (1200p, 1300p, 1400p, 1500p, 1600p, 1920p, 2048p) for grayscale
+pages, the IllustrationJaNai denoise model for colour pages at 2x and 4x, and
+two unsized catch-alls - all built from the models you actually have. This is
+exactly what used to be hidden inside "auto", now visible and editable. It
+touches only the table; **Reset all** in the header puts every setting back to
+its default, keeping your input and output folders.
+
+Settings loaded from an older build are migrated rather than discarded: the
+two old pickers become catch-all rules, and any `auto` row is resolved to the
+file it would have picked, with a line in the log for each one.
 
 Grayscale detection itself is not one saturation threshold. Every page is
 measured for colour strength *and* for the share of pixels that are
@@ -452,10 +467,15 @@ Velopack packaging, the bundled updater, the workflow/chain state in
   `pyproject.toml` and `scripts\` for the harnesses, plus ruff enforcing
   format and lint in CI on Windows and Ubuntu.
 - **rule-based upscaling** - an ordered *condition -> model* table (colour or
-  grayscale, exact/ranged/any dimensions, model, auto levels) replaces the
-  opaque "auto". Explicit dimensions always outrank `any`, impossible rules are
-  flagged in the editor, and the old auto behaviour ships as the editable
-  default working set.
+  grayscale, exact/ranged/any page size, model, auto levels) is the only thing
+  that chooses a model: no model pickers, no `auto` entry, nothing hidden.
+  Explicit sizes always outrank `any`, unusable rows are flagged under the
+  table, each row can be switched off from the table itself, and the old auto
+  behaviour ships as the editable default set.
+- **a redesigned interface** - flatter palette and one type ramp, a rules table
+  that scrolls by scrollbar and wheel, wheel-guarded dropdowns and number
+  fields so the wheel scrolls the page instead of quietly changing a value,
+  useful help text on every control, and a **Reset all** button.
 - **presets** - export and import everything you have set up as
   `presets\<name>.janai.json`, minus machine-specific paths and the pinned
   device; settings are remembered between runs regardless.
@@ -468,8 +488,8 @@ Velopack packaging, the bundled updater, the workflow/chain state in
   the run, and shrinks only after pressure that repeats. Measured at parity
   with the best hand-picked fixed tile (509 ms/MP across a four-page chapter)
   and about 15% ahead of any smaller one.
-- **grayscale detection from image statistics**, and when it is on you pick two
-  models: one for colour pages, one for grayscale ones.
+- **grayscale detection from image statistics**, which is what lets one table
+  send grayscale pages to MangaJaNai and colour pages to IllustrationJaNai.
 - **a scale/model sanity check** - every weight carries its factor in its name,
   so pointing a 4x model at a 2x run (or the reverse) is flagged in the panel
   before you start, and again in the log from the loaded weights themselves.
