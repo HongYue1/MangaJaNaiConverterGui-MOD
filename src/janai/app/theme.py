@@ -5,17 +5,16 @@ surface for controls, a single accent, and a 1px border instead of shadows or
 gradients. Everything is expressed as ttk styles so the widgets stay native -
 real focus rings, real DPI scaling, real keyboard behaviour.
 
-Two parts are less obvious than they look:
+Point sizes are a plain fixed ramp. Tk already multiplies every point size by
+the display's own scaling (see ``main.enable_dpi_awareness`` and the ``tk
+scaling`` call next to it), so a second factor applied here made text come out
+roughly twice too large on a scaled display.
 
-* **Size follows the font.** Point sizes come from one ramp multiplied by an
-  interface-size setting, and everything measured in pixels - row height, the
-  indicators, paddings - is derived from the resulting font metrics rather than
-  hard-coded. Because every style points at the same shared ``Font`` objects,
-  re-sizing them re-renders the whole window with no rebuild.
-* **Check boxes are drawn here.** clam's own indicator is a bevelled box that
-  loses its outline once borders are flattened, which left the boxes hard to
-  tell apart from their background. They are painted as small images instead,
-  one set per surface, repainted whenever the palette or size changes.
+One part is less obvious than it looks: **check boxes are drawn here.** clam's
+own indicator is a bevelled box that loses its outline once borders are
+flattened, which left the boxes hard to tell apart from their background. They
+are painted as small images instead, one set per surface, sized from the body
+font's measured line height and repainted whenever the palette changes.
 """
 
 from __future__ import annotations
@@ -117,48 +116,20 @@ def pick_family(candidates: tuple[str, ...] = UI_FAMILIES, fallback: str = "TkDe
     return fallback
 
 
-#: Point sizes before the interface-size multiplier. The previous 9/10/11/16
-#: ramp measured 17px of line height on a 96 DPI display, which simply read as
-#: small on a large monitor; this is one step up across the board.
+#: One ramp used everywhere: 9 for supporting text, 10 for body and the log,
+#: 11 and 16 for the two heading levels. Tk applies the display's scaling to
+#: these on its own - nothing multiplies them a second time.
 BASE_SIZES = {
-    "body": 11,
-    "bold": 11,
-    "small": 10,
+    "body": 10,
+    "bold": 10,
+    "small": 9,
     "tiny": 9,
-    "title": 20,
-    "card": 13,
-    "mono": 11,
-    "mono_bold": 11,
+    "title": 16,
+    "card": 11,
+    "mono": 10,
+    "mono_bold": 10,
 }
 BOLD_KEYS = frozenset({"bold", "title", "card", "mono_bold"})
-
-#: What the "Interface size" control offers. "auto" follows the display.
-SCALE_CHOICES = ("auto", "100%", "110%", "125%", "150%", "175%")
-
-
-def parse_scale(value: object, root: tk.Misc | None = None) -> float:
-    """Interface-size multiplier; ``"auto"`` reads the display's own DPI.
-
-    Tk states scaling in pixels per point and already applies it to every
-    point size, so auto only has to pick up what is left on a high-DPI
-    display - 1.333 px/pt is the 96 DPI baseline where the answer is 1.0.
-    """
-    text = str(value or "auto").strip().lower().removesuffix("%")
-    if text in {"", "auto", "0"}:
-        if root is None:
-            return 1.0
-        try:
-            per_point = float(root.tk.call("tk", "scaling"))
-        except (tk.TclError, ValueError):
-            return 1.0
-        return max(1.0, min(2.0, round(per_point / (96.0 / 72.0), 2)))
-    try:
-        num = float(text)
-    except ValueError:
-        return 1.0
-    if num > 3:  # written as a percentage
-        num /= 100.0
-    return max(0.8, min(2.0, num))
 
 
 def _stamp_tick(rows: list[list[str]], box: int, colour: str, thick: int) -> None:
@@ -224,7 +195,7 @@ class Theme:
         ("Bg.TCheckbutton", "bg"),
     )
 
-    def __init__(self, root: tk.Misc, mode: str = "dark", scale: object = "auto") -> None:
+    def __init__(self, root: tk.Misc, mode: str = "dark") -> None:
         self.root = root
         self.style = ttk.Style(root)
         try:
@@ -233,12 +204,10 @@ class Theme:
             pass
         self.family = pick_family()
         self.mono_family = pick_family(MONO_FAMILIES, "TkFixedFont")
-        self.scale_setting = str(scale or "auto")
-        self.scale = parse_scale(self.scale_setting, root)
         self.fonts = {
             key: tkfont.Font(
                 family=self.mono_family if key.startswith("mono") else self.family,
-                size=self._pt(key),
+                size=BASE_SIZES[key],
                 weight="bold" if key in BOLD_KEYS else "normal",
             )
             for key in BASE_SIZES
@@ -250,22 +219,16 @@ class Theme:
         self.apply(mode)
 
     # -- sizing --------------------------------------------------------- #
-    def _pt(self, key: str) -> int:
-        return max(7, round(BASE_SIZES[key] * self.scale))
-
-    def px(self, n: int) -> int:
-        """Scale a pixel measurement with the interface size."""
-        return max(1, round(n * self.scale))
-
     def line_height(self, key: str = "body") -> int:
+        """Measured line height of one of the shared fonts."""
         try:
             return int(self.fonts[key].metrics("linespace"))
         except (tk.TclError, KeyError):
             return 17
 
     def row_height(self) -> int:
-        """Table row height that follows the font instead of a fixed 26px."""
-        return max(22, self.line_height("small") + self.px(10))
+        """The original 26px table row, widened only if the font needs it."""
+        return max(26, self.line_height("small") + 6)
 
     def _sync_named_fonts(self) -> None:
         """Point Tk's named fonts at the same faces.
@@ -289,21 +252,6 @@ class Theme:
             target.configure(
                 family=src.cget("family"), size=src.cget("size"), weight=src.cget("weight")
             )
-
-    def set_scale(self, value: object) -> float:
-        """Re-size the whole interface in place, with no rebuild.
-
-        Every style refers to the shared ``Font`` objects, so reconfiguring
-        those re-renders each widget that uses them; the pixel measurements
-        below are all derived from the new metrics.
-        """
-        self.scale_setting = str(value or "auto")
-        self.scale = parse_scale(self.scale_setting, self.root)
-        for key, font in self.fonts.items():
-            font.configure(size=self._pt(key))
-        self._sync_named_fonts()
-        self.apply(self.p.name)
-        return self.scale
 
     # -- check-box indicators ------------------------------------------- #
     def _indicator_size(self) -> tuple[int, int]:
@@ -393,7 +341,6 @@ class Theme:
         self.p = p = PALETTES.get(mode, DARK)
         s = self.style
         f = self.fonts
-        px = self.px
 
         self.root.configure(background=p.bg)
         for opt, val in (
@@ -537,7 +484,7 @@ class Theme:
                 indicatorforeground=p.accent_text,
                 bordercolor=p.border,
                 focuscolor=p.accent,
-                padding=(0, px(4)),
+                padding=(0, 4),
             )
             s.map(
                 style_name,
@@ -551,7 +498,7 @@ class Theme:
             foreground=p.text,
             indicatorcolor=p.surface2,
             bordercolor=p.border,
-            padding=(0, px(4)),
+            padding=(0, 4),
         )
         s.map(
             "TRadiobutton",
@@ -568,7 +515,7 @@ class Theme:
             lightcolor=p.surface2,
             darkcolor=p.surface2,
             insertcolor=p.text,
-            padding=(px(8), px(6)),
+            padding=(8, 6),
         )
         s.map(
             "TEntry",
@@ -583,11 +530,11 @@ class Theme:
             foreground=p.text,
             bordercolor=p.border,
             arrowcolor=p.muted,
-            arrowsize=px(13),
+            arrowsize=12,
             insertcolor=p.text,
             lightcolor=p.surface2,
             darkcolor=p.surface2,
-            padding=(px(8), px(5)),
+            padding=(8, 5),
         )
         s.map(
             "TSpinbox",
@@ -603,10 +550,10 @@ class Theme:
             foreground=p.text,
             bordercolor=p.border,
             arrowcolor=p.muted,
-            arrowsize=px(14),
+            arrowsize=13,
             lightcolor=p.surface2,
             darkcolor=p.surface2,
-            padding=(px(8), px(5)),
+            padding=(8, 5),
             selectbackground=p.surface2,
             selectforeground=p.text,
         )
@@ -641,7 +588,7 @@ class Theme:
             foreground=p.muted,
             font=f["small"],
             relief="flat",
-            padding=(px(8), px(7)),
+            padding=(8, 6),
             borderwidth=0,
         )
         s.map("Rules.Treeview.Heading", background=[("active", p.surface2)])
@@ -654,7 +601,7 @@ class Theme:
             bordercolor=p.surface2,
             lightcolor=p.accent,
             darkcolor=p.accent,
-            thickness=px(6),
+            thickness=5,
         )
         s.configure("TSeparator", background=p.border)
         s.configure("TScale", background=p.surface, troughcolor=p.surface2)
@@ -667,8 +614,7 @@ class Theme:
                 arrowcolor=p.muted,
                 darkcolor=p.border,
                 lightcolor=p.border,
-                arrowsize=px(13),
-                width=px(13),
+                arrowsize=12,
                 relief="flat",
             )
             s.map(
@@ -686,8 +632,7 @@ class Theme:
             darkcolor=p.border,
             lightcolor=p.border,
             arrowcolor=p.muted,
-            arrowsize=px(13),
-            width=px(13),
+            arrowsize=12,
             relief="flat",
         )
         s.map(

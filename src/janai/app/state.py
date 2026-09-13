@@ -92,9 +92,6 @@ def defaults() -> dict[str, Any]:
             "log_open": False,
             "log_weight": 2,
             "geometry": "",
-            # Interface size. "auto" follows the display's DPI; a percentage
-            # ("125%") overrides it for a display that reports the wrong one.
-            "scale": "auto",
         },
         "probe": None,
     }
