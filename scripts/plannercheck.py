@@ -20,7 +20,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from janai.worker import worker
+from janai.worker import runtime, tiling
 
 # Measured on a 6 GB RTX 3060 laptop card by the app's own hardware profiler,
 # so these checks reason about real numbers rather than invented ones.
@@ -67,9 +67,14 @@ class FakeCuda:
 
 
 CUDA = FakeCuda()
-worker.TILE = {"cls": int, "none": "none", "maximum": "maximum", "estimate": "estimate"}
-worker.log = fake_log
-worker.torch = SimpleNamespace(cuda=CUDA)
+# Patch each name on the module that owns it. The planner reads TILE and torch
+# through `runtime.` at call time, so patching them here really reaches it;
+# `log` is bound into tiling's own namespace by its import, so it has to be
+# patched there. Patching the wrong module leaves these checks driving the real
+# card, which is worse than not running them.
+runtime.TILE = {"cls": int, "none": "none", "maximum": "maximum", "estimate": "estimate"}
+runtime.torch = SimpleNamespace(cuda=CUDA)
+tiling.log = fake_log
 
 
 class Page:
@@ -81,7 +86,7 @@ class Model:
     scale = 4
 
 
-class Planner(worker.TilePlanner):
+class Planner(tiling.TilePlanner):
     """The real planner with the card's three answers under test control."""
 
     fake_retries = 0

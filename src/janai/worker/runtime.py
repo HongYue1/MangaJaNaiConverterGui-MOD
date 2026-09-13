@@ -84,6 +84,19 @@ TILE: dict[str, Any] = {}
 _heavy_loaded = False
 
 
+def hwc(image: Any) -> tuple[int, int, int]:
+    """(height, width, channels): the stdlib-only twin of `get_h_w_c` above.
+
+    Kept beside that handle because shapes are needed before, or entirely
+    without, the vendored backend being imported - a dry run, the tile planner
+    under test and the encoder probe all ask for an image's shape while
+    `get_h_w_c` is still None.
+    """
+    if image.ndim == 2:
+        return int(image.shape[0]), int(image.shape[1]), 1
+    return int(image.shape[0]), int(image.shape[1]), int(image.shape[2])
+
+
 def apply_perf_env(perf: dict) -> None:
     """Environment that must be set before libvips/torch are imported."""
     vc = int(perf.get("vips_concurrency") or 0)
