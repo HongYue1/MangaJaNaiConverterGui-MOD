@@ -17,35 +17,43 @@ model packs. See [What changed in this fork](#what-changed-in-this-fork).
 
 ```
 MangaJaNaiConverterGui-MOD\
-  JaNaiUpscaler.cmd      launcher (finds the venv's pythonw.exe)
-  setup.cmd / setup.ps1  one-shot installer, uv-driven
+  JaNaiUpscaler.cmd      Windows launcher (finds the venv's pythonw.exe)
+  janai-upscaler.sh      Linux / macOS launcher
+  setup.cmd / setup.ps1  one-shot installer for Windows, uv-driven
+  setup.sh               the same installer for Linux / macOS
+  pyproject.toml         package metadata and the ruff configuration
   requirements.txt       the pinned worker dependencies
   janai.config.json      written by setup: python version, torch backend
   janai.runtime.txt      written by setup: which interpreter to launch
   settings.json          your last-used settings (created on first exit)
-  app\                   the GUI - standard library only, never imports torch
-  app\runlog.py          the pretty run log written to logs\Run_*.log
-  common\formats.py      the encoder/option table shared by GUI and worker
-  common\displays.py     e-reader / tablet screen presets for Fit mode
-  worker\worker.py       the upscaling process (torch, pyvips, spandrel)
+  src\janai\app\         the GUI - standard library only, never imports torch
+    runlog.py            the pretty run log written to logs\Run_*.log
+  src\janai\core\        shared, torch-free logic used by GUI and worker
+    formats.py           the encoder / option table
+    displays.py          e-reader / tablet screen presets for Fit mode
+    rules.py             the upscaling rule engine and default working set
+    presets.py           export / import of settings presets
+    paths.py             runtime, model and backend resolution
+  src\janai\worker\      the upscaling process (torch, pyvips, spandrel)
+  scripts\selftest.py    end-to-end check: probe, encoders, models, upscale
+  scripts\bench.py       throughput harness (tile sizes, baseline compare)
+  scripts\smoke.py       dependency-free checks, also run by CI
   logs\                  Run_YYYYMMDD-HHMMSS.log, one per run, auto-pruned
-  tools\                 uv.exe, plus cjxl.exe / djxl.exe when available
-  tools\selftest.py      end-to-end check: probe, encoders, models, upscale
-  tools\bench.py         throughput harness (tile sizes, baseline compare)
-  tools\smoke.py         dependency-free checks, also run by CI
+  presets\               your saved presets (*.janai.json)
   backend\
     python\              the virtual environment: torch, pyvips, spandrel
     pythons\             the CPython uv downloaded for that venv
     src\                 chaiNNer-derived backend, tracked in this repository
     ImageMagick\         ICC profiles used for grayscale resizing
     models\              *.pth / *.safetensors / *.onnx
+    tools\               uv, plus cjxl / djxl when available
     extras\              optional side-loaded packages, normally empty
     _cache\              uv cache + downloads, safe to delete
 ```
 
-`backend\python`, `backend\pythons`, `backend\models`, `backend\extras` and
-`backend\_cache` are per-machine and are not tracked by git: every clone starts
-clean and builds its own runtime. Nothing is ever shared with, or borrowed
+`backend\python`, `backend\pythons`, `backend\models`, `backend\extras`,
+`backend\_cache`, `logs\`, `presets\` and `settings.json` are per-machine and
+are not tracked by git: every clone starts clean and builds its own runtime. Nothing is ever shared with, or borrowed
 from, another application's install.
 
 ## Setup
@@ -53,8 +61,8 @@ from, another application's install.
 Run **`setup.cmd`** once and let it finish. It is driven by
 [uv](https://docs.astral.sh/uv/) and does this:
 
-1. finds `uv.exe` - `tools\`, `PATH`, `~\.local\bin`, WinGet links - and
-   downloads it into `tools\` if you do not have it (~15 MB);
+1. finds `uv.exe` - `backend\tools\`, `PATH`, `~\.local\bin`, WinGet links -
+   and downloads it into `backend\tools\` if you do not have it (~15 MB);
 2. checks that `backend\src`, `backend\ImageMagick` and `backend\resources`
    are in place - they are tracked here, so a clone already has them and
    nothing is copied;
@@ -95,25 +103,31 @@ cached in `backend\_cache`).
 
 ## Platform support
 
-Windows 10/11 x64 is what ships and what CI checks. The wrappers are Windows
-scripts (`setup.cmd`, `setup.ps1`, `JaNaiUpscaler.cmd`) and the bundled JPEG XL
-helpers are `cjxl.exe` / `djxl.exe`.
+Windows 10/11 x64 and Linux x64 are both supported, and CI checks both.
 
-The Python side itself is portable: the GUI is Tk, the worker is torch +
-pyvips, paths go through `pathlib`, and the Windows-only calls (DPI awareness,
-WM_DROPFILES drag & drop, `CREATE_NO_WINDOW`, opening a folder) are all guarded
-by platform checks with POSIX fallbacks. On Linux only the wrappers are
-missing, so running it means creating the environment by hand:
+| | Windows | Linux |
+| --- | --- | --- |
+| install | `setup.cmd` (or `setup.ps1`) | `./setup.sh` |
+| launch | `JaNaiUpscaler.cmd` | `./janai-upscaler.sh` |
+| JPEG XL | bundled `cjxl.exe` / `djxl.exe` | `libjxl-tools`, or `pillow-jxl-plugin` in the venv |
+| libvips | `pyvips-binary` wheel | `pyvips-binary` wheel, distro `libvips` as a fallback |
 
-```
-uv venv backend/python --python 3.13
-uv pip install --python backend/python/bin/python -r requirements.txt
-backend/python/bin/python app/main.py
-```
+`setup.sh` mirrors `setup.ps1` flag for flag - `--python 3.13`, `--torch
+auto|cpu|cu126|cu128|cu129`, `--models all|manga|illustration|none`,
+`--force`, `--offline`, `--no-jxl-plugin` - detects an NVIDIA driver with
+`nvidia-smi` and falls back to the CPU wheels when there is none, installs uv
+into `backend/tools` if you do not have it, falls back to `python3 -m venv`
+when even that is impossible, and finishes by probing the runtime exactly like
+the Windows installer. Tk is the one thing it cannot install for you: the
+CPython that uv downloads brings its own, but if setup falls back to a system
+interpreter you may need `sudo apt install python3-tk` (or your
+distribution's equivalent).
 
-plus `libvips` and `libjxl-tools` from the distribution's package manager
-(pyvips needs the system library, and the bundled `.exe` encoders will not
-run). That path is not tested here, so treat Linux as unsupported until it is.
+The Python side is platform-neutral by design: the GUI is Tk, the worker is
+torch + pyvips, paths go through `pathlib`, and the Windows-only calls (DPI
+awareness, WM_DROPFILES drag & drop, `CREATE_NO_WINDOW`) are guarded with
+POSIX fallbacks - "open output folder" uses `xdg-open`, and the JPEG XL tool
+finder falls back to `PATH`.
 
 **NVIDIA T4** (Turing, sm_75, 16 GB) is a good fit. FP16 runs on its tensor
 cores, so the default half precision is a genuine speed-up, and 16 GB lets the
@@ -125,7 +139,8 @@ FP32 all the same. Any CUDA device torch supports works the same way.
 
 ## Using it
 
-Start with **`JaNaiUpscaler.cmd`**.
+Start with **`JaNaiUpscaler.cmd`** on Windows or **`./janai-upscaler.sh`** on
+Linux.
 
 **Input** - choose a file (single image or a `.cbz`/`.zip`) or a folder (bulk).
 Drag and drop onto the window works too. Folders can optionally recurse and
@@ -142,19 +157,43 @@ optionally process archives; the header shows what the scan found.
 
 **Models** - with *Grayscale detection* off, one model handles everything.
 With it on you pick two: one for colour pages, one for grayscale pages, which
-is the entire point of telling them apart. *Suggest* fills both from what is
-installed (IllustrationJaNai for colour, the MangaJaNai model closest to your
-target page height for grayscale); either box can stay on *Auto* to keep the
-old per-image choice. Start refuses to run while a required model is empty and
-says which one is missing.
+is the entire point of telling them apart. Start refuses to run while a
+required model is empty and says which one is missing.
 
-Detection itself is no longer one saturation threshold. Every page is measured
-for colour strength *and* for the share of pixels that are meaningfully
-coloured, on a downsampled copy, so a manga page with a couple of coloured
-bubbles or a yellowed scan still counts as grayscale while a pale colour
-illustration does not. Both numbers are adjustable, and each per-file log line
-prints the score that decided it. Auto levels and a pre-downscale cap are still
-there for the cases where the automatic choice is wrong.
+**Rules** - above those pickers sits the rule table, which is how the app
+really decides. A rule is a condition and the model to use when it matches:
+
+| Page | Dimensions | Model | Auto levels |
+| --- | --- | --- | --- |
+| grayscale | `1920` | `2x_MangaJaNai_1920p_V1_ESRGAN_70k.pth` | yes |
+| grayscale | `1600-1919` | `2x_MangaJaNai_1600p_V1_ESRGAN_70k.pth` | yes |
+| colour | any | `4x_IllustrationJaNai_V3denoise_FDAT_M_47k_fp16` | - |
+| any | any | `auto` | - |
+
+Pages are matched from the top down, except that a rule with explicit
+dimensions always outranks an `any` rule, so a catch-all sitting too high
+cannot silently shadow a sized rule. Dimensions accept an exact height
+(`1920`, `1920p`), a range (`1600-1920`), an open end (`1985-`, `-1250`) or
+`any`; *Auto levels* applies to grayscale rules only; a model left on `auto`
+hands that page back to the built-in picker, so a rule can narrow the
+condition without pinning a file. The editor flags rules that cannot work - a
+4x model on a 2x rule, auto levels on a colour rule, a model that is not
+installed - and the log prints, once per run, which rule claimed each page.
+
+**Defaults** rebuilds the *default working set*: exactly what used to be
+hidden inside "auto", now visible and editable. The MangaJaNai height bands
+(1200p, 1300p, 1400p, 1600p, 1920p, 2048p) for grayscale pages at the current
+scale, the IllustrationJaNai denoise model for colour pages, and a catch-all
+fallback - built from the models you actually have. Untick *Use rules* and the
+two pickers above apply to everything, as before.
+
+Grayscale detection itself is not one saturation threshold. Every page is
+measured for colour strength *and* for the share of pixels that are
+meaningfully coloured, on a downsampled copy, so a manga page with a couple of
+coloured bubbles or a yellowed scan still counts as grayscale while a pale
+colour illustration does not. Both numbers are adjustable, and each per-file
+log line prints the score that decided it. Auto levels and a pre-downscale cap
+are still there for the cases where the automatic choice is wrong.
 
 **Output** - folder, filename pattern, overwrite policy, keep-folder-structure,
 the **package** mode, and the format: PNG, JPEG, WebP, AVIF or **JPEG XL**.
@@ -251,6 +290,15 @@ text, plus a header describing the job (input, output, package, format, models,
 device, precision, tile) and a footer with the totals. The most recent 40 are
 kept.
 
+**Presets** - *Presets* saves everything you have set up - output, format,
+upscale settings including the whole rule table, performance and log options -
+into `presets\<name>.janai.json`, and loads it back here or on another
+machine. Machine-specific values are deliberately left out (the output folder,
+the pinned device, the log folder), so applying someone else's preset never
+redirects your output or pins a GPU you do not have; the menu lists whatever
+is in `presets\`. Your settings are remembered between runs in `settings.json`
+without saving anything.
+
 ### Shortcuts
 
 | Key | Action |
@@ -268,13 +316,18 @@ kept.
 The worker is usable on its own, which is handy for scripting or debugging:
 
 ```bat
-backend\python\Scripts\python.exe worker\worker.py --probe
-backend\python\Scripts\python.exe worker\worker.py --job job.json
-backend\python\Scripts\python.exe worker\worker.py --job job.json --dry-run
-backend\python\Scripts\python.exe worker\worker.py --hold --device cuda:0
-backend\python\Scripts\python.exe tools\selftest.py
-backend\python\Scripts\python.exe tools\bench.py --input page.png --tiles auto,1024,768
+set PY=backend\python\Scripts\python.exe
+%PY% src\janai\worker\worker.py --probe
+%PY% src\janai\worker\worker.py --job job.json
+%PY% src\janai\worker\worker.py --job job.json --dry-run
+%PY% src\janai\worker\worker.py --hold --device cuda:0
+%PY% scripts\selftest.py
+%PY% scripts\bench.py --input page.png --tiles auto,1024,768
 ```
+
+A uv venv keeps the interpreter in `Scripts\`, an embedded runtime is flat,
+and on Linux it is `backend/python/bin/python`; `janai.runtime.txt` records
+whichever one setup found, which is also how the launchers locate it.
 
 `--probe` prints one JSON line describing devices, encoders, models and
 library versions. `--job` takes the same JSON the GUI writes (input, output,
@@ -284,12 +337,40 @@ the same job and reports what it would write without loading a model.
 `--hold` is the wake lock: it keeps a context alive on `--device` (or the best
 GPU when omitted) until `stop` arrives on stdin or stdin closes.
 
-`tools\selftest.py` exercises the whole pipeline end to end - probe, encoders,
-models, a real upscale, grayscale detection, CBZ packaging and a dry run - and
-prints `ALL PASS` or the first failure. `tools\bench.py` runs the real worker
-once per tile setting and prints a time / ms-per-megapixel table; `--repeat`,
-`--warmup`, `--copies N` (duplicate one page into a chapter) and `--baseline
-<ms>` are there for comparing against a known-good number.
+`scripts\selftest.py` exercises the whole pipeline end to end - probe,
+encoders, models, a real upscale, grayscale detection, the rule engine, CBZ
+packaging and a dry run - and prints `ALL PASS` or the first failure.
+`scripts\bench.py` runs the real worker once per tile setting and prints a
+time / ms-per-megapixel table; `--repeat`, `--warmup`, `--copies N`
+(duplicate one page into a chapter), `--cudnn` and `--baseline <ms>` are there
+for comparing against a known-good number.
+
+## Development
+
+The code is a plain `src` layout package: `src\janai\app` (Tk GUI),
+`src\janai\core` (torch-free shared logic) and `src\janai\worker` (the
+upscaling process), described by `pyproject.toml`, with the harnesses in
+`scripts\`. Nothing under `app` or `core` imports torch, which is what keeps
+the window and the dry run instant.
+
+Formatting and linting are [ruff](https://docs.astral.sh/ruff/), configured in
+`pyproject.toml` (100 columns, `py311`, double quotes, LF):
+
+```
+uv tool run ruff format .
+uv tool run ruff check .
+```
+
+The rule set is chosen for this kind of code rather than for maximal
+strictness: `PERF`, `FURB`, `C4`, `SIM`, `RET` and `PIE` for hot-path
+efficiency and dead weight, `PTH` for pathlib, `B`/`A`/`RUF`/`PL` for
+correctness traps, `LOG`/`G` for logging, `NPY` for numpy, `I` for import
+order and `TID` to ban relative imports. Four are deliberately off, each for a
+performance or architecture reason: `PLC0415` (deferred imports are how torch
+stays out of the GUI process), `SIM105` (`try`/`except`/`pass` is cheaper than
+`contextlib.suppress` on the per-tile path), `PLW0603` (the worker's module
+state is intentional) and `BLE001`. CI runs `ruff format --check`,
+`ruff check` and the dependency-free smoke checks on both Windows and Ubuntu.
 
 ## Parity with the original
 
@@ -324,8 +405,8 @@ workflow editor.
   opens with the system Python, but upscaling needs `backend\python`.
 - **No models listed** - drop `.pth`/`.safetensors` files into `backend\models`
   and press `F5`, or re-run `setup.cmd -Models all`.
-- **JXL disabled** - the tooltip shows why. Dropping `cjxl.exe` into `tools\`
-  fixes it; `setup.cmd` also tries `pillow-jxl-plugin`, which setup installs
+- **JXL disabled** - the tooltip shows why. Dropping `cjxl.exe` into
+  `backend\tools\` fixes it; `setup.cmd` also tries `pillow-jxl-plugin`, which setup installs
   into the venv.
 - **GPU not listed** - the CPU build got installed; re-run
   `setup.cmd -Torch cu128 -Force`. If CUDA is present but upscaling still runs
@@ -364,8 +445,22 @@ Velopack packaging, the bundled updater, the workflow/chain state in
 
 **New or rewritten:**
 
-- **the interface** - `app\`, Python + Tk, standard library only. It never
-  imports torch; `worker\worker.py` is a separate process that does.
+- **the interface** - `src\janai\app`, Python + Tk, standard library only. It
+  never imports torch; `src\janai\worker\worker.py` is a separate process that
+  does.
+- **a proper package layout** - `src\janai\{app,core,worker}` with
+  `pyproject.toml` and `scripts\` for the harnesses, plus ruff enforcing
+  format and lint in CI on Windows and Ubuntu.
+- **rule-based upscaling** - an ordered *condition -> model* table (colour or
+  grayscale, exact/ranged/any dimensions, model, auto levels) replaces the
+  opaque "auto". Explicit dimensions always outrank `any`, impossible rules are
+  flagged in the editor, and the old auto behaviour ships as the editable
+  default working set.
+- **presets** - export and import everything you have set up as
+  `presets\<name>.janai.json`, minus machine-specific paths and the pinned
+  device; settings are remembered between runs regardless.
+- **Linux support** - `setup.sh` and `janai-upscaler.sh` beside the Windows
+  wrappers, same flags, same closing probe.
 - **FP16 on by default**, decided by a runtime capability check rather than a
   checkbox that could silently do nothing.
 - **an adaptive tile planner** - it measures what the loaded model actually
@@ -393,12 +488,12 @@ Velopack packaging, the bundled updater, the workflow/chain state in
   nothing written and torch never loaded.
 - **the run log** - aligned and grouped, saved to `logs\Run_<timestamp>.log`
   automatically, and the log pane now fills the window.
-- **setup** - a single `uv`-driven `setup.cmd` that builds the environment,
-  fetches the model packs and self-tests the result. Every install is clean
-  and self-contained.
-- **checks** - `tools\smoke.py` (no dependencies, runs in CI),
-  `tools\selftest.py` (end to end, needs the runtime) and `tools\bench.py`
-  (throughput).
+- **setup** - a single `uv`-driven installer (`setup.cmd` on Windows,
+  `setup.sh` on Linux) that builds the environment, fetches the model packs
+  and self-tests the result. Every install is clean and self-contained.
+- **checks** - `scripts\smoke.py` (no dependencies, runs in CI),
+  `scripts\selftest.py` (end to end, needs the runtime) and
+  `scripts\bench.py` (throughput).
 
 `backend\resources` and the ICC profiles are byte-identical to upstream. The
 backend under `backend\src` carries three deliberate changes, all in
