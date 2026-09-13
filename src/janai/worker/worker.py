@@ -46,31 +46,15 @@ from pathlib import Path
 from typing import Any
 from zipfile import ZIP_STORED, ZipFile
 
-HERE = Path(__file__).resolve().parent
-SRC = HERE.parents[1]  # <app folder>/src, the import root
-ROOT = SRC.parent  # the app folder itself
+_HERE = Path(__file__).resolve().parent
+_SRC = _HERE.parents[1]  # <app folder>/src, the import root
 
 # Run as a script, sys.path[0] is this directory, so the package itself would
 # not be importable. Put the import root in front before anything of ours.
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
-from janai.core import paths as _paths, rules as _rules
-
-# The runtime, the models, the backend source and the ICC profiles all live in
-# backend/, unless janai.config.json points somewhere else. janai.core.paths
-# works that out once, here.
-PATHS = _paths.resolve(ROOT)
-MODELS_DIR = PATHS.models_dir or (ROOT / "backend" / "models")
-
-for _p in reversed(PATHS.import_paths()):
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
-
-# Bundled command line tools (cjxl, djxl) win over anything already on PATH.
-if PATHS.tools_dir:
-    os.environ["PATH"] = f"{PATHS.tools_dir}{os.pathsep}{os.environ.get('PATH', '')}"
-
+from janai.core import rules as _rules
 from janai.core.formats import (
     CONTAINERS,
     FORMATS,
@@ -79,6 +63,11 @@ from janai.core.formats import (
 )
 from janai.worker import devices, runtime
 from janai.worker.control import CTRL, Cancelled
+
+# Importing environment resolves the install layout, puts the vendored backend
+# on sys.path and the bundled tools on PATH. It must happen before any heavy
+# import, which is why nothing below may be reordered above it.
+from janai.worker.environment import MODELS_DIR, PATHS, ROOT
 from janai.worker.events import emit, log
 from janai.worker.pipeline import BundleWriter, WritePool, prefetch
 from janai.worker.planning import (
