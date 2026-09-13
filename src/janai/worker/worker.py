@@ -33,13 +33,10 @@ import json
 import os
 import platform
 import re
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 import traceback
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 from zipfile import ZIP_STORED, ZipFile
@@ -57,9 +54,8 @@ from janai.core.formats import (
     CONTAINERS,
     FORMATS,
     merged,
-    save_kwargs,
 )
-from janai.worker import capabilities, devices, runtime, tiling
+from janai.worker import capabilities, devices, imageio, runtime, tiling
 from janai.worker.control import CTRL, Cancelled
 
 # Importing environment resolves the install layout, puts the vendored backend
@@ -109,11 +105,6 @@ _upscale_image_node = None
 _load_model_node = None
 TILE: dict[str, Any] = {}
 
-# Not a runtime handle: the ICC cache belongs to icc_transforms() and moves with
-# it. Kept here only because that function has not been extracted yet.
-_icc_pair = None
-_icc_warned = False
-
 
 def _mirror_runtime() -> None:
     """Publish runtime's loaded handles under the names this file still uses."""
@@ -139,31 +130,8 @@ def load_backend(perf: dict | None = None) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# encoder capability probe
+# model discovery
 # --------------------------------------------------------------------------- #
-def encode_capabilities() -> dict:
-    """What this install can really write, checked by encoding a 1x1 image."""
-    caps: dict[str, dict] = {}
-    probe = np.zeros((1, 1), dtype=np.uint8)
-    for fid, spec in FORMATS.items():
-        entry = {"ok": False, "via": "", "reason": ""}
-        if capabilities.vips_has(spec.probe):
-            try:
-                vips_from_array(probe).write_to_buffer(spec.suffix)
-                entry.update(ok=True, via="libvips")
-            except Exception as exc:
-                entry["reason"] = f"libvips {spec.probe}: {exc}"
-        else:
-            entry["reason"] = f"libvips has no {spec.probe}"
-        if not entry["ok"] and fid == "jxl":
-            if capabilities.pillow_jxl_available():
-                entry.update(ok=True, via="pillow-jxl", reason="")
-            elif capabilities.find_cjxl():
-                entry.update(ok=True, via="cjxl", reason="")
-        caps[fid] = entry
-    return caps
-
-
 def list_models(models_dir: Path) -> list[dict]:
     if not models_dir.is_dir():
         return []
@@ -236,7 +204,7 @@ def do_probe(models_dir: Path) -> int:
     info["devices"] = devices.device_objects()
     gpu = next((d for d in info["devices"] if d["value"] != "cpu"), None)
     info["default_device"] = gpu["value"] if gpu else "cpu"
-    info["formats"] = encode_capabilities()
+    info["formats"] = imageio.encode_capabilities()
     info["read_jxl"] = capabilities.vips_has("jxlload") or bool(capabilities.find_djxl())
     info["read_heif"] = capabilities.vips_has("heifload")
     info["models"] = list_models(models_dir)
@@ -258,84 +226,6 @@ def do_probe(models_dir: Path) -> int:
 # --------------------------------------------------------------------------- #
 # image pipeline
 # --------------------------------------------------------------------------- #
-def vips_from_array(arr):
-    a = np.ascontiguousarray(arr)
-    if a.ndim == 2:
-        h, w = a.shape
-        bands = 1
-    else:
-        h, w, bands = a.shape
-    img = pyvips.Image.new_from_memory(a.tobytes(), w, h, bands, "uchar")
-    try:
-        img = img.copy(interpretation="b-w" if bands == 1 else "srgb")
-    except Exception:
-        pass
-    return img
-
-
-def read_image(path: Path):
-    if path.suffix.lower() == ".jxl" and not capabilities.vips_has("jxlload"):
-        return read_jxl_djxl(path)
-    return (
-        pyvips.Image.new_from_file(str(path), access="sequential", fail=True)
-        .icc_transform("srgb")
-        .numpy()
-    )
-
-
-def read_image_bytes(data: bytes, name: str = ""):
-    if name.lower().endswith(".jxl") and not capabilities.vips_has("jxlload"):
-        with tempfile.TemporaryDirectory(prefix="janai-jxl-") as td:
-            src = Path(td) / "in.jxl"
-            src.write_bytes(data)
-            return read_jxl_djxl(src)
-    return pyvips.Image.new_from_buffer(data, "", access="sequential").icc_transform("srgb").numpy()
-
-
-def read_jxl_djxl(path: Path):
-    """Decode JPEG XL through djxl, for a libvips built without jxlload."""
-    exe = capabilities.find_djxl()
-    if not exe:
-        raise RuntimeError(
-            "this libvips cannot read JPEG XL; put djxl.exe in the tools folder "
-            "or on PATH to read .jxl inputs"
-        )
-    with tempfile.TemporaryDirectory(prefix="janai-jxl-") as td:
-        dst = Path(td) / "decoded.png"
-        run = subprocess.run(
-            [exe, str(path), str(dst)], check=False, capture_output=True, creationflags=no_window()
-        )
-        if run.returncode != 0 or not dst.exists():
-            raise RuntimeError(f"djxl failed: {run.stderr.decode('utf-8', 'replace')[:300]}")
-        return (
-            pyvips.Image.new_from_file(str(dst), access="sequential", fail=True)
-            .icc_transform("srgb")
-            .numpy()
-        )
-
-
-def icc_transforms():
-    """(dotgain20 -> gamma1, gamma1 -> dotgain20) or None when profiles are missing."""
-    global _icc_pair, _icc_warned
-    if _icc_pair is not None:
-        return _icc_pair
-    gamma = PATHS.icc("Custom Gray Gamma 1.0.icc")
-    dot = PATHS.icc("Dot Gain 20%.icc")
-    if not (gamma and dot):
-        if not _icc_warned:
-            log("grayscale ICC profiles missing, using Lanczos for the final resize", "warn")
-            _icc_warned = True
-        _icc_pair = ()
-        return _icc_pair
-    g = _ImageCms.getOpenProfile(str(gamma))
-    d = _ImageCms.getOpenProfile(str(dot))
-    _icc_pair = (
-        _ImageCms.buildTransformFromOpenProfiles(d, g, "L", "L"),
-        _ImageCms.buildTransformFromOpenProfiles(g, d, "L", "L"),
-    )
-    return _icc_pair
-
-
 def standard_resize(image, new_size: tuple[int, int]):
     out = image.astype(np.float32) / 255.0
     out = _cx_resize(out, new_size, _ResizeFilter.Lanczos, False)
@@ -346,7 +236,7 @@ def standard_resize(image, new_size: tuple[int, int]):
 
 
 def dotgain20_resize(image, new_size: tuple[int, int]):
-    pair = icc_transforms()
+    pair = imageio.icc_transforms()
     if not pair:
         return standard_resize(image, new_size)
     to_gamma, to_dotgain = pair
@@ -614,88 +504,6 @@ def upscale_array(ctx, image, model, tile):
 
 
 # --------------------------------------------------------------------------- #
-# encoding
-# --------------------------------------------------------------------------- #
-def encode(image, fid: str, opts: dict, caps: dict) -> bytes:
-    spec = FORMATS[fid]
-    cap = caps.get(fid, {})
-    via = cap.get("via") or "libvips"
-    if via == "libvips":
-        return encode_vips(image, fid, opts)
-    if fid == "jxl" and via == "pillow-jxl":
-        return encode_jxl_pillow(image, opts)
-    if fid == "jxl" and via == "cjxl":
-        return encode_jxl_cjxl(image, opts)
-    raise RuntimeError(f"no encoder available for {spec.label}")
-
-
-def encode_vips(image, fid: str, opts: dict) -> bytes:
-    spec = FORMATS[fid]
-    img = vips_from_array(image)
-    if img.bands == 4 and fid == "jpeg":
-        img = img.flatten(background=255)
-    kwargs = save_kwargs(fid, opts)
-    try:
-        return img.write_to_buffer(spec.suffix, **kwargs)
-    except Exception as exc:
-        keep = {
-            k: v for k, v in kwargs.items() if k in ("Q", "lossless", "compression", "distance")
-        }
-        log(f"{spec.label}: {exc}; retrying with {keep or 'defaults'}", "warn")
-        return img.write_to_buffer(spec.suffix, **keep)
-
-
-def _pil_image(image):
-    if image.ndim == 2:
-        return _PILImage.fromarray(image, mode="L")
-    if image.shape[2] == 4:
-        return _PILImage.fromarray(image, mode="RGBA")
-    return _PILImage.fromarray(image[:, :, :3], mode="RGB")
-
-
-def encode_jxl_pillow(image, opts: dict) -> bytes:
-    import pillow_jxl  # noqa: F401
-
-    vals = merged("jxl", opts)
-    kwargs: dict[str, Any] = {"effort": int(vals["effort"])}
-    if vals.get("lossless"):
-        kwargs["lossless"] = True
-    else:
-        if vals.get("rate_mode") == "distance":
-            log("pillow-jxl has no distance control; using the quality value instead", "warn")
-        kwargs["quality"] = int(vals["Q"])
-    buf = BytesIO()
-    _pil_image(image).save(buf, format="JXL", **kwargs)
-    return buf.getvalue()
-
-
-def encode_jxl_cjxl(image, opts: dict) -> bytes:
-    exe = capabilities.find_cjxl()
-    if not exe:
-        raise RuntimeError("cjxl not found")
-    vals = merged("jxl", opts)
-    with tempfile.TemporaryDirectory(prefix="janai-jxl-") as td:
-        src = Path(td) / "in.png"
-        dst = Path(td) / "out.jxl"
-        vips_from_array(image).write_to_file(str(src))
-        cmd = [exe, str(src), str(dst), "-e", str(int(vals["effort"]))]
-        if vals.get("lossless"):
-            cmd += ["-d", "0", "--lossless_jpeg=0"]
-        elif vals.get("rate_mode") == "distance":
-            cmd += ["-d", str(float(vals["distance"]))]
-        else:
-            cmd += ["-q", str(int(vals["Q"]))]
-        run = subprocess.run(cmd, check=False, capture_output=True, creationflags=no_window())
-        if run.returncode != 0 or not dst.exists():
-            raise RuntimeError(f"cjxl failed: {run.stderr.decode('utf-8', 'replace')[:300]}")
-        return dst.read_bytes()
-
-
-def no_window() -> int:
-    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-
-
-# --------------------------------------------------------------------------- #
 # job execution
 # --------------------------------------------------------------------------- #
 def predict_size(ow: int, oh: int, t_scale: float, t_w: int, t_h: int) -> tuple[int, int]:
@@ -924,7 +732,7 @@ def run_job(job: dict) -> int:
     CTRL.start()  # only safe after the imports; see the note in main()
 
     models_dir = Path(str(ups.get("models_dir") or MODELS_DIR))
-    caps = encode_capabilities()
+    caps = imageio.encode_capabilities()
     if not caps.get(fid, {}).get("ok"):
         emit(
             "done",
@@ -1182,7 +990,7 @@ def run_job(job: dict) -> int:
         return image, gray, (pick["name"] if pick else ""), info
 
     def encode_now(image) -> bytes:
-        return encode(image, fid, opts, caps)
+        return imageio.encode(image, fid, opts, caps)
 
     def write_result(
         index: int,
@@ -1292,7 +1100,7 @@ def run_job(job: dict) -> int:
                     try:
                         raw = reader(name)
                         image, _gray, _model, _info = process_array(
-                            read_image_bytes(raw, name), name
+                            imageio.read_image_bytes(raw, name), name
                         )
                         data = encode_now(image)
                         zf.writestr(str(Path(name).with_suffix(FORMATS[fid].ext).as_posix()), data)
@@ -1323,7 +1131,7 @@ def run_job(job: dict) -> int:
 
     def reader(unit: dict):
         if unit["kind"] == "image":
-            return read_image(unit["path"])
+            return imageio.read_image(unit["path"])
         return None
 
     def run_images(items: list[dict], into: dict | None) -> None:
