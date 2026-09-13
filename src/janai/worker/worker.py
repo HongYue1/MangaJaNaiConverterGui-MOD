@@ -502,10 +502,12 @@ class TilePlanner:
       per-pixel cost from it, so later pages are sized for the model in use
       instead of for a constant,
     * only ever revises that cost upwards, and shrinks the tile for the rest
-      of the run only on real memory pressure - an allocator retry, or a peak
-      that came within a hair of the memory actually free. A tile that fitted
-      is a tile worth keeping: on a 6 GB laptop card, stepping 1248px down to
-      864px costs about 9% throughput on every page that follows.
+      of the run only on real memory pressure - an allocator retry once the
+      allocator has settled, or a peak that came within a hair of the memory
+      actually free - and then only as far as a cut that is really cheaper.
+      A tile that fitted is a tile worth keeping: on a 6 GB laptop card,
+      stepping 1248px down to 864px costs about 9% throughput on every page
+      that follows.
     * prices a tile through the cut the splitter will really make - the tile
       grid, the per-edge overlap and the channel count - rather than pricing
       tile x tile, which overstated the affordable tile by about sqrt(3) on a
@@ -562,6 +564,11 @@ class TilePlanner:
         self._pending: tuple[int, int, int, int, int, int] | None = None
         self._retries = 0
         self._pressure: dict[int, int] = {}
+        # Pages this model has measured. The first one runs against a cold
+        # allocator with the weights just uploaded, so its cudaMalloc retries
+        # describe a cache that has not settled rather than a tile that is too
+        # big. See after().
+        self._pages: dict[int, int] = {}
         self._good: dict[int, int] = {}
         self._failed: dict[int, int] = {}
         self._last_page: tuple[int, int, int, int] | None = None
@@ -697,6 +704,25 @@ class TilePlanner:
         if not failed:
             return 0
         return max(self.MIN_TILE, self._align(failed - self.ALIGN))
+
+    def _cheaper(self, w: int, h: int, c: int, tile: int) -> int:
+        """The largest aligned tile that cuts this page into cheaper passes.
+
+        A step down is only worth taking if it reaches a different cut, and
+        stepping by a ratio need not: 0.85 x 1312px aligns to 1088px, and on a
+        720x4000 colour page both cut the same four passes of 752x1032. So the
+        old cap shrank the number in the log and changed no work at all, while
+        reading like a response to memory pressure. Walk the aligned sizes down
+        until the price per pass really drops - the mirror of the blind halving
+        that turned a 1152px request into 576px tiles.
+        """
+        pixels = self._tile_pixels(w, h, tile, c)
+        step = self._align(tile) - self.ALIGN
+        while step > self.MIN_TILE:
+            if self._tile_pixels(w, h, step, c) < pixels:
+                return step
+            step -= self.ALIGN
+        return self.MIN_TILE
 
     def choose(self, model: Any, image: Any):
         """A TileSize for this image, in the backend's own encoding."""
@@ -871,11 +897,23 @@ class TilePlanner:
         # keeping, since every step down is paid on every later page.
         retried = max(0, self._alloc_retries() - self._retries)
         near_limit = bool(free) and peak > int(free * 0.92)
+        pages = self._pages.get(key, 0) + 1
+        self._pages[key] = pages
         if not (retried or near_limit):
             # A page that finished cleanly clears the slate: pressure has to be
             # consecutive to mean anything, or one fragmented page early in a
             # chapter ratchets the tile down for every page after it.
             self._pressure.pop(key, None)
+            return
+        if pages == 1 and retried and not near_limit:
+            # The first page of a model pays for a cold allocator: the weights
+            # have only just been uploaded and the cache has nothing to reuse,
+            # so cudaMalloc retries here are warm-up and not a tile that is too
+            # big. Proven on a 6 GB card with a 720x4000 colour page that
+            # retried at 1312px: forcing 1088px across the batch produced the
+            # very same 17.9s first page, and later pages 0.2s slower. Shrink
+            # only if a settled allocator repeats the retries.
+            log("first page of this model: allocator warming up, keeping the tile", "debug")
             return
         strikes = self._pressure.get(key, 0) + max(1, retried)
         self._pressure[key] = strikes
@@ -893,7 +931,14 @@ class TilePlanner:
         else:
             log("memory was tight, keeping the proven tile", "debug")
             return
-        capped = max(self.MIN_TILE, self._align(tile * 0.85))
+        # Step to the next cut that is genuinely cheaper rather than stepping
+        # by a ratio, which can land inside the same cut and cost a whole run
+        # a smaller number for no change in the work done.
+        last = self._last_page
+        if last is not None and last[0] == key:
+            capped = self._cheaper(last[1], last[2], last[3], tile)
+        else:
+            capped = max(self.MIN_TILE, self._align(tile * 0.85))
         if capped < (self._cap.get(key) or tile):
             self._cap[key] = capped
             log(f"tile capped at {capped}px after {why}", "debug")

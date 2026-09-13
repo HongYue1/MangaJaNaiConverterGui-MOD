@@ -52,6 +52,13 @@ jobs:
       - name: Smoke-test the dependency-free modules
         run: python scripts/smoke.py
 
+      # Drives the real tile planner with the allocator, the free memory and
+      # the peak under test control. Three planner defects reached a build
+      # because only a GPU run could expose them; these checks need neither a
+      # GPU nor torch.
+      - name: Check the tile planner
+        run: python scripts/plannercheck.py
+
       # Qt links against X11 and EGL even when it renders offscreen, and the
       # Linux runner does not ship those libraries.
       - name: Install the system libraries Qt links against
