@@ -476,6 +476,19 @@ Velopack packaging, the bundled updater, the workflow/chain state in
   that scrolls by scrollbar and wheel, wheel-guarded dropdowns and number
   fields so the wheel scrolls the page instead of quietly changing a value,
   useful help text on every control, and a **Reset all** button.
+- **DPI-aware sizing** - fonts, padding, row heights, indicators and
+  scrollbars are all derived from the display's own scaling, with an
+  **Interface size** setting (auto, or 100% to 175%) that re-renders the
+  window immediately and is remembered between runs.
+- **drawn checkbox and radio indicators** - painted by the app at the current
+  scale instead of borrowed from the theme's font, so they cannot come out as
+  missing-glyph boxes, and they carry the hover and disabled states of the
+  surface they sit on.
+- **scrolling that follows the pointer** - the wheel scrolls whatever is under
+  the cursor rather than whatever holds focus; the rules table takes the
+  gesture while it has rows left and hands it back to the page at either end.
+  Its columns are redistributed to the width the table actually has, so the
+  last one always ends inside the frame instead of under the scrollbar.
 - **presets** - export and import everything you have set up as
   `presets\<name>.janai.json`, minus machine-specific paths and the pinned
   device; settings are remembered between runs regardless.
