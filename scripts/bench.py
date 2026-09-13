@@ -6,7 +6,7 @@ per-file time, so a tile-planner change can be judged instead of guessed.
 
 Example:
 
-    backend/python/python/python.exe tools/bench.py \\
+    backend/python/python.exe scripts/bench.py \\
         --input C:\\path\\to\\page.jpg \\
         --model 4x-UltraSharpV2.safetensors --scale 4 \\
         --tiles auto,1024,768 --baseline 68897
@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKER = ROOT / "worker" / "worker.py"
+WORKER = ROOT / "src" / "janai" / "worker" / "worker.py"
 
 
 def human_bytes(n: float) -> str:
@@ -86,7 +86,10 @@ def run_once(job: dict, verbose: bool) -> dict:
     try:
         proc = subprocess.run(
             [sys.executable, str(WORKER), "--job", str(job_path)],
-            capture_output=True, text=True, cwd=str(ROOT),
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
         )
         for line in proc.stdout.splitlines():
             line = line.strip()
@@ -126,15 +129,22 @@ def main() -> int:
     p.add_argument("--device", default="")
     p.add_argument("--tiles", default="auto", help="comma list, e.g. auto,1024,768,max")
     p.add_argument("--repeat", type=int, default=1)
-    p.add_argument("--copies", type=int, default=0,
-                   help="duplicate a single input N times into a temp folder, to check "
-                        "that the tile planner keeps its size across a whole chapter")
+    p.add_argument(
+        "--copies",
+        type=int,
+        default=0,
+        help="duplicate a single input N times into a temp folder, to check "
+        "that the tile planner keeps its size across a whole chapter",
+    )
     p.add_argument("--baseline", type=float, default=0.0, help="reference ms to compare against")
     p.add_argument("--warmup", action="store_true", help="discard one run before measuring")
     p.add_argument("--no-fp16", action="store_true")
     p.add_argument("--no-grayscale", action="store_true")
-    p.add_argument("--cudnn", action="store_true",
-                   help="turn cuDNN autotune on (off by default, as in the app)")
+    p.add_argument(
+        "--cudnn",
+        action="store_true",
+        help="turn cuDNN autotune on (off by default, as in the app)",
+    )
     p.add_argument("--keep", action="store_true", help="keep upscaled output")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
@@ -178,9 +188,11 @@ def main() -> int:
                 size = sum(int(f.get("bytes") or 0) for f in files)
                 mp = pixels / 1e6 or 1.0
                 rows.append((label, total_ms, pixels, total_ms / mp, used))
-                print(f"  {total_ms / 1000:.2f}s for {len(files)} file(s), "
-                      f"{mp:.1f} MP out, tile used {used}, {human_bytes(size)}, "
-                      f"device {res['device']} fp16={res['fp16']}")
+                print(
+                    f"  {total_ms / 1000:.2f}s for {len(files)} file(s), "
+                    f"{mp:.1f} MP out, tile used {used}, {human_bytes(size)}, "
+                    f"device {res['device']} fp16={res['fp16']}"
+                )
 
         if not rows:
             print("nothing measured")
@@ -190,16 +202,20 @@ def main() -> int:
         best = min(r[1] for r in rows)
         for label, ms, _pixels, per_mp, used in rows:
             delta = (ms / best - 1) * 100
-            print(f"{label:<12}{ms / 1000:>9.2f}s{per_mp:>10.0f}{used:>14}"
-                  f"{('best' if ms == best else f'+{delta:.1f}%'):>10}")
+            print(
+                f"{label:<12}{ms / 1000:>9.2f}s{per_mp:>10.0f}{used:>14}"
+                f"{('best' if ms == best else f'+{delta:.1f}%'):>10}"
+            )
         if args.baseline:
             per_file = max(1, args.copies) if args.copies else 1
             best_each = best / per_file
             diff = (best_each / args.baseline - 1) * 100
             verdict = "faster" if diff < 0 else "slower"
             each = " per page" if per_file > 1 else ""
-            print(f"\nbest {best_each / 1000:.2f}s{each} vs baseline "
-                  f"{args.baseline / 1000:.2f}s -> {abs(diff):.1f}% {verdict}")
+            print(
+                f"\nbest {best_each / 1000:.2f}s{each} vs baseline "
+                f"{args.baseline / 1000:.2f}s -> {abs(diff):.1f}% {verdict}"
+            )
     finally:
         if pages_dir is not None:
             shutil.rmtree(pages_dir, ignore_errors=True)

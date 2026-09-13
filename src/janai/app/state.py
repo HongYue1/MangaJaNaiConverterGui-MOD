@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 from pathlib import Path
 from typing import Any
 
-from common.formats import all_defaults
+from janai.core.formats import all_defaults
 
 
 def defaults() -> dict[str, Any]:
@@ -45,6 +44,13 @@ def defaults() -> dict[str, Any]:
             # detection is off); model_gray is used for detected gray pages.
             "model": "auto",
             "model_gray": "auto",
+            # Rules-based selection (janai.core.rules). Empty means "not set
+            # up yet": the interface seeds the default working set from the
+            # installed models the first time it runs, so what used to be a
+            # hidden "auto" is visible and editable. The two model choices
+            # above stay as the fallback for pages no rule matches.
+            "rules": [],
+            "rules_enabled": True,
             "auto_levels": True,
             "grayscale_convert": True,
             "grayscale_threshold": 12,
@@ -133,7 +139,7 @@ class Settings:
         self.path = path
         self.data = defaults()
 
-    def load(self) -> "Settings":
+    def load(self) -> Settings:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             self.data = _merge(defaults(), _migrate(raw))
@@ -148,7 +154,7 @@ class Settings:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, self.path)
+            tmp.replace(self.path)
         except Exception:
             pass
 

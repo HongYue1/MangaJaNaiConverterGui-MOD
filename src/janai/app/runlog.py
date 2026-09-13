@@ -12,8 +12,9 @@ log can never drift apart.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 NAME_WIDTH = 32
 TAG_WIDTH = 4
@@ -144,18 +145,20 @@ def format_bundle(ev: dict) -> tuple[str, str]:
 def format_start(ev: dict) -> list[tuple[str, str]]:
     """Header lines for a `start` event."""
     dry = bool(ev.get("dry"))
-    bits = [f"{int(ev.get('total') or 0)} item(s)",
-            str(ev.get("format") or "").upper(),
-            str(ev.get("container") or "files"),
-            str(ev.get("device") or "auto"),
-            "FP16" if ev.get("fp16") else "FP32",
-            f"tile {str(ev.get('tile') or 'auto').lower()}"]
+    bits = [
+        f"{int(ev.get('total') or 0)} item(s)",
+        str(ev.get("format") or "").upper(),
+        str(ev.get("container") or "files"),
+        str(ev.get("device") or "auto"),
+        "FP16" if ev.get("fp16") else "FP32",
+        f"tile {str(ev.get('tile') or 'auto').lower()}",
+    ]
     if ev.get("bundles"):
         bits.append(f"{int(ev['bundles'])} archive(s)")
     head = "dry run" if dry else "run"
     lines = [(f"{head}: " + "  \u00b7  ".join(b for b in bits if b), "info")]
     if ev.get("out_dir"):
-        lines.append((f"    output: {ev['out_dir']}", "info")) 
+        lines.append((f"    output: {ev['out_dir']}", "info"))
     return lines
 
 
@@ -169,8 +172,11 @@ def format_done(ev: dict) -> tuple[str, str]:
     if failed:
         bits.append(f"{failed} failed")
     bits.append(fmt_secs(float(ev.get("elapsed") or 0)))
-    head = "cancelled" if ev.get("cancelled") else ("dry run finished" if ev.get("dry")
-                                                    else "finished")
+    head = (
+        "cancelled"
+        if ev.get("cancelled")
+        else ("dry run finished" if ev.get("dry") else "finished")
+    )
     level = "error" if failed or not ev.get("ok") else ("dry" if ev.get("dry") else "ok")
     if ev.get("cancelled"):
         level = "warn"
@@ -256,9 +262,8 @@ class RunLog:
         if not self.keep:
             return
         try:
-            runs = sorted(self.dir.glob("Run_*.log"), key=lambda p: p.stat().st_mtime,
-                          reverse=True)
-            for old in runs[self.keep:]:
+            runs = sorted(self.dir.glob("Run_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for old in runs[self.keep :]:
                 old.unlink(missing_ok=True)
         except Exception:
             pass

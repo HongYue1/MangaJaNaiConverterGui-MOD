@@ -9,10 +9,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
 
-from common import paths
+from janai import worker as worker_pkg
+from janai.core import paths
 
 
 def no_window_flags() -> int:
@@ -24,7 +25,7 @@ def no_window_flags() -> int:
 def open_in_explorer(path: Path) -> None:
     try:
         if os.name == "nt":
-            os.startfile(str(path))  # noqa: S606
+            os.startfile(str(path))
         elif sys.platform == "darwin":
             subprocess.Popen(["open", str(path)])
         else:
@@ -38,7 +39,7 @@ class Runner:
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.events: "queue.Queue[dict]" = queue.Queue()
+        self.events: queue.Queue[dict] = queue.Queue()
         self.proc: subprocess.Popen | None = None
         self._job_file: Path | None = None
         self._lock = threading.Lock()
@@ -55,10 +56,12 @@ class Runner:
     def python_exe(self) -> Path:
         """The resolved backend interpreter, else the one running the GUI."""
         exe = self.paths().interpreter()
-        return exe if exe else Path(sys.executable)
+        return exe or Path(sys.executable)
 
     def worker_script(self) -> Path:
-        return self.root / "worker" / "worker.py"
+        """The worker module on disk, located through the package rather than a
+        hardcoded folder name, so the layout can move without breaking launch."""
+        return Path(worker_pkg.__file__).resolve().parent / "worker.py"
 
     def has_portable_python(self) -> bool:
         """Whether the environment in backend\\python was found."""
@@ -69,6 +72,11 @@ class Runner:
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # The worker bootstraps its own sys.path, but passing the import root
+        # explicitly also covers being launched from an installed wheel.
+        src = str(Path(worker_pkg.__file__).resolve().parents[2])
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{src}{os.pathsep}{existing}" if existing else src
         return env
 
     # ------------------------------------------------------------------ #
@@ -80,9 +88,16 @@ class Runner:
         cmd = [str(self.python_exe()), str(self.worker_script()), "--probe"]
         try:
             run = subprocess.run(
-                cmd, cwd=str(self.root), env=self._env(), capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                creationflags=no_window_flags(), timeout=600,
+                cmd,
+                check=False,
+                cwd=str(self.root),
+                env=self._env(),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=no_window_flags(),
+                timeout=600,
             )
         except FileNotFoundError as exc:
             self.events.put({"type": "probe_error", "message": f"interpreter not found: {exc}"})
@@ -103,8 +118,12 @@ class Runner:
                 data = obj
         if data is None:
             tail = ((run.stderr or "") + (run.stdout or "")).strip().splitlines()[-6:]
-            self.events.put({"type": "probe_error",
-                             "message": "\n".join(tail) or "worker produced no probe output"})
+            self.events.put(
+                {
+                    "type": "probe_error",
+                    "message": "\n".join(tail) or "worker produced no probe output",
+                }
+            )
             return
         self.events.put(data)
 
@@ -125,19 +144,31 @@ class Runner:
             cmd += ["--device", device]
         try:
             proc = subprocess.Popen(
-                cmd, cwd=str(self.root), env=self._env(),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                cmd,
+                cwd=str(self.root),
+                env=self._env(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
                 creationflags=no_window_flags(),
             )
         except Exception as exc:
-            self.events.put({"type": "hold", "ok": False, "device": device or "auto",
-                             "error": f"could not start: {exc}"})
+            self.events.put(
+                {
+                    "type": "hold",
+                    "ok": False,
+                    "device": device or "auto",
+                    "error": f"could not start: {exc}",
+                }
+            )
             return False
         self.hold = proc
         self.hold_device = device
-        threading.Thread(target=self._read_hold, args=(proc,), name="hold-out",
-                         daemon=True).start()
+        threading.Thread(target=self._read_hold, args=(proc,), name="hold-out", daemon=True).start()
         return True
 
     def _read_hold(self, proc: subprocess.Popen) -> None:
@@ -195,15 +226,31 @@ class Runner:
             cmd = [str(self.python_exe()), str(self.worker_script()), "--job", str(tmp)]
             try:
                 self.proc = subprocess.Popen(
-                    cmd, cwd=str(self.root), env=self._env(),
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding="utf-8", errors="replace", bufsize=1,
+                    cmd,
+                    cwd=str(self.root),
+                    env=self._env(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
                     creationflags=no_window_flags(),
                 )
             except Exception as exc:
-                self.events.put({"type": "done", "ok": False, "processed": 0, "failed": 0,
-                                 "skipped": 0, "cancelled": False, "elapsed": 0,
-                                 "error": f"could not start worker: {exc}"})
+                self.events.put(
+                    {
+                        "type": "done",
+                        "ok": False,
+                        "processed": 0,
+                        "failed": 0,
+                        "skipped": 0,
+                        "cancelled": False,
+                        "elapsed": 0,
+                        "error": f"could not start worker: {exc}",
+                    }
+                )
                 return False
             self.paused = False
         threading.Thread(target=self._read_stdout, name="worker-out", daemon=True).start()

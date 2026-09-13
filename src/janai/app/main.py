@@ -1,7 +1,7 @@
 """JaNai Upscaler - GUI entry point.
 
 Run via JaNaiUpscaler.cmd, or directly:
-    backend\\python\\Scripts\\pythonw.exe app\\main.py
+    backend\\python\\Scripts\\pythonw.exe -m janai
 
 The GUI imports nothing heavier than the Python standard library; torch and
 friends only ever live inside the worker process.
@@ -17,9 +17,14 @@ import sys
 import traceback
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+_HERE = Path(__file__).resolve()
+SRC = _HERE.parents[2]  # <app folder>/src, the import root
+ROOT = _HERE.parents[3]  # the app folder itself
+
+# Running this file directly puts src/janai/app on sys.path, not src, so the
+# package would not be importable. Fix that before importing anything of ours.
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 
 def enable_dpi_awareness() -> None:
@@ -32,10 +37,10 @@ def enable_dpi_awareness() -> None:
         return
     try:
         user32 = ctypes.windll.user32
-        if hasattr(user32, "SetProcessDpiAwarenessContext"):
-            # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-            if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
-                return
+        set_ctx = getattr(user32, "SetProcessDpiAwarenessContext", None)
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        if set_ctx and set_ctx(ctypes.c_void_p(-4)):
+            return
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
         return
     except Exception:
@@ -73,7 +78,7 @@ def main() -> int:
         return 2
 
     try:
-        from app.ui import App
+        from janai.app.ui import App
     except Exception:
         fatal("Could not load the interface:\n\n" + traceback.format_exc())
         return 2

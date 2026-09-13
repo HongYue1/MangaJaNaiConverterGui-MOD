@@ -1,0 +1,140 @@
+# JaNai Upscaler - project metadata, packaging and tooling.
+#
+# Layout:
+#   src/janai/app      the Tk interface (standard library only)
+#   src/janai/core     code shared by both processes
+#   src/janai/worker   the out-of-process upscaling pipeline
+#   scripts/           developer tools (smoke, selftest, bench)
+#   backend/           vendored chaiNNer-derived backend + per-machine runtime
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "janai-upscaler"
+version = "1.0.0"
+description = "Manga and illustration upscaler built on the MangaJaNai models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+keywords = ["upscaling", "manga", "esrgan", "spandrel", "jpeg-xl"]
+classifiers = [
+  "Environment :: Win32 (MS Windows)",
+  "Environment :: X11 Applications",
+  "Intended Audience :: End Users/Desktop",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+]
+# The upscaling dependencies are pinned in requirements.txt because torch has
+# to be resolved against a GPU-specific index; setup.ps1 / setup.sh install
+# them into backend/python. The interface itself needs nothing but Tkinter.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["ruff>=0.6"]
+
+[project.scripts]
+janai-upscaler = "janai.app.main:main"
+janai-worker = "janai.worker.worker:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# --------------------------------------------------------------------------- #
+# Ruff: one tool for both formatting and linting.
+#
+#   ruff format .        rewrite
+#   ruff check .         lint
+#   ruff check --fix .   lint and fix what is safely fixable
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+line-length = 100
+indent-width = 4
+target-version = "py311"
+src = ["src", "scripts"]
+
+# backend/ is vendored upstream code plus the per-machine runtime and weights.
+# Linting it would mean carrying a diff against upstream forever, so it is left
+# exactly as it ships.
+extend-exclude = [
+  "backend",
+  "logs",
+  ".tmp",
+]
+
+[tool.ruff.lint]
+# Chosen for correctness and runtime cost rather than style purity:
+#   E,W,F   pycodestyle + pyflakes, the baseline
+#   I       import order, so a merge never reshuffles imports
+#   N       consistent naming
+#   UP      modern syntax for the Python we actually target
+#   B       bugbear: mutable defaults, shadowed loop vars, silent bugs
+#   A       no shadowing of builtins
+#   C4      comprehensions instead of list()/dict() round trips
+#   PERF    the performance rules: this is an image pipeline
+#   FURB    modern, cheaper stdlib idioms
+#   RUF     Ruff's own checks, incl. implicit string concatenation in lists
+#   SIM     simplification, catches redundant branching in hot paths
+#   RET     explicit returns, fewer accidental None paths
+#   PIE     dead code and no-op statements
+#   PTH     pathlib over os.path
+#   LOG,G   logging called correctly and lazily
+#   ISC     no accidentally concatenated string literals
+#   TID     no relative-import spaghetti between the three packages
+#   NPY     numpy-specific correctness (the worker is numpy-heavy)
+#   PLC,PLE,PLW  the useful half of pylint
+#   PGH     no blanket type-ignore / noqa
+#   EXE,INT,Q,COM  shebangs, gettext, quote and comma hygiene
+select = [
+  "E", "W", "F", "I", "N", "UP", "B", "A", "C4", "PERF", "FURB", "RUF",
+  "SIM", "RET", "PIE", "PTH", "LOG", "G", "ISC", "TID", "NPY",
+  "PLC", "PLE", "PLW", "PGH", "EXE", "INT", "Q",
+]
+ignore = [
+  # The worker imports torch, numpy and pyvips inside functions on purpose:
+  # a dry run and the --probe path must never pay for them.
+  "PLC0415",
+  # The GUI and the worker both catch broad exceptions deliberately: a failed
+  # page must not kill a 200-page chapter, and a Tk callback must not take the
+  # window down. Those sites are individually intentional.
+  "BLE001",
+  # Re-binding a loop variable while normalising a line/path is idiomatic here.
+  "PLW2901",
+  # Too many/few arguments: the pipeline functions take what they need.
+  "PLR0913",
+  # `datetime.now()` without a timezone is correct for local log timestamps.
+  "DTZ005",
+  # The worker keeps its cancel flag, model cache and tile planner in module
+  # state on purpose: a job is one process, driven from one thread.
+  "PLW0603",
+  # `try/except pass` is kept over `contextlib.suppress`: the context manager
+  # costs a call and a frame, and some of these sit on the per-tile path.
+  "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The worker resolves sys.path before it can import anything of its own, so its
+# imports legitimately follow executable statements.
+# `Cancelled` is control flow rather than an error, so it keeps its name.
+"src/janai/worker/worker.py" = ["E402", "N818"]
+# Same for the dev scripts, which run straight from a checkout.
+"scripts/*.py" = ["E402", "T201"]
+# ctypes aliases are types, so they are spelled like types.
+"src/janai/app/dnd.py" = ["N806"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["janai"]
+combine-as-imports = true
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+docstring-code-format = true

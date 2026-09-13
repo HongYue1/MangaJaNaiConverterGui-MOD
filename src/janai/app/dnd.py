@@ -9,8 +9,8 @@ from __future__ import annotations
 import ctypes
 import sys
 import tkinter as tk
+from collections.abc import Callable
 from ctypes import wintypes
-from typing import Callable, List
 
 WM_DROPFILES = 0x0233
 GWLP_WNDPROC = -4
@@ -18,7 +18,7 @@ GWLP_WNDPROC = -4
 _keep_alive: list = []
 
 
-def enable(root: tk.Misc, on_drop: Callable[[List[str]], None]) -> bool:
+def enable(root: tk.Misc, on_drop: Callable[[list[str]], None]) -> bool:
     if not sys.platform.startswith("win"):
         return False
     try:
@@ -31,12 +31,18 @@ def enable(root: tk.Misc, on_drop: Callable[[List[str]], None]) -> bool:
             hwnd = root.winfo_id()
 
         LRESULT = ctypes.c_ssize_t
-        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
-                                     ctypes.c_size_t, ctypes.c_ssize_t)
+        WNDPROC = ctypes.WINFUNCTYPE(
+            LRESULT, wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t
+        )
 
         user32.CallWindowProcW.restype = LRESULT
-        user32.CallWindowProcW.argtypes = [WNDPROC, wintypes.HWND, wintypes.UINT,
-                                           ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.CallWindowProcW.argtypes = [
+            WNDPROC,
+            wintypes.HWND,
+            wintypes.UINT,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        ]
         if ctypes.sizeof(ctypes.c_void_p) == 8:
             set_long = user32.SetWindowLongPtrW
             set_long.restype = LRESULT
@@ -46,8 +52,12 @@ def enable(root: tk.Misc, on_drop: Callable[[List[str]], None]) -> bool:
             set_long.restype = LRESULT
             set_long.argtypes = [wintypes.HWND, ctypes.c_int, WNDPROC]
 
-        shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT,
-                                          wintypes.LPWSTR, wintypes.UINT]
+        shell32.DragQueryFileW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.UINT,
+            wintypes.LPWSTR,
+            wintypes.UINT,
+        ]
         shell32.DragQueryFileW.restype = wintypes.UINT
         shell32.DragFinish.argtypes = [wintypes.HANDLE]
         shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
@@ -59,11 +69,14 @@ def enable(root: tk.Misc, on_drop: Callable[[List[str]], None]) -> bool:
                 try:
                     hdrop = wintypes.HANDLE(wparam)
                     count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
-                    paths: list[str] = []
                     buf = ctypes.create_unicode_buffer(32768)
-                    for i in range(count):
-                        if shell32.DragQueryFileW(hdrop, i, buf, len(buf)):
-                            paths.append(buf.value)
+                    # The query fills `buf` and returns its length, so the
+                    # condition has to run before the value is read.
+                    paths: list[str] = [
+                        buf.value
+                        for i in range(count)
+                        if shell32.DragQueryFileW(hdrop, i, buf, len(buf))
+                    ]
                     shell32.DragFinish(hdrop)
                     if paths:
                         root.after(0, lambda p=paths: on_drop(p))

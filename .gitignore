@@ -14,8 +14,8 @@ backend/_cache/
 backend/ImageMagick/*
 !backend/ImageMagick/*.icc
 
-# JPEG XL helpers (cjxl/djxl) are downloaded by setup.
-tools/*.exe
+# JPEG XL helpers (cjxl/djxl) are downloaded by setup, per platform.
+backend/tools/
 
 # ---------------------------------------------------------------------------
 # Per-machine state written by the app
@@ -24,6 +24,9 @@ janai.config.json
 janai.runtime.txt
 settings.json
 settings.json.tmp
+
+# Presets are the user's own; the folder is created on demand.
+presets/
 logs/
 *.log
 .tmp/

@@ -22,7 +22,7 @@
       backend\src           upscaling backend, part of this repository
       backend\ImageMagick   ICC profiles, part of this repository
       backend\_cache        uv cache and downloads - safe to delete
-      tools\                uv.exe, cjxl.exe, djxl.exe
+      backend\tools         uv.exe, cjxl.exe, djxl.exe
       janai.config.json     what was resolved, and how
       janai.runtime.txt     interpreter path, for the launcher
 
@@ -81,9 +81,9 @@ $Backend = Join-Path $Here 'backend'
 $PyRoot = Join-Path $Backend 'python'
 $ModelsDir = Join-Path $Backend 'models'
 $Cache = Join-Path $Backend '_cache'
-$ToolsDir = Join-Path $Here 'tools'
-$Worker = Join-Path $Here 'worker\worker.py'
-$Resolver = Join-Path $Here 'common\paths.py'
+$ToolsDir = Join-Path $Backend 'tools'
+$Worker = Join-Path $Here 'src\janai\worker\worker.py'
+$Resolver = Join-Path $Here 'src\janai\core\paths.py'
 $Requirements = Join-Path $Here 'requirements.txt'
 $ConfigFile = Join-Path $Here 'janai.config.json'
 $RuntimeFile = Join-Path $Here 'janai.runtime.txt'

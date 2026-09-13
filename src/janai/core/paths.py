@@ -6,7 +6,7 @@ Everything the app needs lives in this one folder:
     backend/models        the model weights
     backend/src           the chaiNNer-derived upscaling backend
     backend/ImageMagick   the ICC profiles used by the dot-gain resize
-    tools/                cjxl, djxl, uv
+    backend/tools         cjxl, djxl, uv
 
 The runtime and the weights are installed here by setup and are not tracked by
 git, so every clone starts clean; nothing is ever borrowed from another
@@ -21,8 +21,8 @@ Each location is resolved at run time, in this order:
 Standard library only: the GUI imports this module, and the GUI never imports
 torch. For a report of what this copy of the app resolves to::
 
-    python common/paths.py
-    python common/paths.py --json
+    python -m janai.core.paths
+    python -m janai.core.paths --json
 """
 
 from __future__ import annotations
@@ -30,9 +30,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
 
 CONFIG_NAME = "janai.config.json"
 MODEL_EXTS = {".pth", ".safetensors", ".pt", ".ckpt"}
@@ -51,9 +51,22 @@ LOCATIONS = (
 )
 
 
+def code_root() -> Path:
+    """The import root: the folder holding the ``janai`` package."""
+    return Path(__file__).resolve().parents[2]
+
+
 def app_root() -> Path:
-    """The portable folder: the one holding app/, worker/ and common/."""
-    return Path(__file__).resolve().parent.parent
+    """The portable folder: the one holding src/, backend/ and the launchers.
+
+    Found by walking up from this module until a folder looks like the app, so
+    the tree can be moved, vendored or pip-installed without this breaking.
+    """
+    here = Path(__file__).resolve()
+    for cand in here.parents:
+        if (cand / "backend").is_dir() or (cand / "pyproject.toml").is_file():
+            return cand
+    return here.parents[3] if len(here.parents) > 3 else here.parent
 
 
 def config_file(root: Path | None = None) -> Path:
@@ -171,7 +184,7 @@ class Paths:
 
     def import_paths(self) -> list[Path]:
         """Directories the worker adds to sys.path, in priority order."""
-        return _unique([self.root, self.extras_dir, self.src_dir])
+        return _unique([code_root(), self.root, self.extras_dir, self.src_dir])
 
     def icc(self, name: str = ICC_MARKER) -> Path | None:
         if self.icc_dir:
@@ -227,7 +240,7 @@ def resolve(root: Path | None = None) -> Paths:
                     break
             except OSError:
                 continue
-        chosen = best if best else (None if strict else first)
+        chosen = best or (None if strict else first)
         if chosen:
             setattr(paths, name, chosen[1])
             paths.origins[name] = chosen[0]
@@ -253,7 +266,9 @@ def resolve(root: Path | None = None) -> Paths:
     )
     pick("resources_dir", [("app", backend / "resources")])
     pick("extras_dir", [("app", backend / "extras")])
-    pick("tools_dir", [("app", root / "tools"), ("app", backend / "tools")])
+    # backend/tools is where setup puts cjxl/djxl/uv; the old top-level tools/
+    # is still accepted so an existing install keeps working.
+    pick("tools_dir", [("app", backend / "tools"), ("app", root / "tools")])
     return paths
 
 
@@ -263,7 +278,7 @@ def report(paths: Paths | None = None) -> str:
     exe = p.interpreter()
     lines = [
         f"{'root':<15} {p.root}",
-        f"{'interpreter':<15} {exe if exe else '(not found)'}",
+        f"{'interpreter':<15} {exe or '(not found)'}",
     ]
     for name in LOCATIONS:
         value = getattr(p, name)

@@ -50,15 +50,18 @@ from typing import Any
 from zipfile import ZIP_STORED, ZipFile
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+SRC = HERE.parents[1]  # <app folder>/src, the import root
+ROOT = SRC.parent  # the app folder itself
 
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# Run as a script, sys.path[0] is this directory, so the package itself would
+# not be importable. Put the import root in front before anything of ours.
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
-from common import paths as _paths  # noqa: E402
+from janai.core import paths as _paths, rules as _rules
 
 # The runtime, the models, the backend source and the ICC profiles all live in
-# backend/, unless janai.config.json points somewhere else. common/paths.py
+# backend/, unless janai.config.json points somewhere else. janai.core.paths
 # works that out once, here.
 PATHS = _paths.resolve(ROOT)
 MODELS_DIR = PATHS.models_dir or (ROOT / "backend" / "models")
@@ -71,7 +74,7 @@ for _p in reversed(PATHS.import_paths()):
 if PATHS.tools_dir:
     os.environ["PATH"] = f"{PATHS.tools_dir}{os.pathsep}{os.environ.get('PATH', '')}"
 
-from common.formats import (  # noqa: E402
+from janai.core.formats import (
     CONTAINERS,
     FORMATS,
     merged,
@@ -80,8 +83,21 @@ from common.formats import (  # noqa: E402
 )
 
 IMAGE_EXTS = {
-    ".png", ".jpg", ".jpeg", ".jfif", ".webp", ".avif", ".jxl", ".bmp",
-    ".tif", ".tiff", ".gif", ".heic", ".heif", ".ppm", ".pgm",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".jfif",
+    ".webp",
+    ".avif",
+    ".jxl",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".ppm",
+    ".pgm",
 }
 ARCHIVE_EXTS = {".zip", ".cbz", ".rar", ".cbr"}
 MODEL_EXTS = {".pth", ".safetensors", ".pt", ".ckpt"}
@@ -264,10 +280,10 @@ def load_imaging(perf: dict | None = None) -> None:
         apply_perf_env(perf)
     install_warning_filters()
 
-    import numpy  # noqa: PLC0415
-    import cv2 as cv2_mod  # noqa: PLC0415
-    import pyvips as pyvips_mod  # noqa: PLC0415
-    from PIL import Image as PILImage, ImageCms, ImageFilter  # noqa: PLC0415
+    import cv2 as cv2_mod
+    import numpy
+    import pyvips as pyvips_mod
+    from PIL import Image as PILImage, ImageCms, ImageFilter
 
     np = numpy
     cv2 = cv2_mod
@@ -283,24 +299,23 @@ def load_backend(perf: dict | None = None) -> None:
     if _heavy_loaded:
         return
 
-    import torch as torch_mod  # noqa: PLC0415
-    from chainner_ext import ResizeFilter, resize as cx_resize  # noqa: PLC0415
-
-    import spandrel_custom  # noqa: PLC0415
-    from api import NodeContext, SettingsParser  # noqa: PLC0415
-    from nodes.impl.image_utils import normalize, to_uint8  # noqa: PLC0415
-    from nodes.impl.upscale.auto_split_tiles import (  # noqa: PLC0415
+    import spandrel_custom
+    import torch as torch_mod
+    from api import NodeContext, SettingsParser
+    from chainner_ext import ResizeFilter, resize as cx_resize
+    from nodes.impl.image_utils import normalize, to_uint8
+    from nodes.impl.upscale.auto_split_tiles import (
         ESTIMATE,
         MAX_TILE_SIZE,
         NO_TILING,
         TileSize,
     )
-    from nodes.utils.utils import get_h_w_c  # noqa: PLC0415
-    from packages.chaiNNer_pytorch.pytorch.io.load_model import load_model_node  # noqa: PLC0415
-    from packages.chaiNNer_pytorch.pytorch.processing.upscale_image import (  # noqa: PLC0415
+    from nodes.utils.utils import get_h_w_c
+    from packages.chaiNNer_pytorch.pytorch.io.load_model import load_model_node
+    from packages.chaiNNer_pytorch.pytorch.processing.upscale_image import (
         upscale_image_node,
     )
-    from progress_controller import ProgressController  # noqa: PLC0415
+    from progress_controller import ProgressController
 
     installer = getattr(spandrel_custom, "install", None)
     if callable(installer):
@@ -349,7 +364,6 @@ def apply_torch_perf(perf: dict) -> None:
 # node context (copied from the original backend, minus the chain executor)
 # --------------------------------------------------------------------------- #
 def make_context(perf: dict):
-    from typing import Callable, Literal  # noqa: PLC0415
 
     class ExecutorNodeContext(_NodeContext):
         def __init__(self, progress, settings, storage_dir: Path) -> None:
@@ -496,18 +510,19 @@ class TilePlanner:
 
     ALIGN = 32
     MIN_TILE = 128
-    OVERLAP = 16          # auto_split's default padding per tile edge
-    HEADROOM = 256 * 1024 ** 2
+    OVERLAP = 16  # auto_split's default padding per tile edge
+    HEADROOM = 256 * 1024**2
     SAFETY = 0.85
-    MARGIN = 1.10         # applied to a measured cost before reusing it
+    MARGIN = 1.10  # applied to a measured cost before reusing it
 
-    def __init__(self, mode: str, fixed: int, device: str, fp16: bool,
-                 budget_limit_gib: int = 0) -> None:
+    def __init__(
+        self, mode: str, fixed: int, device: str, fp16: bool, budget_limit_gib: int = 0
+    ) -> None:
         self.mode = mode
         self.fixed = int(fixed or 0)
         self.device = str(device or "")
         self.fp16 = bool(fp16)
-        self.budget_limit = max(0, int(budget_limit_gib or 0)) * 1024 ** 3
+        self.budget_limit = max(0, int(budget_limit_gib or 0)) * 1024**3
         self.elem = 2 if fp16 else 4
         self.last = 0
         self._model_bytes: dict[int, int] = {}
@@ -539,7 +554,7 @@ class TilePlanner:
             except Exception:
                 return 0
         try:
-            import psutil  # noqa: PLC0415
+            import psutil
 
             return int(psutil.virtual_memory().available)
         except Exception:
@@ -643,8 +658,9 @@ class TilePlanner:
             tile = min(tile, cap)
         return self._arm(key, model, w, h, c, tile, budget, free)
 
-    def _arm(self, key: int, model: Any, w: int, h: int, c: int, tile: int,
-             budget: int, free: int) -> Any:
+    def _arm(
+        self, key: int, model: Any, w: int, h: int, c: int, tile: int, budget: int, free: int
+    ) -> Any:
         """Note what is about to be attempted, then hand the tile over."""
         # one tile that covers the page is the fastest case there is
         tile = max(self.MIN_TILE, min(tile, self._align(max(w, h) + self.ALIGN)))
@@ -656,9 +672,8 @@ class TilePlanner:
             model_scale = max(1, int(getattr(model, "scale", 1) or 1))
         except Exception:
             model_scale = 1
-        page_bytes = int(w * h * max(1, c) * self.elem * (1 + model_scale ** 2))
-        self._pending = (key, self._tile_pixels(w, h, tile, c), tile, budget,
-                         page_bytes, free)
+        page_bytes = int(w * h * max(1, c) * self.elem * (1 + model_scale**2))
+        self._pending = (key, self._tile_pixels(w, h, tile, c), tile, budget, page_bytes, free)
         return TILE["cls"](tile)
 
     # -- measurement ------------------------------------------------------- #
@@ -692,7 +707,7 @@ class TilePlanner:
         previous = self._per_px.get(key)
         self._per_px[key] = measured if previous is None else max(previous, measured)
         if previous is None:
-            log(f"tile cost calibrated at {tile}px, peak {peak // 1024 ** 2} MiB", "debug")
+            log(f"tile cost calibrated at {tile}px, peak {peak // 1024**2} MiB", "debug")
         # this tile finished, so it is the one to repeat when the driver stops
         # reporting usable free memory on later pages
         self._good[key] = max(self._good.get(key, 0), tile)
@@ -730,7 +745,6 @@ class TilePlanner:
             log(f"tile capped at {capped}px after {why}", "debug")
 
 
-
 # --------------------------------------------------------------------------- #
 # device + capability probe
 # --------------------------------------------------------------------------- #
@@ -739,32 +753,48 @@ def device_objects() -> list[dict]:
     load_backend()
     out: list[dict] = []
     try:
-        from accelerator_detection import get_accelerator_detector  # noqa: PLC0415
+        from accelerator_detection import get_accelerator_detector
 
-        for d in get_accelerator_detector().available_devices:
-            out.append(
-                {
-                    "value": d.device_string,
-                    "label": ("CPU" if d.type.value == "cpu" else f"{d.name} ({d.device_string})"),
-                    "kind": d.type.value,
-                    "index": d.index,
-                    "fp16": bool(d.supports_fp16),
-                    "bf16": bool(d.supports_bf16),
-                    "vram": int(d.memory_total or 0),
-                }
-            )
+        out.extend(
+            {
+                "value": d.device_string,
+                "label": ("CPU" if d.type.value == "cpu" else f"{d.name} ({d.device_string})"),
+                "kind": d.type.value,
+                "index": d.index,
+                "fp16": bool(d.supports_fp16),
+                "bf16": bool(d.supports_bf16),
+                "vram": int(d.memory_total or 0),
+            }
+            for d in get_accelerator_detector().available_devices
+        )
     except Exception as exc:
         log(f"accelerator detection failed ({exc}); using torch directly", "warn")
-        out.append({"value": "cpu", "label": "CPU", "kind": "cpu", "index": 0,
-                    "fp16": False, "bf16": True, "vram": 0})
+        out.append(
+            {
+                "value": "cpu",
+                "label": "CPU",
+                "kind": "cpu",
+                "index": 0,
+                "fp16": False,
+                "bf16": True,
+                "vram": 0,
+            }
+        )
         try:
             if torch.cuda.is_available():
                 for i in range(torch.cuda.device_count()):
                     props = torch.cuda.get_device_properties(i)
-                    out.append({"value": f"cuda:{i}", "label": f"{props.name} (cuda:{i})",
-                                "kind": "cuda", "index": i, "fp16": True,
-                                "bf16": getattr(props, "major", 0) >= 8,
-                                "vram": int(props.total_memory)})
+                    out.append(
+                        {
+                            "value": f"cuda:{i}",
+                            "label": f"{props.name} (cuda:{i})",
+                            "kind": "cuda",
+                            "index": i,
+                            "fp16": True,
+                            "bf16": getattr(props, "major", 0) >= 8,
+                            "vram": int(props.total_memory),
+                        }
+                    )
         except Exception:
             pass
     return out
@@ -796,7 +826,7 @@ def find_djxl() -> str:
 
 def pillow_jxl_available() -> bool:
     try:
-        import pillow_jxl  # noqa: F401, PLC0415
+        import pillow_jxl  # noqa: F401
 
         return True
     except Exception:
@@ -829,11 +859,11 @@ def encode_capabilities() -> dict:
 def list_models(models_dir: Path) -> list[dict]:
     if not models_dir.is_dir():
         return []
-    out = []
-    for p in sorted(models_dir.rglob("*")):
-        if p.is_file() and p.suffix.lower() in MODEL_EXTS:
-            out.append(model_info(p))
-    return out
+    return [
+        model_info(p)
+        for p in sorted(models_dir.rglob("*"))
+        if p.is_file() and p.suffix.lower() in MODEL_EXTS
+    ]
 
 
 def model_info(p: Path) -> dict:
@@ -905,9 +935,11 @@ def do_probe(models_dir: Path) -> int:
     info["icc"] = PATHS.icc() is not None
     info["tools"] = {name: find_tool(name) for name in ("cjxl", "djxl")}
     try:
-        import rarfile  # noqa: PLC0415
+        import rarfile
 
-        info["rar"] = bool(rarfile.tool_setup(sevenzip=True, sevenzip2=True, unrar=True, bsdtar=True))
+        info["rar"] = bool(
+            rarfile.tool_setup(sevenzip=True, sevenzip2=True, unrar=True, bsdtar=True)
+        )
     except Exception:
         info["rar"] = False
     info["cpu_count"] = os.cpu_count() or 1
@@ -949,11 +981,7 @@ def read_image_bytes(data: bytes, name: str = ""):
             src = Path(td) / "in.jxl"
             src.write_bytes(data)
             return read_jxl_djxl(src)
-    return (
-        pyvips.Image.new_from_buffer(data, "", access="sequential")
-        .icc_transform("srgb")
-        .numpy()
-    )
+    return pyvips.Image.new_from_buffer(data, "", access="sequential").icc_transform("srgb").numpy()
 
 
 def read_jxl_djxl(path: Path):
@@ -967,7 +995,7 @@ def read_jxl_djxl(path: Path):
     with tempfile.TemporaryDirectory(prefix="janai-jxl-") as td:
         dst = Path(td) / "decoded.png"
         run = subprocess.run(
-            [exe, str(path), str(dst)], capture_output=True, creationflags=no_window()
+            [exe, str(path), str(dst)], check=False, capture_output=True, creationflags=no_window()
         )
         if run.returncode != 0 or not dst.exists():
             raise RuntimeError(f"djxl failed: {run.stderr.decode('utf-8', 'replace')[:300]}")
@@ -1038,8 +1066,7 @@ def image_resize(image, new_size: tuple[int, int], is_gray: bool):
 GRAY_SAMPLE = 768  # long edge of the copy the grayscale test looks at
 
 
-def gray_stats(image, threshold: float,
-               colour_percent: float = 0.25) -> tuple[bool, float, float]:
+def gray_stats(image, threshold: float, colour_percent: float = 0.25) -> tuple[bool, float, float]:
     """(is_grayscale, mean colour excess, percent of clearly coloured pixels).
 
     Three things were wrong with the inherited test:
@@ -1067,14 +1094,17 @@ def gray_stats(image, threshold: float,
     long_edge = max(h, w)
     if long_edge > GRAY_SAMPLE:
         factor = GRAY_SAMPLE / float(long_edge)
-        sample = cv2.resize(sample, (max(1, int(w * factor)), max(1, int(h * factor))),
-                            interpolation=cv2.INTER_AREA)
+        sample = cv2.resize(
+            sample, (max(1, int(w * factor)), max(1, int(h * factor))), interpolation=cv2.INTER_AREA
+        )
 
     b, g, r = cv2.split(sample)
     t = int(max(0, min(255, round(threshold))))
-    excess = (cv2.subtract(cv2.absdiff(r, g), t).astype(np.int32)
-              + cv2.subtract(cv2.absdiff(r, b), t).astype(np.int32)
-              + cv2.subtract(cv2.absdiff(g, b), t).astype(np.int32))
+    excess = (
+        cv2.subtract(cv2.absdiff(r, g), t).astype(np.int32)
+        + cv2.subtract(cv2.absdiff(r, b), t).astype(np.int32)
+        + cv2.subtract(cv2.absdiff(g, b), t).astype(np.int32)
+    )
     high = cv2.max(cv2.max(r, g), b)
     low = cv2.min(cv2.min(r, g), b)
     keep = ~np.logical_or(high == 0, low == 255)  # skip pure black / pure white
@@ -1187,35 +1217,25 @@ class ModelCache:
             got = loaded[0] if isinstance(loaded, tuple) else loaded
             self._cache[path] = got
             scale = getattr(got, "scale", None)
-            log(f"loaded model {Path(path).name} (x{scale if scale else '?'})")
+            log(f"loaded model {Path(path).name} (x{scale or '?'})")
             # Read off the weights rather than the filename: this is the
             # authoritative version of the warning the GUI shows from the name.
             if scale and self.want_scale > 0 and abs(float(scale) - self.want_scale) > 0.01:
-                log(f"{Path(path).name} is x{scale} but the target is "
+                log(
+                    f"{Path(path).name} is x{scale} but the target is "
                     f"{self.want_scale:g}x, so every page gets resampled to the "
-                    f"target and loses detail", "warn")
+                    f"target and loses detail",
+                    "warn",
+                )
         return got
 
 
-# Upstream's default workflow shipped one MangaJaNai chain per page-height
-# band, in 2x and 4x flavours. These are those bands, copied from the original
-# default_cli_configuration.json (MaxResolution "0x1250", "0x1350", ...), as
-# (inclusive height limit, model bucket) pairs.
-GRAY_HEIGHT_BANDS: tuple[tuple[int, int], ...] = (
-    (1250, 1200),
-    (1350, 1300),
-    (1450, 1400),
-    (1550, 1500),
-    (1760, 1600),
-    (1984, 1920),
-)
-GRAY_TOP_BUCKET = 2048  # anything taller than the last band
-
-# What "auto" means for colour pages, per target scale.
-COLOUR_DEFAULTS = {
-    2: "2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16.safetensors",
-    4: "4x_IllustrationJaNai_V3denoise_FDAT_M_47k_fp16.safetensors",
-}
+# Upstream's height bands and the colour defaults live with the rules engine,
+# so the shipped default working set and this fallback picker can never drift
+# apart. See janai/core/rules.py.
+GRAY_HEIGHT_BANDS = _rules.GRAY_HEIGHT_BANDS
+GRAY_TOP_BUCKET = _rules.GRAY_TOP_BUCKET
+COLOUR_DEFAULTS = _rules.COLOUR_DEFAULTS
 
 _auto_pick_logged: set[tuple] = set()
 
@@ -1248,10 +1268,13 @@ def choose_model(models: list[dict], is_gray: bool, src_h: int, target_scale: fl
         tagged = [m for m in scaled if m["height"]]
         if tagged:
             pick = min(tagged, key=lambda m: (abs(m["height"] - bucket), m["height"], m["name"]))
-            why = (f"{bucket}p band for a {src_h}px page" if pick["height"] == bucket
-                   else f"{bucket}p band for a {src_h}px page, nearest installed")
+            why = (
+                f"{bucket}p band for a {src_h}px page"
+                if pick["height"] == bucket
+                else f"{bucket}p band for a {src_h}px page, nearest installed"
+            )
         else:
-            pick = sorted(scaled, key=lambda m: m["name"])[0]
+            pick = min(scaled, key=lambda m: m["name"])
             why = "no height-tagged MangaJaNai model installed"
     else:
         wanted = COLOUR_DEFAULTS.get(want_scale, "")
@@ -1260,9 +1283,8 @@ def choose_model(models: list[dict], is_gray: bool, src_h: int, target_scale: fl
             why = f"default x{want_scale} colour model"
         else:
             denoise = [m for m in scaled if m["denoise"]]
-            pick = sorted(denoise or scaled, key=lambda m: m["name"])[0]
-            why = (f"{wanted} not installed, closest match" if wanted
-                   else "closest installed match")
+            pick = min(denoise or scaled, key=lambda m: m["name"])
+            why = f"{wanted} not installed, closest match" if wanted else "closest installed match"
 
     key = (is_gray, want_scale, pick["name"], why)
     if key not in _auto_pick_logged:
@@ -1299,13 +1321,15 @@ def encode(image, fid: str, opts: dict, caps: dict) -> bytes:
 def encode_vips(image, fid: str, opts: dict) -> bytes:
     spec = FORMATS[fid]
     img = vips_from_array(image)
-    if img.bands == 4 and fid in ("jpeg",):
+    if img.bands == 4 and fid == "jpeg":
         img = img.flatten(background=255)
     kwargs = save_kwargs(fid, opts)
     try:
         return img.write_to_buffer(spec.suffix, **kwargs)
     except Exception as exc:
-        keep = {k: v for k, v in kwargs.items() if k in ("Q", "lossless", "compression", "distance")}
+        keep = {
+            k: v for k, v in kwargs.items() if k in ("Q", "lossless", "compression", "distance")
+        }
         log(f"{spec.label}: {exc}; retrying with {keep or 'defaults'}", "warn")
         return img.write_to_buffer(spec.suffix, **keep)
 
@@ -1319,7 +1343,7 @@ def _pil_image(image):
 
 
 def encode_jxl_pillow(image, opts: dict) -> bytes:
-    import pillow_jxl  # noqa: F401, PLC0415
+    import pillow_jxl  # noqa: F401
 
     vals = merged("jxl", opts)
     kwargs: dict[str, Any] = {"effort": int(vals["effort"])}
@@ -1350,7 +1374,7 @@ def encode_jxl_cjxl(image, opts: dict) -> bytes:
             cmd += ["-d", str(float(vals["distance"]))]
         else:
             cmd += ["-q", str(int(vals["Q"]))]
-        run = subprocess.run(cmd, capture_output=True, creationflags=no_window())
+        run = subprocess.run(cmd, check=False, capture_output=True, creationflags=no_window())
         if run.returncode != 0 or not dst.exists():
             raise RuntimeError(f"cjxl failed: {run.stderr.decode('utf-8', 'replace')[:300]}")
         return dst.read_bytes()
@@ -1385,7 +1409,10 @@ def gather_units(inp: dict) -> list[dict]:
         add(raw, raw.parent)
     elif raw.is_dir():
         it = raw.rglob("*") if recursive else raw.glob("*")
-        for p in sorted((q for q in it if q.is_file()), key=lambda q: (str(q.parent).lower(), natural_key(q.name))):
+        for p in sorted(
+            (q for q in it if q.is_file()),
+            key=lambda q: (str(q.parent).lower(), natural_key(q.name)),
+        ):
             add(p, raw)
     else:
         raise FileNotFoundError(f"input not found: {raw}")
@@ -1408,8 +1435,9 @@ def format_name(pattern: str, src: Path, index: int, total: int) -> str:
     return re.sub(r'[<>:"/\\|?*]', "_", out).strip() or src.stem
 
 
-def resolve_out(unit: dict, out_dir: Path, pattern: str, ext: str, keep_structure: bool,
-                index: int, total: int) -> Path:
+def resolve_out(
+    unit: dict, out_dir: Path, pattern: str, ext: str, keep_structure: bool, index: int, total: int
+) -> Path:
     src: Path = unit["path"]
     base: Path = unit["base"]
     sub = Path()
@@ -1546,8 +1574,9 @@ def chapter_dest(unit: dict, out_dir: Path, keep_structure: bool) -> Path:
     return parent / f"{safe_name(name)}.cbz"
 
 
-def build_tasks(units: list[dict], out_dir: Path, keep_structure: bool,
-                container_id: str) -> list[dict]:
+def build_tasks(
+    units: list[dict], out_dir: Path, keep_structure: bool, container_id: str
+) -> list[dict]:
     """Group the units into the things this run will actually produce.
 
     Loose images stay in one run of consecutive units so the decoder can read
@@ -1719,10 +1748,19 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
     clock = time.perf_counter()
     cancelled = False
 
-    emit("start", total=total, out_dir=str(out_dir), device=cfg["device"] or "auto",
-         fp16=cfg["fp16"], tile=cfg["tile_label"], format=cfg["fid"],
-         container=cfg["container"], models=cfg["model_count"], dry=True,
-         bundles=sum(1 for t in tasks if t["kind"] == "bundle"))
+    emit(
+        "start",
+        total=total,
+        out_dir=str(out_dir),
+        device=cfg["device"] or "auto",
+        fp16=cfg["fp16"],
+        tile=cfg["tile_label"],
+        format=cfg["fid"],
+        container=cfg["container"],
+        models=cfg["model_count"],
+        dry=True,
+        bundles=sum(1 for t in tasks if t["kind"] == "bundle"),
+    )
 
     for task in tasks:
         if CTRL.cancelled:
@@ -1741,8 +1779,16 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
                 log(f"{src.name}: {exc}", "warn")
             exists = dest.exists() and not overwrite
             counters["skipped" if exists else "processed"] += 1
-            emit("file", i=index, total=total, path=str(src), out=str(dest), dry=True,
-                 entries=entries, error="exists, would skip" if exists else None)
+            emit(
+                "file",
+                i=index,
+                total=total,
+                path=str(src),
+                out=str(dest),
+                dry=True,
+                entries=entries,
+                error="exists, would skip" if exists else None,
+            )
             continue
 
         bundle = task["kind"] == "bundle"
@@ -1750,9 +1796,16 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
         dest_bundle: Path | None = task.get("dest")
         if bundle and dest_bundle is not None and dest_bundle.exists() and not overwrite:
             counters["skipped"] += len(units)
-            emit("file", i=int(units[0].get("index") or 0), total=total,
-                 path=str(units[0]["path"].parent), out=str(dest_bundle), dry=True,
-                 entries=len(units), error="exists, would skip")
+            emit(
+                "file",
+                i=int(units[0].get("index") or 0),
+                total=total,
+                path=str(units[0]["path"].parent),
+                out=str(dest_bundle),
+                dry=True,
+                entries=len(units),
+                error="exists, would skip",
+            )
             continue
         if bundle and dest_bundle is not None:
             emit("bundle", out=str(dest_bundle), entries=len(units), planned=True, dry=True)
@@ -1765,15 +1818,28 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
             CTRL.gate()
             src = unit["path"]
             index = int(unit.get("index") or position)
-            emit("progress", i=index, total=total, path=str(src),
-                 sub_i=position if bundle else 0, sub_n=len(units) if bundle else 0)
+            emit(
+                "progress",
+                i=index,
+                total=total,
+                path=str(src),
+                sub_i=position if bundle else 0,
+                sub_n=len(units) if bundle else 0,
+            )
             try:
                 w, h, gray, score, coloured = probe_image(
-                    src, cfg["threshold"], cfg["colour_percent"])
+                    src, cfg["threshold"], cfg["colour_percent"]
+                )
             except Exception as exc:
                 counters["failed"] += 1
-                emit("file", i=index, total=total, path=str(src), dry=True,
-                     error=f"cannot read: {type(exc).__name__}: {exc}")
+                emit(
+                    "file",
+                    i=index,
+                    total=total,
+                    path=str(src),
+                    dry=True,
+                    error=f"cannot read: {type(exc).__name__}: {exc}",
+                )
                 continue
             pick = cfg["pick_model"](bool(gray), h, w)
             pw, ph = predict_size(w, h, cfg["t_scale"], cfg["t_w"], cfg["t_h"])
@@ -1786,19 +1852,38 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
                 dest = dest_bundle
                 exists = False
             else:
-                dest = resolve_out(unit, out_dir, pattern, ext, cfg["keep_structure"],
-                                   index, total)
+                dest = resolve_out(unit, out_dir, pattern, ext, cfg["keep_structure"], index, total)
                 exists = dest.exists() and not overwrite
             counters["skipped" if exists else "processed"] += 1
-            emit("file", i=index, total=total, path=str(src), out=str(dest), entry=entry,
-                 w=pw, h=ph, src_w=w, src_h=h, gray=bool(gray), score=round(score, 2),
-                 colour=round(coloured, 2), model=(pick["name"] if pick else ""), dry=True,
-                 error="exists, would skip" if exists else None)
+            emit(
+                "file",
+                i=index,
+                total=total,
+                path=str(src),
+                out=str(dest),
+                entry=entry,
+                w=pw,
+                h=ph,
+                src_w=w,
+                src_h=h,
+                gray=bool(gray),
+                score=round(score, 2),
+                colour=round(coloured, 2),
+                model=(pick["name"] if pick else ""),
+                dry=True,
+                error="exists, would skip" if exists else None,
+            )
         if cancelled:
             break
 
-    emit("done", ok=counters["failed"] == 0 and not cancelled, cancelled=cancelled,
-         elapsed=round(time.perf_counter() - clock, 2), dry=True, **counters)
+    emit(
+        "done",
+        ok=counters["failed"] == 0 and not cancelled,
+        cancelled=cancelled,
+        elapsed=round(time.perf_counter() - clock, 2),
+        dry=True,
+        **counters,
+    )
     return 0 if counters["failed"] == 0 else 1
 
 
@@ -1831,8 +1916,19 @@ def run_job(job: dict) -> int:
     models_dir = Path(str(ups.get("models_dir") or MODELS_DIR))
     caps = encode_capabilities()
     if not caps.get(fid, {}).get("ok"):
-        emit("done", ok=False, processed=0, failed=0, skipped=0, cancelled=False, elapsed=0,
-             error=f"{FORMATS[fid].label} cannot be written here: {caps.get(fid, {}).get('reason', '')}")
+        emit(
+            "done",
+            ok=False,
+            processed=0,
+            failed=0,
+            skipped=0,
+            cancelled=False,
+            elapsed=0,
+            error=(
+                f"{FORMATS[fid].label} cannot be written here: "
+                f"{caps.get(fid, {}).get('reason', '')}"
+            ),
+        )
         return 2
 
     units = gather_units(inp)
@@ -1853,6 +1949,11 @@ def run_job(job: dict) -> int:
     pre_h = int(ups.get("pre_downscale_height") or 0)
     model_colour = str(ups.get("model") or "auto")
     model_gray = str(ups.get("model_gray") or "auto") if do_gray else model_colour
+    # Rules decide the model and auto-levels per page; the two names above are
+    # the fallback for pages no rule matches (and for jobs with no rules).
+    use_rules = bool(ups.get("rules_enabled", True))
+    rule_set = _rules.RuleSet.from_dicts(ups.get("rules") if use_rules else [])
+    rules_logged: set[str] = set()
     overwrite = bool(outp.get("overwrite", False))
     pattern = str(outp.get("pattern") or "{name}")
     keep_structure = bool(outp.get("keep_structure", True))
@@ -1875,49 +1976,104 @@ def run_job(job: dict) -> int:
 
     tasks = build_tasks(units, out_dir, keep_structure, container_id)
 
-    def pick_model(gray: bool, oh: int, ow: int) -> dict | None:
-        """The model for this page: the gray one for gray pages, else the colour one."""
-        if not models:
-            return None
-        wanted = (model_gray if (gray and do_gray) else model_colour).strip()
-        want_scale = t_scale
+    def page_factor(oh: int, ow: int) -> float:
+        """The factor this page will actually be upscaled by."""
         if mode == "height" and t_h:
-            want_scale = t_h / max(1, oh)
-        elif mode == "width" and t_w:
-            want_scale = t_w / max(1, ow)
-        elif mode == "fit" and t_w and t_h:
-            want_scale = min(t_w / max(1, ow), t_h / max(1, oh))
-        if wanted.lower() in ("", "auto"):
-            return choose_model(models, gray and do_gray, oh, want_scale)
-        found = next((m for m in models if m["name"] == wanted or m["path"] == wanted), None)
+            return t_h / max(1, oh)
+        if mode == "width" and t_w:
+            return t_w / max(1, ow)
+        if mode == "fit" and t_w and t_h:
+            return min(t_w / max(1, ow), t_h / max(1, oh))
+        return t_scale
+
+    def resolve_model(wanted: str, gray: bool, oh: int, factor: float) -> dict | None:
+        """Turn a model name (or "auto") into an installed model."""
+        name = (wanted or "").strip()
+        if name.lower() in ("", "auto"):
+            return choose_model(models, gray, oh, factor)
+        found = next((m for m in models if m["name"] == name or m["path"] == name), None)
         if found is None:
-            found = choose_model(models, gray and do_gray, oh, want_scale)
+            found = choose_model(models, gray, oh, factor)
             if found:
-                log(f"model {wanted} not found, using {found['name']}", "warn")
+                log(f"model {name} not found, using {found['name']}", "warn")
         return found
 
+    def note_rule(hit) -> None:
+        """Say which rule fired, once per distinct rule, not once per page."""
+        text = hit.describe()
+        if text not in rules_logged:
+            rules_logged.add(text)
+            log(f"rule: {text}")
+
+    def page_plan(gray: bool, oh: int, ow: int) -> tuple[dict | None, bool]:
+        """What happens to one page: which model, and whether to auto-level.
+
+        A matching rule decides; with no rules, or no rule matching this page,
+        the two model choices are used exactly as before.
+        """
+        is_gray = gray and do_gray
+        levels = do_levels
+        if not models:
+            return None, levels
+        factor = page_factor(oh, ow)
+        hit = rule_set.match(gray=is_gray, width=ow, height=oh, scale=factor)
+        if hit is None:
+            wanted = model_gray if is_gray else model_colour
+        else:
+            note_rule(hit)
+            wanted = hit.model
+            if hit.auto_levels is not None:
+                levels = bool(hit.auto_levels)
+        return resolve_model(wanted, is_gray, oh, factor), levels
+
+    def pick_model(gray: bool, oh: int, ow: int) -> dict | None:
+        """Model only; the dry run reports models without touching levels."""
+        return page_plan(gray, oh, ow)[0]
+
     if dry:
-        return dry_run(tasks, total, {
-            "out_dir": out_dir, "ext": ext, "pattern": pattern, "overwrite": overwrite,
-            "keep_structure": keep_structure, "threshold": threshold,
-            "colour_percent": colour_percent, "pick_model": pick_model,
-            "t_scale": t_scale, "t_w": t_w, "t_h": t_h, "fid": fid,
-            "container": container_id, "model_count": len(models),
-            "device": str(perf.get("device") or ""),
-            "fp16": wants_fp16(perf.get("use_fp16", True)), "tile_label": tile_label,
-        })
+        return dry_run(
+            tasks,
+            total,
+            {
+                "out_dir": out_dir,
+                "ext": ext,
+                "pattern": pattern,
+                "overwrite": overwrite,
+                "keep_structure": keep_structure,
+                "threshold": threshold,
+                "colour_percent": colour_percent,
+                "pick_model": pick_model,
+                "t_scale": t_scale,
+                "t_w": t_w,
+                "t_h": t_h,
+                "fid": fid,
+                "container": container_id,
+                "model_count": len(models),
+                "device": str(perf.get("device") or ""),
+                "fp16": wants_fp16(perf.get("use_fp16", True)),
+                "tile_label": tile_label,
+            },
+        )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     ctx, device, fp16 = make_context(perf)
-    planner = TilePlanner(tile_mode, tile_fixed, device, fp16,
-                          int(perf.get("budget_limit") or 0))
+    planner = TilePlanner(tile_mode, tile_fixed, device, fp16, int(perf.get("budget_limit") or 0))
     # Only a plain scale target has one fixed factor to compare models against;
     # width/height/fit factors depend on each page, so no warning there.
     cache = ModelCache(ctx, t_scale if mode == "scale" else 0.0)
 
-    emit("start", total=total, out_dir=str(out_dir), device=device, fp16=fp16,
-         tile=tile_label, format=fid, models=len(models), container=container_id,
-         bundles=sum(1 for t in tasks if t["kind"] == "bundle"))
+    emit(
+        "start",
+        total=total,
+        out_dir=str(out_dir),
+        device=device,
+        fp16=fp16,
+        tile=tile_label,
+        format=fid,
+        models=len(models),
+        container=container_id,
+        bundles=sum(1 for t in tasks if t["kind"] == "bundle"),
+    )
     if not models:
         log(f"no models found in {models_dir}; images will only be resized", "warn")
 
@@ -1930,23 +2086,30 @@ def run_job(job: dict) -> int:
         oh, ow = hwc(image)[:2]
         gray, score, coloured = gray_stats(image, threshold, colour_percent)
         if skip_long and is_long_strip(ow, oh, long_max_side, long_aspect, long_pixels):
-            log(f"{src_name}: {ow}x{oh} long strip, passed through without upscaling",
-                "warn")
-            return image, gray, "", {"w": ow, "h": oh, "src_w": ow, "src_h": oh,
-                                     "score": round(score, 2),
-                                     "colour": round(coloured, 2), "tile": 0}
+            log(f"{src_name}: {ow}x{oh} long strip, passed through without upscaling", "warn")
+            return (
+                image,
+                gray,
+                "",
+                {
+                    "w": ow,
+                    "h": oh,
+                    "src_w": ow,
+                    "src_h": oh,
+                    "score": round(score, 2),
+                    "colour": round(coloured, 2),
+                    "tile": 0,
+                },
+            )
         if gray and do_gray:
             image = to_grayscale(image)
         if pre_h and oh > pre_h:
             image = standard_resize(image, (round(ow * pre_h / oh), pre_h))
 
-        pick = pick_model(gray, oh, ow)
+        pick, want_levels = page_plan(gray, oh, ow)
         model = cache.get(pick["path"]) if pick else None
 
-        if do_levels and image.ndim == 2:
-            image = auto_levels(image)
-        else:
-            image = _normalize(image)
+        image = auto_levels(image) if want_levels and image.ndim == 2 else _normalize(image)
         CTRL.gate()
         tile = planner.choose(model, image)
         planner.before()
@@ -1955,46 +2118,96 @@ def run_job(job: dict) -> int:
         image = _to_uint8(image, normalized=True)
         image = final_resize(image, t_scale, t_w, t_h, ow, oh, gray and do_gray)
         out_h, out_w = hwc(image)[:2]
-        info = {"w": out_w, "h": out_h, "src_w": ow, "src_h": oh,
-                "score": round(score, 2), "colour": round(coloured, 2),
-                "tile": planner.last}
+        info = {
+            "w": out_w,
+            "h": out_h,
+            "src_w": ow,
+            "src_h": oh,
+            "score": round(score, 2),
+            "colour": round(coloured, 2),
+            "tile": planner.last,
+        }
         return image, gray, (pick["name"] if pick else ""), info
 
     def encode_now(image) -> bytes:
         return encode(image, fid, opts, caps)
 
-    def write_result(index: int, src: Path, dest: Path, image, gray: bool, model_name: str,
-                     info: dict, started: float):
+    def write_result(
+        index: int,
+        src: Path,
+        dest: Path,
+        image,
+        gray: bool,
+        model_name: str,
+        info: dict,
+        started: float,
+    ):
         try:
             data = encode_now(image)
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
             counters["processed"] += 1
-            emit("file", i=index, total=total, path=str(src), out=str(dest),
-                 ms=int((time.perf_counter() - started) * 1000), bytes=len(data),
-                 gray=bool(gray), model=model_name, **info)
+            emit(
+                "file",
+                i=index,
+                total=total,
+                path=str(src),
+                out=str(dest),
+                ms=int((time.perf_counter() - started) * 1000),
+                bytes=len(data),
+                gray=bool(gray),
+                model=model_name,
+                **info,
+            )
         except Exception as exc:
             counters["failed"] += 1
-            emit("file", i=index, total=total, path=str(src), out=str(dest),
-                 error=f"{type(exc).__name__}: {exc}")
+            emit(
+                "file",
+                i=index,
+                total=total,
+                path=str(src),
+                out=str(dest),
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
     def on_bundle_page(meta: dict, name: str, size: int) -> None:
         counters["processed"] += 1
-        emit("file", i=meta.get("i"), total=total, path=meta.get("src"),
-             out=meta.get("bundle"), entry=name, bytes=size,
-             ms=int((time.perf_counter() - float(meta.get("started") or 0)) * 1000),
-             gray=bool(meta.get("gray")), model=meta.get("model"),
-             **(meta.get("info") or {}))
+        emit(
+            "file",
+            i=meta.get("i"),
+            total=total,
+            path=meta.get("src"),
+            out=meta.get("bundle"),
+            entry=name,
+            bytes=size,
+            ms=int((time.perf_counter() - float(meta.get("started") or 0)) * 1000),
+            gray=bool(meta.get("gray")),
+            model=meta.get("model"),
+            **(meta.get("info") or {}),
+        )
 
     def on_bundle_fail(meta: dict, name: str, error: str) -> None:
         counters["failed"] += 1
-        emit("file", i=meta.get("i"), total=total, path=meta.get("src"),
-             out=meta.get("bundle"), entry=name, error=error)
+        emit(
+            "file",
+            i=meta.get("i"),
+            total=total,
+            path=meta.get("src"),
+            out=meta.get("bundle"),
+            entry=name,
+            error=error,
+        )
 
     def on_bundle_done(key: str, dest: Path, entries: int, failed: int, elapsed: float) -> None:
-        emit("bundle", key=key, out=str(dest), entries=entries, failed=failed,
-             bytes=(dest.stat().st_size if dest.exists() else 0),
-             ms=int(elapsed * 1000))
+        emit(
+            "bundle",
+            key=key,
+            out=str(dest),
+            entries=entries,
+            failed=failed,
+            bytes=(dest.stat().st_size if dest.exists() else 0),
+            ms=int(elapsed * 1000),
+        )
 
     bundle = BundleWriter(encode_now, on_bundle_page, on_bundle_fail, on_bundle_done)
 
@@ -2003,7 +2216,9 @@ def run_job(job: dict) -> int:
         dest = resolve_out(unit, out_dir, pattern, ".cbz", keep_structure, index, total)
         if dest.exists() and not overwrite:
             counters["skipped"] += 1
-            emit("file", i=index, total=total, path=str(src), out=str(dest), error="exists, skipped")
+            emit(
+                "file", i=index, total=total, path=str(src), out=str(dest), error="exists, skipped"
+            )
             return
         dest.parent.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
@@ -2025,7 +2240,8 @@ def run_job(job: dict) -> int:
                     try:
                         raw = reader(name)
                         image, _gray, _model, _info = process_array(
-                            read_image_bytes(raw, name), name)
+                            read_image_bytes(raw, name), name
+                        )
                         data = encode_now(image)
                         zf.writestr(str(Path(name).with_suffix(FORMATS[fid].ext).as_posix()), data)
                         written += 1
@@ -2035,9 +2251,16 @@ def run_job(job: dict) -> int:
                         log(f"{src.name}:{name}: {exc}", "warn")
             tmp.replace(dest)
             counters["processed"] += 1
-            emit("file", i=index, total=total, path=str(src), out=str(dest),
-                 ms=int((time.perf_counter() - started) * 1000),
-                 bytes=dest.stat().st_size, entries=written)
+            emit(
+                "file",
+                i=index,
+                total=total,
+                path=str(src),
+                out=str(dest),
+                ms=int((time.perf_counter() - started) * 1000),
+                bytes=dest.stat().st_size,
+                entries=written,
+            )
         except Cancelled:
             tmp.unlink(missing_ok=True)
             raise
@@ -2063,20 +2286,37 @@ def run_job(job: dict) -> int:
             CTRL.gate()
             index = int(unit.get("index") or position)
             src: Path = unit["path"]
-            emit("progress", i=index, total=total, path=str(src),
-                 sub_i=position if into else 0, sub_n=count if into else 0)
+            emit(
+                "progress",
+                i=index,
+                total=total,
+                path=str(src),
+                sub_i=position if into else 0,
+                sub_n=count if into else 0,
+            )
             if isinstance(payload, Exception):
                 counters["failed"] += 1
-                emit("file", i=index, total=total, path=str(src),
-                     error=f"read failed: {type(payload).__name__}: {payload}")
+                emit(
+                    "file",
+                    i=index,
+                    total=total,
+                    path=str(src),
+                    error=f"read failed: {type(payload).__name__}: {payload}",
+                )
                 continue
             dest: Path | None = None
             if into is None:
                 dest = resolve_out(unit, out_dir, pattern, ext, keep_structure, index, total)
                 if dest.exists() and not overwrite:
                     counters["skipped"] += 1
-                    emit("file", i=index, total=total, path=str(src), out=str(dest),
-                         error="exists, skipped")
+                    emit(
+                        "file",
+                        i=index,
+                        total=total,
+                        path=str(src),
+                        out=str(dest),
+                        error="exists, skipped",
+                    )
                     continue
                 if dest.resolve() == src.resolve():
                     dest = unique_path(dest)
@@ -2087,22 +2327,37 @@ def run_job(job: dict) -> int:
                 if CTRL.cancelled:
                     raise Cancelled from exc
                 counters["failed"] += 1
-                emit("file", i=index, total=total, path=str(src),
-                     error=f"{type(exc).__name__}: {exc}")
+                emit(
+                    "file",
+                    i=index,
+                    total=total,
+                    path=str(src),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 log(traceback.format_exc(limit=4), "debug")
                 continue
             if into is None and dest is not None:
-                writer.submit(write_result, index, src, dest, image, gray, model_name,
-                              info, started)
+                writer.submit(
+                    write_result, index, src, dest, image, gray, model_name, info, started
+                )
                 continue
             entry = format_name(pattern, src, position, count) + ext
             while entry.lower() in seen:
                 entry = f"{entry[: -len(ext)]}_{position}{ext}"
             seen.add(entry.lower())
-            bundle.add(entry, image, {"i": index, "src": str(src), "gray": gray,
-                                      "model": model_name, "info": info,
-                                      "started": started,
-                                      "bundle": str(into["dest"])})
+            bundle.add(
+                entry,
+                image,
+                {
+                    "i": index,
+                    "src": str(src),
+                    "gray": gray,
+                    "model": model_name,
+                    "info": info,
+                    "started": started,
+                    "bundle": str(into["dest"]),
+                },
+            )
 
     cancelled = False
     try:
@@ -2112,8 +2367,7 @@ def run_job(job: dict) -> int:
                 break
             if task["kind"] == "archive":
                 unit = task["unit"]
-                emit("progress", i=int(unit.get("index") or 0), total=total,
-                     path=str(unit["path"]))
+                emit("progress", i=int(unit.get("index") or 0), total=total, path=str(unit["path"]))
                 handle_archive(int(unit.get("index") or 0), unit)
                 continue
             if task["kind"] == "images":
@@ -2123,9 +2377,15 @@ def run_job(job: dict) -> int:
             units_here: list[dict] = task["units"]
             if dest_bundle.exists() and not overwrite:
                 counters["skipped"] += len(units_here)
-                emit("file", i=int(units_here[0].get("index") or 0), total=total,
-                     path=str(units_here[0]["path"].parent), out=str(dest_bundle),
-                     entries=len(units_here), error="exists, skipped")
+                emit(
+                    "file",
+                    i=int(units_here[0].get("index") or 0),
+                    total=total,
+                    path=str(units_here[0]["path"].parent),
+                    out=str(dest_bundle),
+                    entries=len(units_here),
+                    error="exists, skipped",
+                )
                 continue
             bundle.open(task["key"], dest_bundle)
             run_images(units_here, task)
@@ -2154,8 +2414,13 @@ def run_job(job: dict) -> int:
         except Exception:
             pass
 
-    emit("done", ok=counters["failed"] == 0 and not cancelled, cancelled=cancelled,
-         elapsed=round(time.perf_counter() - clock, 2), **counters)
+    emit(
+        "done",
+        ok=counters["failed"] == 0 and not cancelled,
+        cancelled=cancelled,
+        elapsed=round(time.perf_counter() - clock, 2),
+        **counters,
+    )
     return 0 if counters["failed"] == 0 else 1
 
 
@@ -2165,19 +2430,25 @@ def open_archive(path: Path):
     if ext in (".zip", ".cbz"):
         zf = ZipFile(path)
         names = sorted(
-            (n for n in zf.namelist()
-             if not n.endswith("/") and Path(n).suffix.lower() in IMAGE_EXTS),
+            (
+                n
+                for n in zf.namelist()
+                if not n.endswith("/") and Path(n).suffix.lower() in IMAGE_EXTS
+            ),
             key=natural_key,
         )
         return names, zf.read
     if ext in (".rar", ".cbr"):
         try:
-            import rarfile  # noqa: PLC0415
+            import rarfile
 
             rf = rarfile.RarFile(str(path))
             names = sorted(
-                (n for n in rf.namelist()
-                 if not n.endswith("/") and Path(n).suffix.lower() in IMAGE_EXTS),
+                (
+                    n
+                    for n in rf.namelist()
+                    if not n.endswith("/") and Path(n).suffix.lower() in IMAGE_EXTS
+                ),
                 key=natural_key,
             )
             return names, rf.read
@@ -2291,13 +2562,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--job", help="path to a job JSON file")
     ap.add_argument("--probe", action="store_true", help="report devices, encoders and models")
     ap.add_argument("--models-dir", default=str(MODELS_DIR))
-    ap.add_argument("--hold", action="store_true",
-                    help="hold a GPU context awake until stdin says stop")
+    ap.add_argument(
+        "--hold", action="store_true", help="hold a GPU context awake until stdin says stop"
+    )
     ap.add_argument("--device", default="", help="device for --hold, e.g. cuda:0")
-    ap.add_argument("--hold-interval", type=float, default=15.0,
-                    help="seconds between keep-alive touches (default 15)")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="with --job: report what would happen, write nothing")
+    ap.add_argument(
+        "--hold-interval",
+        type=float,
+        default=15.0,
+        help="seconds between keep-alive touches (default 15)",
+    )
+    ap.add_argument(
+        "--dry-run", action="store_true", help="with --job: report what would happen, write nothing"
+    )
     args = ap.parse_args(argv)
 
     install_warning_filters()  # before torch is imported anywhere in this process
@@ -2325,8 +2602,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         job = json.loads(Path(args.job).read_text(encoding="utf-8"))
     except Exception as exc:
-        emit("done", ok=False, processed=0, failed=0, skipped=0, cancelled=False,
-             elapsed=0, error=f"bad job file: {exc}")
+        emit(
+            "done",
+            ok=False,
+            processed=0,
+            failed=0,
+            skipped=0,
+            cancelled=False,
+            elapsed=0,
+            error=f"bad job file: {exc}",
+        )
         return 2
     if args.dry_run:
         job["dry_run"] = True
@@ -2334,8 +2619,16 @@ def main(argv: list[str] | None = None) -> int:
         return run_job(job)
     except Exception as exc:
         emit("log", level="error", message=traceback.format_exc(limit=8))
-        emit("done", ok=False, processed=0, failed=0, skipped=0, cancelled=CTRL.cancelled,
-             elapsed=0, error=f"{type(exc).__name__}: {exc}")
+        emit(
+            "done",
+            ok=False,
+            processed=0,
+            failed=0,
+            skipped=0,
+            cancelled=CTRL.cancelled,
+            elapsed=0,
+            error=f"{type(exc).__name__}: {exc}",
+        )
         return 1
 
 

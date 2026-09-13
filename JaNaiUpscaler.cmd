@@ -2,7 +2,7 @@
 rem JaNai Upscaler - launcher. Uses the environment in .\backend\python.
 setlocal
 set "HERE=%~dp0"
-set "MAIN=%HERE%app\main.py"
+set "MAIN=%HERE%src\janai\app\main.py"
 set "PY="
 
 rem 1. whatever setup recorded

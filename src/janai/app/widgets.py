@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import tkinter as tk
+from collections.abc import Callable, Iterable, Sequence
 from tkinter import ttk
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any
 
 
 class ScrollArea(ttk.Frame):
@@ -13,8 +14,9 @@ class ScrollArea(ttk.Frame):
     def __init__(self, master: tk.Misc, theme: Any, **kw: Any) -> None:
         super().__init__(master, **kw)
         self.theme = theme
-        self.canvas = tk.Canvas(self, highlightthickness=0, bd=0,
-                                background=theme.p.bg, takefocus=0)
+        self.canvas = tk.Canvas(
+            self, highlightthickness=0, bd=0, background=theme.p.bg, takefocus=0
+        )
         self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self._on_scroll)
         self.canvas.grid(row=0, column=0, sticky="nsew")
@@ -59,8 +61,9 @@ class ScrollArea(ttk.Frame):
 class Card(ttk.Frame):
     """Titled surface panel. Content goes into ``.body``."""
 
-    def __init__(self, master: tk.Misc, title: str, subtitle: str = "",
-                 badge: str = "", **kw: Any) -> None:
+    def __init__(
+        self, master: tk.Misc, title: str, subtitle: str = "", badge: str = "", **kw: Any
+    ) -> None:
         super().__init__(master, style="Card.TFrame", padding=(16, 14, 16, 16), **kw)
         self.columnconfigure(0, weight=1)
         head = ttk.Frame(self, style="Card.TFrame")
@@ -96,16 +99,26 @@ class Card(ttk.Frame):
 class Segmented(ttk.Frame):
     """Row of mutually exclusive flat buttons bound to one variable."""
 
-    def __init__(self, master: tk.Misc, variable: tk.Variable,
-                 options: Sequence[tuple[str, Any]],
-                 command: Callable[[Any], None] | None = None, **kw: Any) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        variable: tk.Variable,
+        options: Sequence[tuple[str, Any]],
+        command: Callable[[Any], None] | None = None,
+        **kw: Any,
+    ) -> None:
         super().__init__(master, style="Inset.TFrame", padding=2, **kw)
         self.var = variable
         self.buttons: dict[Any, ttk.Radiobutton] = {}
         for i, (label, value) in enumerate(options):
-            rb = ttk.Radiobutton(self, text=label, value=value, variable=variable,
-                                 style="Seg.Toolbutton",
-                                 command=(lambda v=value: command(v)) if command else None)
+            rb = ttk.Radiobutton(
+                self,
+                text=label,
+                value=value,
+                variable=variable,
+                style="Seg.Toolbutton",
+                command=(lambda v=value: command(v)) if command else None,
+            )
             rb.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 2, 0))
             self.columnconfigure(i, weight=1)
             self.buttons[value] = rb
@@ -119,16 +132,18 @@ class Segmented(ttk.Frame):
 class Collapsible(ttk.Frame):
     """Disclosure panel with a clickable header. Content goes into ``.body``."""
 
-    def __init__(self, master: tk.Misc, title: str, expanded: bool = False,
-                 subtitle: str = "", **kw: Any) -> None:
+    def __init__(
+        self, master: tk.Misc, title: str, expanded: bool = False, subtitle: str = "", **kw: Any
+    ) -> None:
         super().__init__(master, style="Card.TFrame", padding=(16, 12, 16, 12), **kw)
         self.columnconfigure(0, weight=1)
         self._open = tk.BooleanVar(value=expanded)
         self.head = ttk.Frame(self, style="Card.TFrame")
         self.head.grid(row=0, column=0, sticky="ew")
         self.head.columnconfigure(1, weight=1)
-        self.arrow = ttk.Label(self.head, text="\u25be" if expanded else "\u25b8",
-                               style="Card.TLabel", width=2)
+        self.arrow = ttk.Label(
+            self.head, text="\u25be" if expanded else "\u25b8", style="Card.TLabel", width=2
+        )
         self.arrow.grid(row=0, column=0, sticky="w")
         self.title = ttk.Label(self.head, text=title, style="CardTitle.TLabel")
         self.title.grid(row=0, column=1, sticky="w")
@@ -203,9 +218,17 @@ class Tooltip:
         tip.wm_overrideredirect(True)
         tip.wm_geometry(f"+{x}+{y}")
         tip.configure(background=p.border)
-        tk.Label(tip, text=self.text, background=p.surface2, foreground=p.text,
-                 font=self.theme.fonts["small"], justify="left", wraplength=320,
-                 padx=8, pady=6).pack(padx=1, pady=1)
+        tk.Label(
+            tip,
+            text=self.text,
+            background=p.surface2,
+            foreground=p.text,
+            font=self.theme.fonts["small"],
+            justify="left",
+            wraplength=320,
+            padx=8,
+            pady=6,
+        ).pack(padx=1, pady=1)
         try:
             tip.wm_attributes("-topmost", True)
         except Exception:
@@ -213,8 +236,14 @@ class Tooltip:
         self._tip = tip
 
 
-def row_label(parent: tk.Misc, row: int, text: str, hint: str = "",
-              theme: Any = None, style: str = "Card.TLabel") -> ttk.Label:
+def row_label(
+    parent: tk.Misc,
+    row: int,
+    text: str,
+    hint: str = "",
+    theme: Any = None,
+    style: str = "Card.TLabel",
+) -> ttk.Label:
     """Grid a right-aligned field label in column 0."""
     lbl = ttk.Label(parent, text=text, style=style)
     lbl.grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
@@ -223,15 +252,28 @@ def row_label(parent: tk.Misc, row: int, text: str, hint: str = "",
     return lbl
 
 
-def hint_label(parent: tk.Misc, row: int, text: str, style: str = "Muted.TLabel",
-               column: int = 1, columnspan: int = 1) -> ttk.Label:
+def hint_label(
+    parent: tk.Misc,
+    row: int,
+    text: str,
+    style: str = "Muted.TLabel",
+    column: int = 1,
+    columnspan: int = 1,
+) -> ttk.Label:
     lbl = ttk.Label(parent, text=text, style=style, wraplength=520, justify="left")
     lbl.grid(row=row, column=column, columnspan=columnspan, sticky="w", pady=(0, 6))
     return lbl
 
 
-def int_spin(parent: tk.Misc, variable: tk.Variable, lo: float, hi: float,
-             step: float = 1, width: int = 7, on_change: Callable[[], None] | None = None):
+def int_spin(
+    parent: tk.Misc,
+    variable: tk.Variable,
+    lo: float,
+    hi: float,
+    step: float = 1,
+    width: int = 7,
+    on_change: Callable[[], None] | None = None,
+):
     """Spinbox for a numeric field.
 
     A fractional step gets an explicit format, so the arrows produce 0.25
@@ -241,8 +283,16 @@ def int_spin(parent: tk.Misc, variable: tk.Variable, lo: float, hi: float,
     if float(step) != int(float(step)):
         decimals = len(f"{float(step):.6f}".rstrip("0").split(".")[1]) or 2
         extra["format"] = f"%.{decimals}f"
-    sp = ttk.Spinbox(parent, from_=lo, to=hi, increment=step, textvariable=variable,
-                     width=width, justify="right", **extra)
+    sp = ttk.Spinbox(
+        parent,
+        from_=lo,
+        to=hi,
+        increment=step,
+        textvariable=variable,
+        width=width,
+        justify="right",
+        **extra,
+    )
     if on_change is not None:
         sp.configure(command=on_change)
         sp.bind("<FocusOut>", lambda _e: on_change(), add="+")
@@ -250,10 +300,16 @@ def int_spin(parent: tk.Misc, variable: tk.Variable, lo: float, hi: float,
     return sp
 
 
-def combo(parent: tk.Misc, variable: tk.Variable, values: Iterable[str], width: int = 28,
-          on_change: Callable[[], None] | None = None) -> ttk.Combobox:
-    cb = ttk.Combobox(parent, textvariable=variable, values=list(values), width=width,
-                      state="readonly")
+def combo(
+    parent: tk.Misc,
+    variable: tk.Variable,
+    values: Iterable[str],
+    width: int = 28,
+    on_change: Callable[[], None] | None = None,
+) -> ttk.Combobox:
+    cb = ttk.Combobox(
+        parent, textvariable=variable, values=list(values), width=width, state="readonly"
+    )
     if on_change is not None:
         cb.bind("<<ComboboxSelected>>", lambda _e: on_change(), add="+")
     return cb

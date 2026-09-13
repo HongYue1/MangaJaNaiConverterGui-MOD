@@ -13,23 +13,12 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
 
-from common import displays
-from common.formats import (
-    CONTAINER_IDS,
-    CONTAINERS,
-    FORMAT_IDS,
-    FORMATS,
-    Opt,
-    is_active,
-    packs_archive,
-    summary,
-)
-
-from app import dnd
-from app.runlog import (
+from janai import __version__
+from janai.app import dnd
+from janai.app.runlog import (
     RunLog,
     fmt_bytes,
     fmt_secs,
@@ -38,10 +27,10 @@ from app.runlog import (
     format_file,
     format_start,
 )
-from app.runner import Runner, open_in_explorer
-from app.state import Settings
-from app.theme import Theme
-from app.widgets import (
+from janai.app.runner import Runner, open_in_explorer
+from janai.app.state import Settings
+from janai.app.theme import Theme
+from janai.app.widgets import (
     Card,
     Collapsible,
     ScrollArea,
@@ -52,9 +41,35 @@ from app.widgets import (
     int_spin,
     row_label,
 )
+from janai.core import displays, presets, rules
+from janai.core.formats import (
+    CONTAINER_IDS,
+    CONTAINERS,
+    FORMAT_IDS,
+    FORMATS,
+    Opt,
+    is_active,
+    packs_archive,
+    summary,
+)
 
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".jfif", ".webp", ".avif", ".jxl", ".bmp",
-              ".tif", ".tiff", ".gif", ".heic", ".heif", ".ppm", ".pgm"}
+IMAGE_EXTS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".jfif",
+    ".webp",
+    ".avif",
+    ".jxl",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".ppm",
+    ".pgm",
+}
 ARCHIVE_EXTS = {".zip", ".cbz", ".rar", ".cbr"}
 
 TILE_CHOICES = [
@@ -94,6 +109,8 @@ def model_scale(name: str) -> int | None:
         if 1 <= value <= 16:
             return value
     return None
+
+
 LOG_TAGS = ("info", "debug", "warn", "error", "ok", "skip", "dry")
 
 # An empty device string means "let the worker pick the best one".
@@ -124,8 +141,11 @@ class App:
         self.runner = Runner(root_dir)
 
         log_cfg = self.settings.data.get("log") or {}
-        self.runlog = RunLog(self._log_dir(), keep=int(log_cfg.get("keep", 30) or 0),
-                             enabled=bool(log_cfg.get("auto_save", True)))
+        self.runlog = RunLog(
+            self._log_dir(),
+            keep=int(log_cfg.get("keep", 30) or 0),
+            enabled=bool(log_cfg.get("auto_save", True)),
+        )
 
         probe = self.settings.data.get("probe") or {}
         self.probe: dict = probe if isinstance(probe, dict) else {}
@@ -150,6 +170,8 @@ class App:
         self.render_format_options()
         self.render_target()
         self.render_models()
+        self.seed_rules()
+        self.render_rules()
         self.update_start_state()
         self.update_wake_lock()
         self.root.after(80, self._tick)
@@ -173,17 +195,20 @@ class App:
         self.var_width = tk.IntVar(value=int(u.get("width", 2048)))
         self.var_height = tk.IntVar(value=int(u.get("height", 2160)))
         self.var_display = tk.StringVar(
-            value=displays.label_for_id(str(u.get("display", displays.CUSTOM))))
+            value=displays.label_for_id(str(u.get("display", displays.CUSTOM)))
+        )
         self.var_portrait = tk.BooleanVar(value=bool(u.get("display_portrait", True)))
         self.var_model = tk.StringVar(value=str(u.get("model", AUTO_MODEL)))
         self.var_model_gray = tk.StringVar(value=str(u.get("model_gray", AUTO_MODEL)))
         self.var_levels = tk.BooleanVar(value=bool(u.get("auto_levels", True)))
         self.var_gray = tk.BooleanVar(value=bool(u.get("grayscale_convert", True)))
         self.var_threshold = tk.IntVar(value=int(u.get("grayscale_threshold", 12)))
-        self.var_colour_pct = tk.DoubleVar(
-            value=float(u.get("grayscale_colour_percent", 0.25)))
+        self.var_colour_pct = tk.DoubleVar(value=float(u.get("grayscale_colour_percent", 0.25)))
         self.var_pre_h = tk.IntVar(value=int(u.get("pre_downscale_height", 0)))
         self.var_skip_long = tk.BooleanVar(value=bool(u.get("skip_long_strips", False)))
+        self.var_rules_on = tk.BooleanVar(value=bool(u.get("rules_enabled", True)))
+        self.rules: list[rules.Rule] = [rules.Rule.from_dict(r) for r in (u.get("rules") or [])]
+        self._rules_seeded = bool(self.rules)
 
         self.var_fmt = tk.StringVar(value=str(d["format"].get("id", "png")))
         self.var_adv = tk.BooleanVar(value=bool(ui.get("advanced_format", False)))
@@ -271,8 +296,9 @@ class App:
         body = self.scroll.body
         body.columnconfigure(0, weight=1)
 
-        self.banner = ttk.Label(body, text="", style="Err.TLabel", wraplength=900,
-                                justify="left", padding=(12, 8))
+        self.banner = ttk.Label(
+            body, text="", style="Err.TLabel", wraplength=900, justify="left", padding=(12, 8)
+        )
         self._banner_visible = False
 
         self._build_input(body)
@@ -296,16 +322,33 @@ class App:
         head = ttk.Frame(self.root, padding=(18, 14, 18, 8))
         head.grid(row=0, column=0, sticky="ew")
         head.columnconfigure(1, weight=1)
-        ttk.Label(head, text="JaNai Upscaler", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(head, text="JaNai Upscaler", style="Title.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
         self.lbl_env = ttk.Label(head, text="detecting hardware\u2026", style="MutedBg.TLabel")
         self.lbl_env.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
         btns = ttk.Frame(head)
         btns.grid(row=0, column=2, rowspan=2, sticky="e")
-        ttk.Button(btns, text="Theme", style="Ghost.TButton",
-                   command=self.toggle_theme).grid(row=0, column=0, padx=(0, 6))
-        self.btn_refresh = ttk.Button(btns, text="Re-detect", style="Ghost.TButton",
-                                      command=self.refresh_probe)
+        ttk.Button(btns, text="Theme", style="Ghost.TButton", command=self.toggle_theme).grid(
+            row=0, column=0, padx=(0, 6)
+        )
+        self.btn_refresh = ttk.Button(
+            btns, text="Re-detect", style="Ghost.TButton", command=self.refresh_probe
+        )
         self.btn_refresh.grid(row=0, column=1)
+        self.btn_presets = ttk.Button(
+            btns, text="Presets", style="Ghost.TButton", command=self.preset_menu
+        )
+        self.btn_presets.grid(row=0, column=2, padx=(6, 0))
+        Tooltip(
+            self.btn_presets,
+            "Save the current settings as a preset, load one from a "
+            "file, or switch to one you already saved. A preset "
+            "carries the target, models, rules, format, output layout "
+            "and performance options \u2014 never your folders or your "
+            "device.",
+            self.theme,
+        )
 
     def _build_input(self, body: tk.Misc) -> None:
         card = Card(body, "1 \u00b7 Input", badge="")
@@ -319,29 +362,53 @@ class App:
         drop.columnconfigure(0, weight=1)
         self.drop_hint = ttk.Label(drop, text="", style="Inset.TLabel", anchor="center")
         self.drop_hint.grid(row=0, column=0, sticky="ew")
-        self.lbl_path = ttk.Label(drop, text="No input selected", style="InsetMuted.TLabel",
-                                  anchor="center", wraplength=820, justify="center")
+        self.lbl_path = ttk.Label(
+            drop,
+            text="No input selected",
+            style="InsetMuted.TLabel",
+            anchor="center",
+            wraplength=820,
+            justify="center",
+        )
         self.lbl_path.grid(row=1, column=0, sticky="ew", pady=(6, 0))
 
         row = ttk.Frame(b, style="Card.TFrame")
         row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         ttk.Button(row, text="Choose file\u2026", command=self.choose_file).grid(row=0, column=0)
-        ttk.Button(row, text="Choose folder\u2026", command=self.choose_folder).grid(row=0, column=1, padx=8)
-        ttk.Button(row, text="Clear", style="Ghost.TButton",
-                   command=self.clear_input).grid(row=0, column=2)
+        ttk.Button(row, text="Choose folder\u2026", command=self.choose_folder).grid(
+            row=0, column=1, padx=8
+        )
+        ttk.Button(row, text="Clear", style="Ghost.TButton", command=self.clear_input).grid(
+            row=0, column=2
+        )
 
         opts = ttk.Frame(b, style="Card.TFrame")
         opts.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        c1 = ttk.Checkbutton(opts, text="Include subfolders", variable=self.var_recursive,
-                             command=self.on_input_options)
+        c1 = ttk.Checkbutton(
+            opts,
+            text="Include subfolders",
+            variable=self.var_recursive,
+            command=self.on_input_options,
+        )
         c1.grid(row=0, column=0, sticky="w")
-        Tooltip(c1, "Walk the whole tree. With a CBZ package this is what turns each "
-                    "chapter folder into its own archive.", self.theme)
-        c2 = ttk.Checkbutton(opts, text="Include archives (cbz/zip/cbr/rar)",
-                             variable=self.var_archives, command=self.on_input_options)
+        Tooltip(
+            c1,
+            "Walk the whole tree. With a CBZ package this is what turns each "
+            "chapter folder into its own archive.",
+            self.theme,
+        )
+        c2 = ttk.Checkbutton(
+            opts,
+            text="Include archives (cbz/zip/cbr/rar)",
+            variable=self.var_archives,
+            command=self.on_input_options,
+        )
         c2.grid(row=0, column=1, sticky="w", padx=(18, 0))
-        Tooltip(c2, "Comic archives found in the input are re-packed as .cbz with every "
-                    "page upscaled.", self.theme)
+        Tooltip(
+            c2,
+            "Comic archives found in the input are re-packed as .cbz with every page upscaled.",
+            self.theme,
+        )
 
     def _build_upscale(self, body: tk.Misc) -> None:
         card = Card(body, "2 \u00b7 Upscale")
@@ -351,99 +418,246 @@ class App:
 
         row_label(b, 0, "Target", "How large the result should be.", self.theme)
         Segmented(b, self.var_mode, MODE_OPTIONS, command=lambda _v: self.render_target()).grid(
-            row=0, column=1, sticky="w", pady=4)
+            row=0, column=1, sticky="w", pady=4
+        )
 
         self.target_box = ttk.Frame(b, style="Card.TFrame")
         self.target_box.grid(row=1, column=1, sticky="w", pady=(2, 6))
         self.f_scale = ttk.Frame(self.target_box, style="Card.TFrame")
-        int_spin(self.f_scale, self.var_scale, 1.0, 8.0, 0.25, 7, self.update_summary).grid(row=0, column=0)
+        int_spin(self.f_scale, self.var_scale, 1.0, 8.0, 0.25, 7, self.update_summary).grid(
+            row=0, column=0
+        )
         ttk.Label(self.f_scale, text="\u00d7 original size", style="Muted.TLabel").grid(
-            row=0, column=1, padx=(8, 0))
+            row=0, column=1, padx=(8, 0)
+        )
         self.f_width = ttk.Frame(self.target_box, style="Card.TFrame")
-        ttk.Label(self.f_width, text="Width", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 6))
-        int_spin(self.f_width, self.var_width, 64, 30000, 16, 8, self.update_summary).grid(row=0, column=1)
+        ttk.Label(self.f_width, text="Width", style="Muted.TLabel").grid(
+            row=0, column=0, padx=(0, 6)
+        )
+        int_spin(self.f_width, self.var_width, 64, 30000, 16, 8, self.update_summary).grid(
+            row=0, column=1
+        )
         ttk.Label(self.f_width, text="px", style="Muted.TLabel").grid(row=0, column=2, padx=(6, 0))
         self.f_height = ttk.Frame(self.target_box, style="Card.TFrame")
-        ttk.Label(self.f_height, text="Height", style="Muted.TLabel").grid(row=0, column=0, padx=(12, 6))
-        int_spin(self.f_height, self.var_height, 64, 30000, 16, 8, self.update_summary).grid(row=0, column=1)
+        ttk.Label(self.f_height, text="Height", style="Muted.TLabel").grid(
+            row=0, column=0, padx=(12, 6)
+        )
+        int_spin(self.f_height, self.var_height, 64, 30000, 16, 8, self.update_summary).grid(
+            row=0, column=1
+        )
         ttk.Label(self.f_height, text="px", style="Muted.TLabel").grid(row=0, column=2, padx=(6, 0))
 
         # Fit mode also offers the original fork's display-device list, so a
         # chapter can be sized for a specific reader in one click.
         self.f_fit = ttk.Frame(self.target_box, style="Card.TFrame")
-        ttk.Label(self.f_fit, text="Device", style="Muted.TLabel").grid(row=0, column=0, padx=(0, 6))
-        self.cb_display = combo(self.f_fit, self.var_display, displays.labels(), width=30,
-                                on_change=self.on_display_change)
+        ttk.Label(self.f_fit, text="Device", style="Muted.TLabel").grid(
+            row=0, column=0, padx=(0, 6)
+        )
+        self.cb_display = combo(
+            self.f_fit,
+            self.var_display,
+            displays.labels(),
+            width=30,
+            on_change=self.on_display_change,
+        )
         self.cb_display.grid(row=0, column=1)
-        Segmented(self.f_fit, self.var_portrait,
-                  [("Portrait", True), ("Landscape", False)],
-                  command=lambda _v: self.on_display_change()).grid(row=0, column=2, padx=(10, 0))
+        Segmented(
+            self.f_fit,
+            self.var_portrait,
+            [("Portrait", True), ("Landscape", False)],
+            command=lambda _v: self.on_display_change(),
+        ).grid(row=0, column=2, padx=(10, 0))
 
         # Page kind comes before the models, because it decides how many
         # models the run needs.
-        row_label(b, 2, "Pages", "Grayscale detection sorts every page into gray or colour "
-                                 "and sends it to the matching model.", self.theme)
+        row_label(
+            b,
+            2,
+            "Pages",
+            "Grayscale detection sorts every page into gray or colour "
+            "and sends it to the matching model.",
+            self.theme,
+        )
         kinds = ttk.Frame(b, style="Card.TFrame")
         kinds.grid(row=2, column=1, sticky="w", pady=4)
-        c1 = ttk.Checkbutton(kinds, text="Grayscale detection", variable=self.var_gray,
-                             command=self.on_gray_toggle)
+        c1 = ttk.Checkbutton(
+            kinds, text="Grayscale detection", variable=self.var_gray, command=self.on_gray_toggle
+        )
         c1.grid(row=0, column=0, sticky="w")
-        Tooltip(c1, "Detects effectively grayscale pages, converts them to 1 channel, uses "
-                    "the dot-gain aware downscale for them \u2014 and picks the grayscale "
-                    "model instead of the colour one.", self.theme)
-        c2 = ttk.Checkbutton(kinds, text="Auto levels", variable=self.var_levels,
-                             command=self.update_summary)
+        Tooltip(
+            c1,
+            "Detects effectively grayscale pages, converts them to 1 channel, uses "
+            "the dot-gain aware downscale for them \u2014 and picks the grayscale "
+            "model instead of the colour one.",
+            self.theme,
+        )
+        c2 = ttk.Checkbutton(
+            kinds, text="Auto levels", variable=self.var_levels, command=self.update_summary
+        )
         c2.grid(row=0, column=1, sticky="w", padx=(18, 0))
-        Tooltip(c2, "Stretches black and white points on grayscale pages before upscaling. "
-                    "Colour pages are never touched by this.", self.theme)
+        Tooltip(
+            c2,
+            "Stretches black and white points on grayscale pages before upscaling. "
+            "Colour pages are never touched by this.",
+            self.theme,
+        )
 
         self.models_box = ttk.Frame(b, style="Card.TFrame")
         self.models_box.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.models_box.columnconfigure(1, weight=1)
         self.lbl_model = ttk.Label(self.models_box, text="Model", style="Card.TLabel")
         self.lbl_model.grid(row=0, column=0, sticky="w", padx=(0, 12), pady=4)
-        self.cb_model = combo(self.models_box, self.var_model, [AUTO_MODEL], width=44,
-                              on_change=self.update_summary)
+        self.cb_model = combo(
+            self.models_box, self.var_model, [AUTO_MODEL], width=44, on_change=self.update_summary
+        )
         self.cb_model.grid(row=0, column=1, sticky="w", pady=4)
-        self.lbl_model_gray = ttk.Label(self.models_box, text="Grayscale pages",
-                                        style="Card.TLabel")
-        self.cb_model_gray = combo(self.models_box, self.var_model_gray, [AUTO_MODEL], width=44,
-                                   on_change=self.update_summary)
-        self.lbl_models_hint = ttk.Label(self.models_box, text="", style="Muted.TLabel",
-                                         wraplength=620, justify="left")
-        self.lbl_model_warn = ttk.Label(self.models_box, text="", style="Warn.TLabel",
-                                        wraplength=620, justify="left")
+        self.lbl_model_gray = ttk.Label(
+            self.models_box, text="Grayscale pages", style="Card.TLabel"
+        )
+        self.cb_model_gray = combo(
+            self.models_box,
+            self.var_model_gray,
+            [AUTO_MODEL],
+            width=44,
+            on_change=self.update_summary,
+        )
+        self.lbl_models_hint = ttk.Label(
+            self.models_box, text="", style="Muted.TLabel", wraplength=620, justify="left"
+        )
+        self.lbl_model_warn = ttk.Label(
+            self.models_box, text="", style="Warn.TLabel", wraplength=620, justify="left"
+        )
+
+        # Rules replace the old hidden "auto": each row says what a page has to
+        # look like and which model it gets. First match wins, and a row that
+        # names a size beats a row that says "any" wherever it sits.
+        self.rules_box = ttk.Frame(b, style="Card.TFrame")
+        self.rules_box.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        self.rules_box.columnconfigure(0, weight=1)
+
+        rules_head = ttk.Frame(self.rules_box, style="Card.TFrame")
+        rules_head.grid(row=0, column=0, sticky="ew")
+        rules_head.columnconfigure(1, weight=1)
+        cr = ttk.Checkbutton(
+            rules_head, text="Rules", variable=self.var_rules_on, command=self.on_rules_toggle
+        )
+        cr.grid(row=0, column=0, sticky="w")
+        Tooltip(
+            cr,
+            "Per-page selection: page kind, target scale and page size decide the "
+            "model and whether grayscale pages get auto levels. Pages that match "
+            "no rule fall back to the two models above.",
+            self.theme,
+        )
+        ttk.Label(
+            rules_head,
+            text="first match wins \u00b7 a rule with sizes beats a rule with \u201cany\u201d",
+            style="Muted.TLabel",
+        ).grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        table = ttk.Frame(self.rules_box, style="Card.TFrame")
+        table.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        table.columnconfigure(0, weight=1)
+        self.tree_rules = ttk.Treeview(
+            table,
+            columns=("when", "size", "model", "levels"),
+            show="headings",
+            height=7,
+            selectmode="browse",
+            style="Rules.Treeview",
+        )
+        for key, head, width, anchor in (
+            ("when", "When", 150, "w"),
+            ("size", "Page size", 120, "w"),
+            ("model", "Model", 430, "w"),
+            ("levels", "Levels", 64, "center"),
+        ):
+            self.tree_rules.heading(key, text=head)
+            self.tree_rules.column(key, width=width, anchor=anchor, stretch=(key == "model"))
+        self.tree_rules.grid(row=0, column=0, sticky="ew")
+        self.tree_rules.bind("<Double-1>", lambda _e: self.rule_edit())
+
+        side = ttk.Frame(table, style="Card.TFrame")
+        side.grid(row=0, column=1, sticky="n", padx=(10, 0))
+        self.rule_buttons: list[ttk.Button] = []
+        for index, (text, action) in enumerate(
+            (
+                ("Add", self.rule_add),
+                ("Edit", self.rule_edit),
+                ("Remove", self.rule_remove),
+                ("Up", lambda: self.rule_move(-1)),
+                ("Down", lambda: self.rule_move(1)),
+                ("Defaults", self.rules_reset),
+            )
+        ):
+            button = ttk.Button(side, text=text, style="Ghost.TButton", command=action)
+            button.grid(row=index, column=0, sticky="ew", pady=(0 if index == 0 else 4, 0))
+            self.rule_buttons.append(button)
+        Tooltip(
+            self.rule_buttons[-1],
+            "Rewrite the table as the shipped working set, built "
+            "from the models you actually have installed.",
+            self.theme,
+        )
+
+        self.lbl_rules_hint = ttk.Label(
+            self.rules_box, text="", style="Muted.TLabel", wraplength=760, justify="left"
+        )
+        self.lbl_rules_hint.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.lbl_rules_warn = ttk.Label(
+            self.rules_box, text="", style="Warn.TLabel", wraplength=760, justify="left"
+        )
 
         adv = ttk.Frame(b, style="Card.TFrame")
-        adv.grid(row=4, column=1, sticky="w", pady=(10, 0))
+        adv.grid(row=5, column=1, sticky="w", pady=(10, 0))
         ttk.Label(adv, text="Gray threshold", style="Muted.TLabel").grid(row=0, column=0)
         sp = int_spin(adv, self.var_threshold, 0, 64, 1, 5, self.update_summary)
         sp.grid(row=0, column=1, padx=(8, 16))
-        Tooltip(sp, "How much colour a page may carry and still count as grayscale. 12 is "
-                    "the original default.", self.theme)
+        Tooltip(
+            sp,
+            "How much colour a page may carry and still count as grayscale. 12 is "
+            "the original default.",
+            self.theme,
+        )
         ttk.Label(adv, text="Colour pixels %", style="Muted.TLabel").grid(row=0, column=2)
         sp3 = int_spin(adv, self.var_colour_pct, 0.0, 25.0, 0.05, 6, self.update_summary)
         sp3.grid(row=0, column=3, padx=(8, 16))
-        Tooltip(sp3, "Second opinion: a page is colour as soon as this percentage of its "
-                     "pixels are clearly coloured, even if the average looks gray. "
-                     "Catches spot colour on otherwise black-and-white pages.", self.theme)
+        Tooltip(
+            sp3,
+            "Second opinion: a page is colour as soon as this percentage of its "
+            "pixels are clearly coloured, even if the average looks gray. "
+            "Catches spot colour on otherwise black-and-white pages.",
+            self.theme,
+        )
         ttk.Label(adv, text="Pre-downscale height", style="Muted.TLabel").grid(row=0, column=4)
         sp2 = int_spin(adv, self.var_pre_h, 0, 20000, 100, 7, self.update_summary)
         sp2.grid(row=0, column=5, padx=(8, 0))
-        Tooltip(sp2, "0 = off. Shrinks very large scans to this height before the model runs: "
-                     "much faster, and often cleaner on oversized raws.", self.theme)
-        c3 = ttk.Checkbutton(adv, text="Pass through huge long strips",
-                             variable=self.var_skip_long, command=self.update_summary)
+        Tooltip(
+            sp2,
+            "0 = off. Shrinks very large scans to this height before the model runs: "
+            "much faster, and often cleaner on oversized raws.",
+            self.theme,
+        )
+        c3 = ttk.Checkbutton(
+            adv,
+            text="Pass through huge long strips",
+            variable=self.var_skip_long,
+            command=self.update_summary,
+        )
         c3.grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 0))
-        Tooltip(c3, "Webtoon-style mega strips \u2014 very tall and already huge \u2014 are "
-                    "copied straight through in the chosen output format instead of being "
-                    "upscaled. Off by default: the adaptive tiler handles them fine, so "
-                    "this is only for when you want the conversion and nothing else.",
-                self.theme)
+        Tooltip(
+            c3,
+            "Webtoon-style mega strips \u2014 very tall and already huge \u2014 are "
+            "copied straight through in the chosen output format instead of being "
+            "upscaled. Off by default: the adaptive tiler handles them fine, so "
+            "this is only for when you want the conversion and nothing else.",
+            self.theme,
+        )
 
-        self.lbl_upscale_sum = ttk.Label(b, text="", style="Muted.TLabel", wraplength=620,
-                                         justify="left")
-        self.lbl_upscale_sum.grid(row=5, column=1, sticky="w", pady=(10, 0))
+        self.lbl_upscale_sum = ttk.Label(
+            b, text="", style="Muted.TLabel", wraplength=620, justify="left"
+        )
+        self.lbl_upscale_sum.grid(row=6, column=1, sticky="w", pady=(10, 0))
 
     def _build_output(self, body: tk.Misc) -> None:
         card = Card(body, "3 \u00b7 Output")
@@ -453,36 +667,44 @@ class App:
 
         row_label(b, 0, "Format", "The encoder used for every page.", self.theme)
         self.seg_fmt = Segmented(
-            b, self.var_fmt,
+            b,
+            self.var_fmt,
             [(FORMATS[fid].label, fid) for fid in FORMAT_IDS],
             command=lambda _v: self.on_format_change(),
         )
         self.seg_fmt.grid(row=0, column=1, sticky="w", pady=4)
 
-        self.lbl_fmt_hint = ttk.Label(b, text="", style="Muted.TLabel", wraplength=560,
-                                      justify="left")
+        self.lbl_fmt_hint = ttk.Label(
+            b, text="", style="Muted.TLabel", wraplength=560, justify="left"
+        )
         self.lbl_fmt_hint.grid(row=1, column=1, sticky="w", pady=(0, 6))
 
         self.opt_frame = ttk.Frame(b, style="Card.TFrame")
         self.opt_frame.grid(row=2, column=1, sticky="ew")
         self.opt_frame.columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(b, text="Show advanced encoder options", variable=self.var_adv,
-                        command=self.render_format_options).grid(row=3, column=1, sticky="w",
-                                                                 pady=(6, 10))
+        ttk.Checkbutton(
+            b,
+            text="Show advanced encoder options",
+            variable=self.var_adv,
+            command=self.render_format_options,
+        ).grid(row=3, column=1, sticky="w", pady=(6, 10))
 
         ttk.Separator(b).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(2, 10))
 
-        row_label(b, 5, "Package", "Loose files, or pack the pages into comic archives.",
-                  self.theme)
+        row_label(
+            b, 5, "Package", "Loose files, or pack the pages into comic archives.", self.theme
+        )
         self.seg_container = Segmented(
-            b, self.var_container,
+            b,
+            self.var_container,
             [(CONTAINERS[cid].label, cid) for cid in CONTAINER_IDS],
             command=lambda _v: self.on_container_change(),
         )
         self.seg_container.grid(row=5, column=1, sticky="w", pady=4)
-        self.lbl_container_hint = ttk.Label(b, text="", style="Muted.TLabel", wraplength=620,
-                                            justify="left")
+        self.lbl_container_hint = ttk.Label(
+            b, text="", style="Muted.TLabel", wraplength=620, justify="left"
+        )
         self.lbl_container_hint.grid(row=6, column=1, sticky="w", pady=(0, 8))
 
         ttk.Separator(b).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(2, 10))
@@ -491,8 +713,12 @@ class App:
         dest = ttk.Frame(b, style="Card.TFrame")
         dest.grid(row=8, column=1, sticky="ew", pady=2)
         dest.columnconfigure(1, weight=1)
-        ttk.Checkbutton(dest, text="Next to the input, in subfolder", variable=self.var_same,
-                        command=self.on_dest_change).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            dest,
+            text="Next to the input, in subfolder",
+            variable=self.var_same,
+            command=self.on_dest_change,
+        ).grid(row=0, column=0, sticky="w")
         self.e_sub = ttk.Entry(dest, textvariable=self.var_subfolder, width=18)
         self.e_sub.grid(row=0, column=1, sticky="w", padx=(8, 0))
         self.e_sub.bind("<KeyRelease>", lambda _e: self.update_summary(), add="+")
@@ -503,8 +729,12 @@ class App:
         self.e_out = ttk.Entry(self.dest_custom, textvariable=self.var_out_dir)
         self.e_out.grid(row=0, column=0, sticky="ew")
         self.e_out.bind("<KeyRelease>", lambda _e: self.update_summary(), add="+")
-        ttk.Button(self.dest_custom, text="Browse\u2026", style="Ghost.TButton",
-                   command=self.choose_out_dir).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(
+            self.dest_custom,
+            text="Browse\u2026",
+            style="Ghost.TButton",
+            command=self.choose_out_dir,
+        ).grid(row=0, column=1, padx=(8, 0))
 
         self.lbl_names = row_label(b, 10, "File names", "", self.theme)
         names = ttk.Frame(b, style="Card.TFrame")
@@ -513,89 +743,137 @@ class App:
         e_pat = ttk.Entry(names, textvariable=self.var_pattern)
         e_pat.grid(row=0, column=0, sticky="ew")
         e_pat.bind("<KeyRelease>", lambda _e: self.update_summary(), add="+")
-        Tooltip(e_pat, "Tokens: {name} original name, {parent} folder name, "
-                       "{index} position, {index0} zero-padded position. With a CBZ "
-                       "package this names the pages inside the archive.", self.theme)
+        Tooltip(
+            e_pat,
+            "Tokens: {name} original name, {parent} folder name, "
+            "{index} position, {index0} zero-padded position. With a CBZ "
+            "package this names the pages inside the archive.",
+            self.theme,
+        )
         flags = ttk.Frame(b, style="Card.TFrame")
         flags.grid(row=11, column=1, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(flags, text="Overwrite existing", variable=self.var_overwrite,
-                        command=self.update_summary).grid(row=0, column=0, sticky="w")
-        c = ttk.Checkbutton(flags, text="Mirror folder structure", variable=self.var_keep_tree,
-                            command=self.update_summary)
+        ttk.Checkbutton(
+            flags,
+            text="Overwrite existing",
+            variable=self.var_overwrite,
+            command=self.update_summary,
+        ).grid(row=0, column=0, sticky="w")
+        c = ttk.Checkbutton(
+            flags,
+            text="Mirror folder structure",
+            variable=self.var_keep_tree,
+            command=self.update_summary,
+        )
         c.grid(row=0, column=1, sticky="w", padx=(18, 0))
         Tooltip(c, "Recreate the input's subfolder layout inside the output folder.", self.theme)
 
-        self.lbl_out_sum = ttk.Label(b, text="", style="Muted.TLabel", wraplength=620,
-                                     justify="left")
+        self.lbl_out_sum = ttk.Label(
+            b, text="", style="Muted.TLabel", wraplength=620, justify="left"
+        )
         self.lbl_out_sum.grid(row=12, column=1, sticky="w", pady=(10, 0))
 
     def _build_perf(self, body: tk.Misc) -> None:
-        panel = Collapsible(body, "4 \u00b7 Performance", expanded=bool(
-            self.settings.data["ui"].get("perf_open", False)),
-            subtitle="device, precision, tiling, threads")
+        panel = Collapsible(
+            body,
+            "4 \u00b7 Performance",
+            expanded=bool(self.settings.data["ui"].get("perf_open", False)),
+            subtitle="device, precision, tiling, threads",
+        )
         panel.grid(row=4, column=0, sticky="ew", pady=(0, 10))
         self.panel_perf = panel
         b = panel.body
 
         row_label(b, 0, "Device", "Auto picks the fastest GPU it can find.", self.theme)
-        self.cb_device = combo(b, self.var_device, self._device_labels(), width=42,
-                               on_change=self.on_device_change)
+        self.cb_device = combo(
+            b, self.var_device, self._device_labels(), width=42, on_change=self.on_device_change
+        )
         self.cb_device.grid(row=0, column=1, sticky="w", pady=4)
 
-        self.chk_fp16 = ttk.Checkbutton(b, text="FP16 (half precision)", variable=self.var_fp16,
-                                        command=self.update_summary)
+        self.chk_fp16 = ttk.Checkbutton(
+            b, text="FP16 (half precision)", variable=self.var_fp16, command=self.update_summary
+        )
         self.chk_fp16.grid(row=1, column=1, sticky="w", pady=(2, 0))
-        Tooltip(self.chk_fp16, "On by default: roughly twice as fast and half the VRAM on "
-                               "supported GPUs. The worker falls back to FP32 by itself on "
-                               "hardware or models that cannot do it.", self.theme)
+        Tooltip(
+            self.chk_fp16,
+            "On by default: roughly twice as fast and half the VRAM on "
+            "supported GPUs. The worker falls back to FP32 by itself on "
+            "hardware or models that cannot do it.",
+            self.theme,
+        )
         self.lbl_fp16 = ttk.Label(b, text="", style="Muted.TLabel")
         self.lbl_fp16.grid(row=2, column=1, sticky="w", pady=(0, 6))
 
         row_label(b, 3, "Tile size", "Splits large images so they fit in VRAM.", self.theme)
-        cb_tile = combo(b, self.var_tile, [label for label, _ in TILE_CHOICES], width=24,
-                        on_change=self.update_summary)
+        cb_tile = combo(
+            b,
+            self.var_tile,
+            [label for label, _ in TILE_CHOICES],
+            width=24,
+            on_change=self.update_summary,
+        )
         cb_tile.grid(row=3, column=1, sticky="w", pady=4)
-        Tooltip(cb_tile, "Auto measures what the model actually costs on the first tiles and "
-                         "grows to the largest tile that fits the free VRAM \u2014 fewer, "
-                         "bigger tiles means fewer seams and less overhead.", self.theme)
+        Tooltip(
+            cb_tile,
+            "Auto measures what the model actually costs on the first tiles and "
+            "grows to the largest tile that fits the free VRAM \u2014 fewer, "
+            "bigger tiles means fewer seams and less overhead.",
+            self.theme,
+        )
 
         row_label(b, 4, "VRAM budget (GiB)", "0 = no cap.", self.theme)
         int_spin(b, self.var_budget, 0, 128, 1, 6, self.update_summary).grid(
-            row=4, column=1, sticky="w", pady=4)
+            row=4, column=1, sticky="w", pady=4
+        )
 
         row_label(b, 5, "CPU threads", "0 = let torch decide.", self.theme)
         int_spin(b, self.var_threads, 0, 256, 1, 6, self.update_summary).grid(
-            row=5, column=1, sticky="w", pady=4)
+            row=5, column=1, sticky="w", pady=4
+        )
 
-        row_label(b, 6, "I/O workers", "Threads that decode and encode while the GPU works.",
-                  self.theme)
+        row_label(
+            b, 6, "I/O workers", "Threads that decode and encode while the GPU works.", self.theme
+        )
         int_spin(b, self.var_io, 1, 16, 1, 6, self.update_summary).grid(
-            row=6, column=1, sticky="w", pady=4)
+            row=6, column=1, sticky="w", pady=4
+        )
 
         row_label(b, 7, "libvips concurrency", "0 = libvips default.", self.theme)
         int_spin(b, self.var_vips, 0, 64, 1, 6, self.update_summary).grid(
-            row=7, column=1, sticky="w", pady=4)
+            row=7, column=1, sticky="w", pady=4
+        )
 
         extra = ttk.Frame(b, style="Card.TFrame")
         extra.grid(row=8, column=1, sticky="w", pady=(8, 0))
         c1 = ttk.Checkbutton(extra, text="cuDNN autotune", variable=self.var_cudnn)
         c1.grid(row=0, column=0, sticky="w")
-        Tooltip(c1, "Benchmarks convolution algorithms once per shape. Faster for long runs "
-                    "of same-sized pages.", self.theme)
+        Tooltip(
+            c1,
+            "Benchmarks convolution algorithms once per shape. Faster for long runs "
+            "of same-sized pages.",
+            self.theme,
+        )
         c2 = ttk.Checkbutton(extra, text="TF32 matmuls", variable=self.var_tf32)
         c2.grid(row=0, column=1, sticky="w", padx=(18, 0))
         Tooltip(c2, "Ampere and newer: faster matmuls at slightly reduced precision.", self.theme)
         c3 = ttk.Checkbutton(extra, text="Wipe cache between images", variable=self.var_wipe)
         c3.grid(row=0, column=2, sticky="w", padx=(18, 0))
-        Tooltip(c3, "Frees VRAM after every image. Slower, but avoids fragmentation on "
-                    "small GPUs.", self.theme)
-        c4 = ttk.Checkbutton(extra, text="Keep GPU awake", variable=self.var_wake,
-                             command=self.on_wake_toggle)
+        Tooltip(
+            c3,
+            "Frees VRAM after every image. Slower, but avoids fragmentation on small GPUs.",
+            self.theme,
+        )
+        c4 = ttk.Checkbutton(
+            extra, text="Keep GPU awake", variable=self.var_wake, command=self.on_wake_toggle
+        )
         c4.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        Tooltip(c4, "Holds a tiny context on the GPU while this window is open, so the "
-                    "driver keeps the card powered (and a laptop dGPU does not park) and "
-                    "the first run starts at full speed. Costs a few MB of VRAM and is "
-                    "released automatically while a job runs.", self.theme)
+        Tooltip(
+            c4,
+            "Holds a tiny context on the GPU while this window is open, so the "
+            "driver keeps the card powered (and a laptop dGPU does not park) and "
+            "the first run starts at full speed. Costs a few MB of VRAM and is "
+            "released automatically while a job runs.",
+            self.theme,
+        )
 
     def _build_footer(self) -> None:
         foot = ttk.Frame(self.root, padding=(18, 8, 18, 10))
@@ -608,23 +886,32 @@ class App:
 
         left = ttk.Frame(foot)
         left.grid(row=1, column=0, sticky="w")
-        ttk.Label(left, textvariable=self.var_status, style="TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(left, textvariable=self.var_status, style="TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
         ttk.Label(left, textvariable=self.var_detail, style="MutedBg.TLabel").grid(
-            row=1, column=0, sticky="w", pady=(2, 0))
+            row=1, column=0, sticky="w", pady=(2, 0)
+        )
 
         right = ttk.Frame(foot)
         right.grid(row=1, column=1, sticky="e")
         self.btn_log = ttk.Button(right, text="Log", style="Ghost.TButton", command=self.toggle_log)
         self.btn_log.grid(row=0, column=0, padx=(0, 6))
-        self.btn_open = ttk.Button(right, text="Open output", style="Ghost.TButton",
-                                   command=self.open_output)
+        self.btn_open = ttk.Button(
+            right, text="Open output", style="Ghost.TButton", command=self.open_output
+        )
         self.btn_open.grid(row=0, column=1, padx=(0, 6))
-        self.btn_dry = ttk.Button(right, text="Dry run", style="Ghost.TButton",
-                                  command=self.start_dry)
+        self.btn_dry = ttk.Button(
+            right, text="Dry run", style="Ghost.TButton", command=self.start_dry
+        )
         self.btn_dry.grid(row=0, column=2, padx=(0, 6))
-        Tooltip(self.btn_dry, "Walks the whole job and reports every file it would write, "
-                              "the size, the model and the archives it would build \u2014 "
-                              "without touching the disk or the GPU.", self.theme)
+        Tooltip(
+            self.btn_dry,
+            "Walks the whole job and reports every file it would write, "
+            "the size, the model and the archives it would build \u2014 "
+            "without touching the disk or the GPU.",
+            self.theme,
+        )
         self.btn_pause = ttk.Button(right, text="Pause", command=self.toggle_pause)
         self.btn_pause.grid(row=0, column=3, padx=(0, 6))
         self.btn_pause.state(["disabled"])
@@ -647,32 +934,50 @@ class App:
         bar.columnconfigure(1, weight=1)
         ttk.Label(bar, text="Run log", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(bar, textvariable=self.var_log_file, style="MutedBg.TLabel").grid(
-            row=0, column=1, sticky="w", padx=(12, 12))
+            row=0, column=1, sticky="w", padx=(12, 12)
+        )
 
         tools = ttk.Frame(bar)
         tools.grid(row=0, column=2, sticky="e")
-        cw = ttk.Checkbutton(tools, text="Wrap", variable=self.var_log_wrap,
-                             command=self.apply_log_wrap)
+        cw = ttk.Checkbutton(
+            tools, text="Wrap", variable=self.var_log_wrap, command=self.apply_log_wrap
+        )
         cw.grid(row=0, column=0, padx=(0, 10))
-        cd = ttk.Checkbutton(tools, text="Debug", variable=self.var_log_debug,
-                             command=self.update_summary)
+        cd = ttk.Checkbutton(
+            tools, text="Debug", variable=self.var_log_debug, command=self.update_summary
+        )
         cd.grid(row=0, column=1, padx=(0, 10))
-        Tooltip(cd, "Show the noisy lines (library warnings, tracebacks). They are always "
-                    "written to the run file either way.", self.theme)
-        ttk.Button(tools, text="Copy", style="Ghost.TButton",
-                   command=self.copy_log).grid(row=0, column=2, padx=(0, 6))
-        ttk.Button(tools, text="Save as\u2026", style="Ghost.TButton",
-                   command=self.save_log_as).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(tools, text="Log folder", style="Ghost.TButton",
-                   command=self.open_log_folder).grid(row=0, column=4, padx=(0, 6))
-        ttk.Button(tools, text="Clear", style="Ghost.TButton",
-                   command=self.clear_log).grid(row=0, column=5, padx=(0, 6))
-        ttk.Button(tools, text="Hide", style="Ghost.TButton",
-                   command=self.toggle_log).grid(row=0, column=6)
+        Tooltip(
+            cd,
+            "Show the noisy lines (library warnings, tracebacks). They are always "
+            "written to the run file either way.",
+            self.theme,
+        )
+        ttk.Button(tools, text="Copy", style="Ghost.TButton", command=self.copy_log).grid(
+            row=0, column=2, padx=(0, 6)
+        )
+        ttk.Button(
+            tools, text="Save as\u2026", style="Ghost.TButton", command=self.save_log_as
+        ).grid(row=0, column=3, padx=(0, 6))
+        ttk.Button(
+            tools, text="Log folder", style="Ghost.TButton", command=self.open_log_folder
+        ).grid(row=0, column=4, padx=(0, 6))
+        ttk.Button(tools, text="Clear", style="Ghost.TButton", command=self.clear_log).grid(
+            row=0, column=5, padx=(0, 6)
+        )
+        ttk.Button(tools, text="Hide", style="Ghost.TButton", command=self.toggle_log).grid(
+            row=0, column=6
+        )
 
-        self.log_box = tk.Text(panel, height=10, bd=0, highlightthickness=0,
-                               wrap="word" if self.var_log_wrap.get() else "none",
-                               font=self.theme.fonts["mono"], state="disabled")
+        self.log_box = tk.Text(
+            panel,
+            height=10,
+            bd=0,
+            highlightthickness=0,
+            wrap="word" if self.var_log_wrap.get() else "none",
+            font=self.theme.fonts["mono"],
+            state="disabled",
+        )
         self.log_box.grid(row=1, column=0, sticky="nsew")
         self.log_scroll = ttk.Scrollbar(panel, orient="vertical", command=self.log_box.yview)
         self.log_scroll.grid(row=1, column=1, sticky="ns")
@@ -699,9 +1004,16 @@ class App:
     # input handling
     # ------------------------------------------------------------------ #
     def choose_file(self) -> None:
-        types = [("Images and archives", "*.png *.jpg *.jpeg *.webp *.avif *.jxl *.bmp *.tif "
-                                         "*.tiff *.gif *.cbz *.zip *.cbr *.rar"),
-                 ("All files", "*.*")]
+        types = [
+            (
+                "Images and archives",
+                (
+                    "*.png *.jpg *.jpeg *.webp *.avif *.jxl *.bmp *.tif "
+                    "*.tiff *.gif *.cbz *.zip *.cbr *.rar"
+                ),
+            ),
+            ("All files", "*.*"),
+        ]
         path = filedialog.askopenfilename(title="Choose an image or archive", filetypes=types)
         if path:
             self.set_input(path)
@@ -775,8 +1087,16 @@ class App:
                     kind = "missing"
             except Exception:
                 pass
-            self.runner.events.put({"type": "scan", "kind": kind, "images": images,
-                                    "archives": arch, "folders": len(folders), "path": path})
+            self.runner.events.put(
+                {
+                    "type": "scan",
+                    "kind": kind,
+                    "images": images,
+                    "archives": arch,
+                    "folders": len(folders),
+                    "path": path,
+                }
+            )
 
         threading.Thread(target=work, name="scan", daemon=True).start()
 
@@ -818,8 +1138,9 @@ class App:
             self.lbl_models_hint.grid(row=2, column=1, columnspan=2, sticky="w", pady=(2, 0))
             self.lbl_models_hint.configure(
                 text="Both are required: colour pages go to the first model, detected "
-                     "grayscale pages to the second. \u201cauto\u201d picks the closest "
-                     "MangaJaNai or IllustrationJaNai variant per page.")
+                "grayscale pages to the second. \u201cauto\u201d picks the closest "
+                "MangaJaNai or IllustrationJaNai variant per page."
+            )
         else:
             self.lbl_model.configure(text="Model")
             self.lbl_model_gray.grid_remove()
@@ -829,6 +1150,365 @@ class App:
 
     def on_gray_toggle(self) -> None:
         self.render_models()
+
+    # ------------------------------------------------------------------ #
+    # rules
+    # ------------------------------------------------------------------ #
+    def model_names(self) -> list[str]:
+        return [str(m.get("name")) for m in self.models if m.get("name")]
+
+    def seed_rules(self) -> None:
+        """Write the shipped working set out in full, once.
+
+        What used to be a hidden "auto" becomes rows that can be read and
+        edited, built against the models that are actually installed.
+        """
+        if self._rules_seeded or not self.models:
+            return
+        self.rules = rules.default_working_set(self.model_names())
+        self._rules_seeded = True
+        self.save_rules()
+
+    def render_rules(self) -> None:
+        """Redraw the table, its hint, and anything wrong with it."""
+        tree = self.tree_rules
+        tree.delete(*tree.get_children())
+        installed = self.model_names()
+        notes: list[str] = []
+        for index, rule in enumerate(self.rules):
+            tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=rule.columns(),
+                tags=() if rule.enabled else ("off",),
+            )
+            notes.extend(
+                f"row {index + 1}: {problem}" for problem in rules.problems(rule, installed)
+            )
+        tree.tag_configure("off", foreground=self.theme.p.muted)
+
+        on = bool(self.var_rules_on.get())
+        tree.state(["!disabled"] if on else ["disabled"])
+        for button in self.rule_buttons:
+            button.state(["!disabled"] if on else ["disabled"])
+
+        if not on:
+            hint = (
+                "Rules are off. Colour pages go to the colour model, grayscale pages to "
+                "the grayscale model."
+            )
+        elif not self.rules:
+            hint = (
+                "No rules yet. \u201cDefaults\u201d writes out the shipped working set: "
+                "MangaJaNai by page height for grayscale pages, IllustrationJaNai for "
+                "colour."
+            )
+        else:
+            active = sum(1 for r in self.rules if r.enabled)
+            hint = (
+                f"{active} of {len(self.rules)} rules active. A page that matches no rule "
+                f"falls back to the two models above."
+            )
+        self.lbl_rules_hint.configure(text=hint)
+        if on and notes:
+            self.lbl_rules_warn.configure(text="\u26a0  " + "; ".join(notes[:4]))
+            self.lbl_rules_warn.grid(row=3, column=0, sticky="w", pady=(4, 0))
+        else:
+            self.lbl_rules_warn.grid_remove()
+
+    def on_rules_toggle(self) -> None:
+        self.render_rules()
+        self.save_rules()
+        self.update_summary()
+
+    def save_rules(self) -> None:
+        """Rules are remembered as they are edited, not only on Start."""
+        self.settings.set("upscale", "rules", [r.to_dict() for r in self.rules])
+        self.settings.set("upscale", "rules_enabled", bool(self.var_rules_on.get()))
+        self.settings.save()
+
+    def selected_rule(self) -> int:
+        chosen = self.tree_rules.selection()
+        return int(chosen[0]) if chosen else -1
+
+    def rules_changed(self, select: int = -1) -> None:
+        self.render_rules()
+        if 0 <= select < len(self.rules):
+            self.tree_rules.selection_set(str(select))
+        self.save_rules()
+        self.update_summary()
+
+    def rule_add(self) -> None:
+        draft = rules.Rule(
+            kind=rules.GRAYSCALE, scale=self.safe_float(self.var_scale, 2.0), auto_levels=True
+        )
+        made = self.rule_dialog("Add rule", draft)
+        if made is not None:
+            self.rules.append(made)
+            self.rules_changed(len(self.rules) - 1)
+
+    def rule_edit(self) -> None:
+        index = self.selected_rule()
+        if index < 0:
+            return
+        made = self.rule_dialog("Edit rule", self.rules[index])
+        if made is not None:
+            self.rules[index] = made
+            self.rules_changed(index)
+
+    def rule_remove(self) -> None:
+        index = self.selected_rule()
+        if index < 0:
+            return
+        del self.rules[index]
+        self.rules_changed(min(index, len(self.rules) - 1))
+
+    def rule_move(self, delta: int) -> None:
+        index = self.selected_rule()
+        if index < 0:
+            return
+        self.rules = rules.move(self.rules, index, delta)
+        self.rules_changed(max(0, min(index + delta, len(self.rules) - 1)))
+
+    def rules_reset(self) -> None:
+        if self.rules and not messagebox.askyesno(
+            "Replace rules",
+            "Replace the current rules with the shipped working set?",
+            parent=self.root,
+        ):
+            return
+        self.rules = rules.default_working_set(self.model_names())
+        self._rules_seeded = True
+        self.rules_changed(0)
+
+    def rule_dialog(self, title: str, draft: rules.Rule) -> rules.Rule | None:
+        """A small modal editor for one rule."""
+        scales = {"any": 0.0, "1x": 1.0, "2x": 2.0, "4x": 4.0}
+        levels: dict[str, bool | None] = {"inherit": None, "on": True, "off": False}
+
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.transient(self.root)
+        win.resizable(False, False)
+        box = ttk.Frame(win, padding=16)
+        box.grid(row=0, column=0, sticky="nsew")
+
+        v_kind = tk.StringVar(value=draft.kind)
+        v_scale = tk.StringVar(
+            value=next((k for k, v in scales.items() if v == draft.scale), "any")
+        )
+        v_width = tk.StringVar(value=draft.width)
+        v_height = tk.StringVar(value=draft.height)
+        v_model = tk.StringVar(value=draft.model)
+        v_levels = tk.StringVar(value=next(k for k, v in levels.items() if v is draft.auto_levels))
+        v_on = tk.BooleanVar(value=draft.enabled)
+
+        fields = (
+            ("Page kind", combo(box, v_kind, list(rules.KINDS), width=16)),
+            ("Target scale", combo(box, v_scale, list(scales), width=16)),
+            ("Page width", ttk.Entry(box, textvariable=v_width, width=18)),
+            ("Page height", ttk.Entry(box, textvariable=v_height, width=18)),
+            ("Model", combo(box, v_model, [AUTO_MODEL, *self.model_names()], width=54)),
+            ("Auto levels", combo(box, v_levels, list(levels), width=16)),
+        )
+        for row, (label, widget) in enumerate(fields):
+            ttk.Label(box, text=label, style="MutedBg.TLabel").grid(
+                row=row, column=0, sticky="w", padx=(0, 14), pady=4
+            )
+            widget.grid(row=row, column=1, sticky="w", pady=4)
+        ttk.Label(
+            box,
+            text="Sizes take 1920, 1600-1920, 1985-, -1250 or any. Auto levels "
+            "only ever touches grayscale pages.",
+            style="MutedBg.TLabel",
+            wraplength=430,
+            justify="left",
+        ).grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(box, text="Enabled", variable=v_on).grid(
+            row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+
+        out: dict[str, rules.Rule] = {}
+
+        def commit() -> None:
+            out["rule"] = rules.Rule.from_dict(
+                {
+                    "kind": v_kind.get(),
+                    "scale": scales.get(v_scale.get(), 0.0),
+                    "width": v_width.get(),
+                    "height": v_height.get(),
+                    "model": v_model.get(),
+                    "auto_levels": levels[v_levels.get()],
+                    "enabled": bool(v_on.get()),
+                    "note": draft.note,
+                }
+            )
+            win.destroy()
+
+        bar = ttk.Frame(box)
+        bar.grid(row=len(fields) + 2, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(bar, text="Cancel", style="Ghost.TButton", command=win.destroy).grid(
+            row=0, column=0, padx=(0, 8)
+        )
+        ttk.Button(bar, text="Save", style="Accent.TButton", command=commit).grid(row=0, column=1)
+        win.bind("<Return>", lambda _e: commit())
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+        win.update_idletasks()
+        win.geometry(f"+{self.root.winfo_rootx() + 90}+{self.root.winfo_rooty() + 100}")
+        win.grab_set()
+        self.root.wait_window(win)
+        return out.get("rule")
+
+    # ------------------------------------------------------------------ #
+    # presets
+    # ------------------------------------------------------------------ #
+    def preset_menu(self) -> None:
+        """Save, load, or jump straight to a preset already saved."""
+        p = self.theme.p
+        menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            borderwidth=0,
+            activeborderwidth=0,
+            background=p.surface2,
+            foreground=p.text,
+            activebackground=p.accent,
+            activeforeground=p.accent_text,
+        )
+        menu.add_command(label="Save current settings\u2026", command=self.preset_save)
+        menu.add_command(label="Load from file\u2026", command=self.preset_load)
+        saved = presets.available(self.dir)
+        if saved:
+            menu.add_separator()
+            for name, path in saved:
+                menu.add_command(label=name, command=lambda target=path: self.preset_apply(target))
+        try:
+            menu.tk_popup(
+                self.btn_presets.winfo_rootx(),
+                self.btn_presets.winfo_rooty() + self.btn_presets.winfo_height(),
+            )
+        finally:
+            menu.grab_release()
+
+    def preset_save(self) -> None:
+        self.sync_settings()
+        name = simpledialog.askstring(
+            "Save preset", "Name this preset:", parent=self.root, initialvalue="My settings"
+        )
+        if not name:
+            return
+        payload = presets.build(name, self.settings.data, app_version=__version__)
+        try:
+            written = presets.write(presets.folder(self.dir) / presets.filename(name), payload)
+        except OSError as exc:
+            self.show_banner(f"Could not write the preset: {exc}")
+            return
+        self.settings.save()
+        self.log(f"preset saved: {written.name}  \u00b7  {presets.summary(payload)}")
+
+    def preset_load(self) -> None:
+        start = presets.folder(self.dir)
+        chosen = filedialog.askopenfilename(
+            parent=self.root,
+            title="Load preset",
+            initialdir=str(start if start.is_dir() else self.dir),
+            filetypes=[("JaNai preset", "*.json"), ("All files", "*.*")],
+        )
+        if chosen:
+            self.preset_apply(Path(chosen))
+
+    def preset_apply(self, path: Path) -> None:
+        try:
+            preset = presets.read(path)
+        except presets.PresetError as exc:
+            self.show_banner(str(exc))
+            return
+        self.sync_settings()  # so untouched sections survive the merge
+        changed = presets.apply(self.settings.data, preset)
+        self.reload_widgets()
+        name = str(preset.get("name") or path.stem)
+        if changed:
+            self.hide_banner()
+            self.log(f"preset applied: {name}  \u00b7  {', '.join(changed)}")
+        else:
+            self.log(f"preset {name} already matches the current settings")
+
+    def reload_widgets(self) -> None:
+        """Push the settings dict back into the widgets, after a preset.
+
+        The device and the folders are deliberately left alone: a preset
+        describes how to convert, not where this machine keeps things.
+        """
+        d = self.settings.data
+        u, o, p = d["upscale"], d["output"], d["perf"]
+        lg = d.get("log") or {}
+
+        self.var_mode.set(str(u.get("mode", "scale")))
+        self.var_scale.set(float(u.get("scale", 2.0)))
+        self.var_width.set(int(u.get("width", 2048)))
+        self.var_height.set(int(u.get("height", 2160)))
+        self.var_display.set(displays.label_for_id(str(u.get("display", displays.CUSTOM))))
+        self.var_portrait.set(bool(u.get("display_portrait", True)))
+        self.var_model.set(str(u.get("model", AUTO_MODEL)))
+        self.var_model_gray.set(str(u.get("model_gray", AUTO_MODEL)))
+        self.var_levels.set(bool(u.get("auto_levels", True)))
+        self.var_gray.set(bool(u.get("grayscale_convert", True)))
+        self.var_threshold.set(int(u.get("grayscale_threshold", 12)))
+        self.var_colour_pct.set(float(u.get("grayscale_colour_percent", 0.25)))
+        self.var_pre_h.set(int(u.get("pre_downscale_height", 0)))
+        self.var_skip_long.set(bool(u.get("skip_long_strips", False)))
+        self.var_rules_on.set(bool(u.get("rules_enabled", True)))
+        self.rules = [rules.Rule.from_dict(r) for r in (u.get("rules") or [])]
+        self._rules_seeded = bool(self.rules)
+
+        self.var_container.set(str(o.get("container", "files")))
+        self.var_same.set(bool(o.get("same_as_input", True)))
+        self.var_subfolder.set(str(o.get("subfolder", "upscaled")))
+        self.var_pattern.set(str(o.get("pattern", "{name}")))
+        self.var_overwrite.set(bool(o.get("overwrite", False)))
+        self.var_keep_tree.set(bool(o.get("keep_structure", True)))
+
+        self.var_fmt.set(str(d["format"].get("id", "png")))
+        for fid, spec in FORMATS.items():
+            saved = self.settings.format_options(fid)
+            for opt in spec.opts:
+                var = self.fmt_vars.get(fid, {}).get(opt.key)
+                if var is None:
+                    continue
+                value = saved.get(opt.key, opt.default)
+                if opt.kind == "bool":
+                    var.set(bool(value))
+                elif opt.kind == "int":
+                    var.set(int(value))
+                elif opt.kind == "float":
+                    var.set(float(value))
+                else:
+                    var.set(choice_label(opt, value))
+
+        self.var_fp16.set(bool(p.get("use_fp16", True)))
+        self.var_tile.set(self._tile_label(str(p.get("tile", "auto"))))
+        self.var_budget.set(int(p.get("budget_limit", 0)))
+        self.var_wipe.set(bool(p.get("force_cache_wipe", False)))
+        self.var_threads.set(int(p.get("torch_threads", 0)))
+        self.var_io.set(int(p.get("io_workers", 2)))
+        self.var_vips.set(int(p.get("vips_concurrency", 0)))
+        self.var_cudnn.set(bool(p.get("cudnn_benchmark", False)))
+        self.var_tf32.set(bool(p.get("allow_tf32", True)))
+        self.var_wake.set(bool(p.get("gpu_wake_lock", True)))
+        self.var_log_wrap.set(bool(lg.get("wrap", False)))
+        self.var_log_debug.set(bool(lg.get("show_debug", False)))
+
+        self.render_format_options()
+        self.render_target()
+        self.render_models()
+        self.render_rules()
+        self.apply_log_wrap()
+        self.update_summary()
+        self.update_start_state()
+        self.update_wake_lock()
+        self.settings.save()
 
     def on_container_change(self) -> None:
         self.update_summary()
@@ -859,9 +1539,10 @@ class App:
             hint = f"Not available in this install \u2014 {cap.get('reason', 'unsupported')}"
         elif cap.get("via") and cap.get("via") != "libvips":
             hint = f"{spec.hint}  (encoded with {cap['via']})"
-        self.lbl_fmt_hint.configure(text=hint,
-                                    style="Err.TLabel" if (self.caps and not cap.get("ok", False))
-                                    else "Muted.TLabel")
+        self.lbl_fmt_hint.configure(
+            text=hint,
+            style="Err.TLabel" if (self.caps and not cap.get("ok", False)) else "Muted.TLabel",
+        )
 
         row = 0
         hidden_adv = False
@@ -875,11 +1556,19 @@ class App:
             var = self.fmt_vars[fid][opt.key]
             if opt.kind == "bool":
                 w: tk.Widget = ttk.Checkbutton(
-                    self.opt_frame, text="", variable=var,
-                    command=lambda: self.on_opt_change(rerender=True))
+                    self.opt_frame,
+                    text="",
+                    variable=var,
+                    command=lambda: self.on_opt_change(rerender=True),
+                )
             elif opt.kind == "choice":
-                w = combo(self.opt_frame, var, [lbl for lbl, _ in opt.choices], width=26,
-                          on_change=lambda: self.on_opt_change(rerender=True))
+                w = combo(
+                    self.opt_frame,
+                    var,
+                    [lbl for lbl, _ in opt.choices],
+                    width=26,
+                    on_change=lambda: self.on_opt_change(rerender=True),
+                )
             else:
                 step = opt.step or (0.1 if opt.kind == "float" else 1)
                 w = int_spin(self.opt_frame, var, opt.lo, opt.hi, step, 8, self.update_summary)
@@ -889,7 +1578,8 @@ class App:
             row += 1
         if hidden_adv and not show_adv:
             ttk.Label(self.opt_frame, text="More options are hidden", style="Muted.TLabel").grid(
-                row=row, column=1, sticky="w", pady=(4, 0))
+                row=row, column=1, sticky="w", pady=(4, 0)
+            )
         self.update_summary()
 
     def format_values(self, fid: str) -> dict:
@@ -943,8 +1633,9 @@ class App:
             supported = bool(dev.get("fp16")) and str(dev.get("value")) != "cpu"
             self.chk_fp16.state(["!disabled"] if supported else ["disabled"])
             if not supported and self.var_fp16.get():
-                note = ("this device runs FP32 \u2014 the preference is kept for GPUs "
-                        "that support it")
+                note = (
+                    "this device runs FP32 \u2014 the preference is kept for GPUs that support it"
+                )
             elif supported and self.var_fp16.get():
                 note = "half precision on"
         self.lbl_fp16.configure(text=note)
@@ -1014,6 +1705,9 @@ class App:
             bits.append(f"gray: {self.var_model_gray.get() or dash}")
         else:
             bits.append(f"model: {self.var_model.get() or dash}")
+        if self.var_rules_on.get() and self.rules:
+            active = sum(1 for r in self.rules if r.enabled)
+            bits.append(f"{active} rule{'' if active == 1 else 's'}")
         if self.var_levels.get():
             bits.append("auto levels")
         if self.safe_int(self.var_pre_h, 0):
@@ -1068,8 +1762,9 @@ class App:
         if notes:
             self.lbl_model_warn.configure(
                 text="\u26a0  " + "; ".join(notes) + ". The output gets resampled to the "
-                     "target, which throws away detail \u2014 pick a matching model or "
-                     "change the scale.")
+                "target, which throws away detail \u2014 pick a matching model or "
+                "change the scale."
+            )
             self.lbl_model_warn.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
         else:
             self.lbl_model_warn.grid_remove()
@@ -1107,8 +1802,11 @@ class App:
     def update_start_state(self) -> None:
         ok = bool(self.var_in_path.get().strip()) and self.resolved_out_dir() is not None
         if self.var_gray.get():
-            ok = ok and bool(self.var_model.get().strip()) and \
-                bool(self.var_model_gray.get().strip())
+            ok = (
+                ok
+                and bool(self.var_model.get().strip())
+                and bool(self.var_model_gray.get().strip())
+            )
         if self.runner.running:
             self.btn_start.configure(text="Cancel", style="TButton", command=self.cancel)
             self.btn_start.state(["!disabled"])
@@ -1166,8 +1864,10 @@ class App:
         if ev.get("ok"):
             held = int(ev.get("reserved") or 0)
             where = str(ev.get("name") or ev.get("device") or "GPU")
-            self.log(f"GPU wake lock on {where}"
-                     + (f" ({fmt_bytes(held)} reserved)" if held else ""), "debug")
+            self.log(
+                f"GPU wake lock on {where}" + (f" ({fmt_bytes(held)} reserved)" if held else ""),
+                "debug",
+            )
         else:
             self.log(f"GPU wake lock unavailable: {ev.get('error', 'unknown reason')}", "warn")
 
@@ -1194,8 +1894,9 @@ class App:
 
         labels = self._device_labels()
         if self.var_device.get() not in labels:
-            match = next((d for d in self.devices
-                          if str(d.get("value")) == self._saved_device), None)
+            match = next(
+                (d for d in self.devices if str(d.get("value")) == self._saved_device), None
+            )
             self.var_device.set(str(match["label"]) if match else AUTO_DEVICE)
             labels = self._device_labels()
         self.cb_device.configure(values=labels)
@@ -1208,26 +1909,37 @@ class App:
         if self.var_model_gray.get() not in names:
             self.var_model_gray.set(AUTO_MODEL)
 
+        # The shipped working set is built from the models actually installed,
+        # so it can only be seeded once the probe has reported them.
+        self.seed_rules()
+        self.render_rules()
+
         for fid in FORMAT_IDS:
             self.seg_fmt.set_enabled(fid, bool(self.caps.get(fid, {}).get("ok", True)))
         if not self.caps.get(self.var_fmt.get(), {}).get("ok", True):
             fallback = next((f for f in FORMAT_IDS if self.caps.get(f, {}).get("ok")), "png")
-            self.log(f"{FORMATS[self.var_fmt.get()].label} is unavailable, switching to "
-                     f"{FORMATS[fallback].label}", "warn")
+            self.log(
+                f"{FORMATS[self.var_fmt.get()].label} is unavailable, switching to "
+                f"{FORMATS[fallback].label}",
+                "warn",
+            )
             self.var_fmt.set(fallback)
 
         env_bits = []
         gpu = next((d for d in self.devices if d.get("value") != "cpu"), None)
         if gpu:
             vram = int(gpu.get("vram") or 0)
-            env_bits.append(f"{gpu.get('label')}" + (f" \u00b7 {vram / 1024 ** 3:.1f} GB" if vram else ""))
+            env_bits.append(
+                f"{gpu.get('label')}" + (f" \u00b7 {vram / 1024**3:.1f} GB" if vram else "")
+            )
             if gpu.get("fp16"):
                 env_bits.append("FP16 capable")
         else:
             env_bits.append("CPU only")
         if probe.get("torch"):
-            env_bits.append(f"torch {probe['torch']}" + (f" cu{probe.get('cuda')}"
-                                                          if probe.get("cuda") else ""))
+            env_bits.append(
+                f"torch {probe['torch']}" + (f" cu{probe.get('cuda')}" if probe.get("cuda") else "")
+            )
         if probe.get("libvips"):
             env_bits.append(f"libvips {probe['libvips']}")
         env_bits.append(f"{len(self.models)} models")
@@ -1250,7 +1962,8 @@ class App:
                 self.show_banner(
                     f"No models found in {where}. Run setup.cmd to download the model "
                     "packs, or drop .pth files there; without models images are only "
-                    "resized.")
+                    "resized."
+                )
             else:
                 self.hide_banner()
         self.on_device_change()
@@ -1294,6 +2007,8 @@ class App:
             "grayscale_colour_percent": self.safe_float(self.var_colour_pct, 0.25),
             "pre_downscale_height": self.safe_int(self.var_pre_h, 0),
             "skip_long_strips": bool(self.var_skip_long.get()),
+            "rules": [r.to_dict() for r in self.rules],
+            "rules_enabled": bool(self.var_rules_on.get()),
         }
         d["format"]["id"] = self.var_fmt.get()
         for fid in FORMATS:
@@ -1321,15 +2036,17 @@ class App:
             "gpu_wake_lock": bool(self.var_wake.get()),
         }
         log_cfg = dict(d.get("log") or {})
-        log_cfg.update({"wrap": bool(self.var_log_wrap.get()),
-                        "show_debug": bool(self.var_log_debug.get())})
+        log_cfg.update(
+            {"wrap": bool(self.var_log_wrap.get()), "show_debug": bool(self.var_log_debug.get())}
+        )
         d["log"] = log_cfg
-        d["ui"] = dict(d.get("ui") or {}, **{
-            "advanced_format": bool(self.var_adv.get()),
-            "perf_open": self.panel_perf.is_open(),
-            "log_open": self._log_visible,
-            "geometry": self.root.winfo_geometry(),
-        })
+        d["ui"] = dict(
+            d.get("ui") or {},
+            advanced_format=bool(self.var_adv.get()),
+            perf_open=self.panel_perf.is_open(),
+            log_open=self._log_visible,
+            geometry=self.root.winfo_geometry(),
+        )
 
     def build_job(self, dry: bool = False) -> dict | None:
         self.sync_settings()
@@ -1346,10 +2063,13 @@ class App:
         if self.caps and not self.caps.get(fid, {}).get("ok", False):
             self.show_banner(f"{FORMATS[fid].label} cannot be written in this install.")
             return None
-        if d["upscale"]["grayscale_convert"] and not (d["upscale"]["model"]
-                                                     and d["upscale"]["model_gray"]):
-            self.show_banner("Grayscale detection needs two models: one for colour pages "
-                             "and one for grayscale pages.")
+        if d["upscale"]["grayscale_convert"] and not (
+            d["upscale"]["model"] and d["upscale"]["model_gray"]
+        ):
+            self.show_banner(
+                "Grayscale detection needs two models: one for colour pages "
+                "and one for grayscale pages."
+            )
             return None
         self.hide_banner()
         job = {
@@ -1439,15 +2159,19 @@ class App:
         elif kind == "probe_error":
             self.btn_refresh.state(["!disabled"])
             self.lbl_env.configure(text="backend not ready")
-            self.show_banner("The Python backend is not ready. Run setup.cmd in this folder "
-                             f"to create it.\n{ev.get('message', '')}".strip())
+            self.show_banner(
+                "The Python backend is not ready. Run setup.cmd in this folder "
+                f"to create it.\n{ev.get('message', '')}".strip()
+            )
         elif kind == "start":
             self.total = int(ev.get("total") or 0)
             self.dry = bool(ev.get("dry")) or self.dry
             self.var_status.set(("Planning 0/" if self.dry else "Upscaling 0/") + str(self.total))
-            self.var_detail.set(f"{ev.get('device')} \u00b7 "
-                                f"{'FP16' if ev.get('fp16') else 'FP32'} \u00b7 "
-                                f"tile {ev.get('tile')}")
+            self.var_detail.set(
+                f"{ev.get('device')} \u00b7 "
+                f"{'FP16' if ev.get('fp16') else 'FP32'} \u00b7 "
+                f"tile {ev.get('tile')}"
+            )
             for text, level in format_start(ev):
                 self.log(text, level)
         elif kind == "progress":
@@ -1490,7 +2214,9 @@ class App:
         if folders > 1:
             parts.append(f"{folders} folders")
         self.scan_text = ", ".join(parts) or "nothing to do"
-        self.card_input.set_badge(("Single" if kind == "single" else "Bulk") + " \u00b7 " + self.scan_text)
+        self.card_input.set_badge(
+            ("Single" if kind == "single" else "Bulk") + " \u00b7 " + self.scan_text
+        )
         self.update_summary()
 
     def on_progress(self, ev: dict) -> None:
@@ -1557,37 +2283,53 @@ class App:
     def begin_run_log(self, job: dict, dry: bool) -> None:
         u, o, p = job["upscale"], job["output"], job["perf"]
         fid = job["format"]["id"]
-        models = (f"colour={u.get('model')} gray={u.get('model_gray')}"
-                  if u.get("grayscale_convert") else f"model={u.get('model')}")
+        models = (
+            f"colour={u.get('model')} gray={u.get('model_gray')}"
+            if u.get("grayscale_convert")
+            else f"model={u.get('model')}"
+        )
         header = [
-            f"JaNai Upscaler \u2014 {'dry run' if dry else 'run'} "
-            f"{time.strftime('%Y-%m-%d %H:%M:%S')}",
+            (
+                f"JaNai Upscaler \u2014 {'dry run' if dry else 'run'} "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')}"
+            ),
             f"input    {job['input']['path']}",
             f"output   {o['dir']}",
             f"format   {FORMATS[fid].label}  \u00b7  package {CONTAINERS[o['container']].label}",
             f"models   {models}",
-            f"device   {p.get('device') or 'auto'}  \u00b7  "
-            f"{'FP16' if p.get('use_fp16') else 'FP32'}  \u00b7  tile {p.get('tile')}",
+            (
+                f"device   {p.get('device') or 'auto'}  \u00b7  "
+                f"{'FP16' if p.get('use_fp16') else 'FP32'}  \u00b7  tile {p.get('tile')}"
+            ),
         ]
         path = self.runlog.begin(header, dry=dry)
         self.var_log_file.set(str(path) if path else "not saved")
-        self.log(f"{'dry run' if dry else 'job'}: {job['input']['path']} \u2192 {o['dir']} "
-                 f"[{FORMATS[fid].label}]")
+        self.log(
+            f"{'dry run' if dry else 'job'}: {job['input']['path']} \u2192 {o['dir']} "
+            f"[{FORMATS[fid].label}]"
+        )
         if path:
             self.log(f"log: {path}", "debug")
 
     def end_run_log(self) -> None:
         if self.runlog.path is None:
             return
-        self.runlog.end(["-" * 78,
-                         f"ended {time.strftime('%Y-%m-%d %H:%M:%S')}  \u00b7  "
-                         f"{self.completed} done, {self.failed} failed, "
-                         f"{self.skipped} skipped"])
+        self.runlog.end(
+            [
+                "-" * 78,
+                (
+                    f"ended {time.strftime('%Y-%m-%d %H:%M:%S')}  \u00b7  "
+                    f"{self.completed} done, {self.failed} failed, "
+                    f"{self.skipped} skipped"
+                ),
+            ]
+        )
 
     def restyle_log(self) -> None:
         p = self.theme.p
-        self.log_box.configure(background=p.surface, foreground=p.text,
-                               insertbackground=p.text, selectbackground=p.sel)
+        self.log_box.configure(
+            background=p.surface, foreground=p.text, insertbackground=p.text, selectbackground=p.sel
+        )
         self.log_box.tag_configure("info", foreground=p.text)
         self.log_box.tag_configure("debug", foreground=p.muted)
         self.log_box.tag_configure("skip", foreground=p.muted)
@@ -1643,9 +2385,11 @@ class App:
 
     def save_log_as(self) -> None:
         path = filedialog.asksaveasfilename(
-            title="Save log", defaultextension=".log",
+            title="Save log",
+            defaultextension=".log",
             initialfile=f"Run_{time.strftime('%Y%m%d-%H%M%S')}.log",
-            filetypes=[("Log files", "*.log"), ("Text files", "*.txt"), ("All files", "*.*")])
+            filetypes=[("Log files", "*.log"), ("Text files", "*.txt"), ("All files", "*.*")],
+        )
         if not path:
             return
         try:

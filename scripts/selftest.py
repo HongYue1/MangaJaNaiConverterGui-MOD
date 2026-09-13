@@ -1,8 +1,7 @@
 """End-to-end smoke test for the worker.
 
 Generates a small fake manga library (chapter folders with gray pages plus a
-colour cover), then drives ``worker/worker.py`` three times and checks what it
-produced:
+colour cover), then drives the worker three times and checks what it produced:
 
 1. a dry run, which must report every page and write nothing at all
 2. a real run with loose files
@@ -11,7 +10,7 @@ produced:
 
 Run it with the backend interpreter from the project root:
 
-    backend\\python\\python\\python.exe tools\\selftest.py
+    backend\\python\\python.exe scripts\\selftest.py
 
 Exit code 0 means everything passed. ``--keep`` leaves the temporary tree in
 place so you can look at the output.
@@ -30,14 +29,24 @@ from pathlib import Path
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKER = ROOT / "worker" / "worker.py"
+WORKER = ROOT / "src" / "janai" / "worker" / "worker.py"
+
+DASH = "\u2014"
+
+# A small rule set, so the rules path is exercised end to end. "auto" keeps it
+# independent of whichever models happen to be installed.
+RULES: list[dict] = [
+    {"kind": "grayscale", "model": "auto", "auto_levels": True},
+    {"kind": "colour", "model": "auto"},
+]
 
 
 # --------------------------------------------------------------------------- #
 # fixtures
 # --------------------------------------------------------------------------- #
-def make_library(root: Path, chapters: int = 2, pages: int = 3,
-                 size: tuple[int, int] = (360, 520)) -> None:
+def make_library(
+    root: Path, chapters: int = 2, pages: int = 3, size: tuple[int, int] = (360, 520)
+) -> None:
     """Write `chapters` folders of tiny PNG pages, one colour page each."""
     import cv2
     import numpy as np
@@ -61,23 +70,46 @@ def make_library(root: Path, chapters: int = 2, pages: int = 3,
             cv2.imwrite(str(folder / f"page-{p:03d}.png"), img)
 
 
-def build_job(src: Path, out: Path, container: str, dry: bool,
-              fmt: str = "png") -> dict:
+def build_job(
+    src: Path,
+    out: Path,
+    container: str,
+    dry: bool,
+    fmt: str = "png",
+    rule_dicts: list[dict] | None = None,
+) -> dict:
     return {
-        "input": {"path": str(src), "mode": "bulk", "recursive": True,
-                  "include_archives": True},
-        "output": {"dir": str(out), "container": container, "pattern": "{name}",
-                   "overwrite": True, "keep_structure": True},
+        "input": {"path": str(src), "mode": "bulk", "recursive": True, "include_archives": True},
+        "output": {
+            "dir": str(out),
+            "container": container,
+            "pattern": "{name}",
+            "overwrite": True,
+            "keep_structure": True,
+        },
         "format": {"id": fmt, "options": {}},
         "upscale": {
-            "mode": "scale", "scale": 2.0,
-            "model": "auto", "model_gray": "auto",
-            "grayscale_convert": True, "auto_levels": True,
-            "grayscale_threshold": 12, "grayscale_colour_percent": 0.25,
-            "pre_downscale_height": 0, "skip_long_strips": False,
+            "mode": "scale",
+            "scale": 2.0,
+            "model": "auto",
+            "model_gray": "auto",
+            "grayscale_convert": True,
+            "auto_levels": True,
+            "grayscale_threshold": 12,
+            "grayscale_colour_percent": 0.25,
+            "pre_downscale_height": 0,
+            "skip_long_strips": False,
+            "rules": list(rule_dicts or []),
+            "rules_enabled": bool(rule_dicts),
         },
-        "perf": {"device": "", "use_fp16": True, "tile": "auto", "io_workers": 2,
-                 "cudnn_benchmark": False, "allow_tf32": True},
+        "perf": {
+            "device": "",
+            "use_fp16": True,
+            "tile": "auto",
+            "io_workers": 2,
+            "cudnn_benchmark": False,
+            "allow_tf32": True,
+        },
         "dry_run": dry,
     }
 
@@ -92,7 +124,11 @@ def run_worker(job: dict, tmp: Path, label: str, verbose: bool) -> dict:
     started = time.perf_counter()
     proc = subprocess.run(
         [sys.executable, str(WORKER), "--job", str(path)],
-        cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8",
+        check=False,
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
         errors="replace",
     )
     events: dict[str, list[dict]] = {}
@@ -115,13 +151,14 @@ def run_worker(job: dict, tmp: Path, label: str, verbose: bool) -> dict:
         tail = (proc.stderr or "").strip().splitlines()[-6:]
         for line in tail:
             print(f"    stderr: {line}")
-    events["_meta"] = [{"code": proc.returncode,
-                        "secs": round(time.perf_counter() - started, 2)}]
+    events["_meta"] = [{"code": proc.returncode, "secs": round(time.perf_counter() - started, 2)}]
     return events
 
 
 def check(name: str, ok: bool, detail: str = "") -> bool:
-    print(f"  [{'PASS' if ok else 'FAIL'}] {name}{(' \u2014 ' + detail) if detail else ''}")
+    # The dash lives outside the f-string: escapes inside one need Python 3.12.
+    suffix = f" {DASH} {detail}" if detail else ""
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name}{suffix}")
     return ok
 
 
@@ -146,32 +183,37 @@ def main(argv: list[str] | None = None) -> int:
         if args.only in (None, "dry"):
             print("dry run (CBZ per folder)")
             out = tmp / "out-dry"
-            ev = run_worker(build_job(src, out, "cbz", True), tmp, "dry", args.verbose)
+            ev = run_worker(
+                build_job(src, out, "cbz", True, rule_dicts=RULES), tmp, "dry", args.verbose
+            )
             done = (ev.get("done") or [{}])[0]
             files = ev.get("file") or []
             bundles = ev.get("bundle") or []
             passed &= check("exit code 0", ev["_meta"][0]["code"] == 0)
             passed &= check("marked as a dry run", bool(done.get("dry")))
-            passed &= check("every page reported", len(files) == total,
-                            f"{len(files)}/{total}")
-            passed &= check("one archive planned per chapter",
-                            len(bundles) == args.chapters, f"{len(bundles)}")
-            passed &= check("predicted sizes present",
-                            all(f.get("w") and f.get("h") for f in files))
+            passed &= check("every page reported", len(files) == total, f"{len(files)}/{total}")
+            passed &= check(
+                "one archive planned per chapter", len(bundles) == args.chapters, f"{len(bundles)}"
+            )
+            passed &= check(
+                "predicted sizes present", all(f.get("w") and f.get("h") for f in files)
+            )
             passed &= check("nothing written to disk", not out.exists())
             print(f"  took {ev['_meta'][0]['secs']}s (no torch import)")
 
         if args.only in (None, "files"):
             print("real run (loose files)")
             out = tmp / "out-files"
-            ev = run_worker(build_job(src, out, "files", False), tmp, "files", args.verbose)
+            ev = run_worker(
+                build_job(src, out, "files", False, rule_dicts=RULES), tmp, "files", args.verbose
+            )
             done = (ev.get("done") or [{}])[0]
             written = sorted(out.rglob("*.png"))
             passed &= check("exit code 0", ev["_meta"][0]["code"] == 0)
-            passed &= check("no failures", int(done.get("failed") or 0) == 0,
-                            str(done.get("error") or ""))
-            passed &= check("one file per page", len(written) == total,
-                            f"{len(written)}/{total}")
+            passed &= check(
+                "no failures", int(done.get("failed") or 0) == 0, str(done.get("error") or "")
+            )
+            passed &= check("one file per page", len(written) == total, f"{len(written)}/{total}")
             passed &= check("pages were upscaled", all(p.stat().st_size > 0 for p in written))
             print(f"  took {ev['_meta'][0]['secs']}s")
 
@@ -187,15 +229,19 @@ def main(argv: list[str] | None = None) -> int:
                 with ZipFile(arc) as zf:
                     entries.append(len(zf.namelist()))
             passed &= check("exit code 0", ev["_meta"][0]["code"] == 0)
-            passed &= check("no failures", int(done.get("failed") or 0) == 0,
-                            str(done.get("error") or ""))
-            passed &= check("one archive per chapter", len(archives) == args.chapters,
-                            ", ".join(a.name for a in archives))
-            passed &= check("every page inside", entries == [args.pages] * args.chapters,
-                            str(entries))
+            passed &= check(
+                "no failures", int(done.get("failed") or 0) == 0, str(done.get("error") or "")
+            )
+            passed &= check(
+                "one archive per chapter",
+                len(archives) == args.chapters,
+                ", ".join(a.name for a in archives),
+            )
+            passed &= check(
+                "every page inside", entries == [args.pages] * args.chapters, str(entries)
+            )
             passed &= check("no .part files left behind", not leftovers)
-            passed &= check("bundle events emitted",
-                            len(ev.get("bundle") or []) == args.chapters)
+            passed &= check("bundle events emitted", len(ev.get("bundle") or []) == args.chapters)
             print(f"  took {ev['_meta'][0]['secs']}s")
     finally:
         if args.keep:
