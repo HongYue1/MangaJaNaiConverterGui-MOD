@@ -40,17 +40,12 @@ def defaults() -> dict[str, Any]:
             # "Fit" target presets, mirroring the original fork's display list
             "display": "custom",
             "display_portrait": True,
-            # model used for colour pages (and for every page when grayscale
-            # detection is off); model_gray is used for detected gray pages.
-            "model": "auto",
-            "model_gray": "auto",
-            # Rules-based selection (janai.core.rules). Empty means "not set
-            # up yet": the interface seeds the default working set from the
-            # installed models the first time it runs, so what used to be a
-            # hidden "auto" is visible and editable. The two model choices
-            # above stay as the fallback for pages no rule matches.
+            # Rules-based selection (janai.core.rules) is the only thing that
+            # picks a model. Empty means "not set up yet": the interface seeds
+            # the shipped table from the installed models the first time it
+            # runs, so the choice is always visible and editable instead of
+            # hidden behind an "auto" switch.
             "rules": [],
-            "rules_enabled": True,
             "auto_levels": True,
             "grayscale_convert": True,
             "grayscale_threshold": 12,
@@ -114,24 +109,62 @@ def _merge(base: dict, patch: Any) -> dict:
     return out
 
 
+#: Keys older builds wrote that no longer exist. ``model``/``model_gray`` were
+#: the two pickers the rules table replaced; ``rules_enabled`` switched the
+#: table off, which left nothing driving the choice.
+RETIRED_UPSCALE_KEYS = ("model", "model_gray", "rules_enabled")
+
+
 def _migrate(raw: Any) -> Any:
     """Carry older settings files forward.
 
-    The colour-pixel guard used to be stored in per-mille and labelled with a
-    per-mille sign, which read as a stray glyph in the UI. It is a percentage
-    now, so an existing per-mille value is converted instead of dropped.
+    Two changes need translating rather than dropping:
+
+    * the colour-pixel guard used to be stored in per-mille and labelled with a
+      per-mille sign, which read as a stray glyph in the UI;
+    * the model pickers are gone, so their values are handed to the rules table
+      as a starting point when that table has not been written yet.
     """
     if not isinstance(raw, dict):
         return raw
     ups = raw.get("upscale")
-    if isinstance(ups, dict) and "grayscale_colour_permille" in ups:
+    if not isinstance(ups, dict):
+        return raw
+    if "grayscale_colour_permille" in ups:
         old = ups.pop("grayscale_colour_permille")
         if "grayscale_colour_percent" not in ups:
             try:
                 ups["grayscale_colour_percent"] = round(float(old) / 10.0, 4)
             except (TypeError, ValueError):
                 pass
+    if not ups.get("rules"):
+        ups["rules"] = _rules_from_pickers(ups)
+    for key in RETIRED_UPSCALE_KEYS:
+        ups.pop(key, None)
     return raw
+
+
+def _rules_from_pickers(ups: dict) -> list[dict]:
+    """Two named models -> two catch-all rules, so an upgrade keeps working.
+
+    Anything left on "auto" is skipped: the interface reseeds the shipped table
+    from the installed models, which is a better answer than a placeholder.
+    """
+    out: list[dict] = []
+    colour = str(ups.get("model") or "").strip()
+    gray = str(ups.get("model_gray") or "").strip()
+    if colour and colour.lower() != "auto":
+        out.append({"kind": "colour", "model": colour, "note": "carried over from the old picker"})
+    if gray and gray.lower() != "auto" and bool(ups.get("grayscale_convert", True)):
+        out.append(
+            {
+                "kind": "grayscale",
+                "model": gray,
+                "auto_levels": bool(ups.get("auto_levels", True)),
+                "note": "carried over from the old picker",
+            }
+        )
+    return out
 
 
 class Settings:

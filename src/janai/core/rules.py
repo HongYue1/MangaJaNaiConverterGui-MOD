@@ -1,25 +1,33 @@
 """Rules-based model selection.
 
-Rather than one hidden "auto" switch, every page is matched against an ordered
-list of rules. A rule is four conditions and two outcomes::
+The table is the only thing that chooses a model. Every page is matched
+against an ordered list of rules; a rule is a set of conditions on the left
+and the outcome on the right::
 
-    when        scale   size                model                       levels
-    grayscale   2x      height 1551-1760    2x_MangaJaNai_1600p_...     on
-    grayscale   2x      height 1761-1984    2x_MangaJaNai_1920p_...     on
-    colour      4x      any                 4x_IllustrationJaNai_...    -
-    any         any     any                 auto                        -
+    on  when            page size           model                       levels
+    *   grayscale 2x    h 1551-1760         2x_MangaJaNai_1600p_...     on
+    *   grayscale 2x    h 1761-1984         2x_MangaJaNai_1920p_...     on
+    *   colour 4x       any                 4x_IllustrationJaNai_...    -
+    *   colour          any                 2x_IllustrationJaNai_...    -
 
 Matching rules:
 
 * A rule that names a size always beats a rule that says "any", wherever the
   two sit in the list - that is the "specific dimensions take priority"
   behaviour. An exact size beats a range, and a range beats "any".
-* After specificity, the list order decides, so dragging a rule up still means
+* After specificity, the list order decides, so moving a rule up still means
   something for equally specific rules.
-* ``model = auto`` hands that page back to the built-in picker, so a rule can
-  narrow the conditions without pinning a file.
-* ``levels`` only applies to grayscale pages; ``None`` means "inherit the
-  global auto-levels setting".
+* A rule can be switched off without deleting it (``enabled``); the table shows
+  that state in its first column.
+* ``levels`` only applies to grayscale pages. ``None`` means "use the Auto
+  levels checkbox", ``True``/``False`` override it for the pages this rule
+  claims.
+
+``model = auto`` is no longer a choice a user can make: the shipped table
+names real files, and :func:`materialise` upgrades any ``auto`` left in an
+older settings file to the file it would have resolved to. If a rule still
+carries it (a hand-edited JSON, a model that was uninstalled), the worker
+falls back to its built-in picker and the table flags the row.
 
 The module is pure standard library so the interface and the worker can both
 import it, and matching is a handful of integer comparisons over a compiled
@@ -238,13 +246,24 @@ class Rule:
         return "  ".join(parts)
 
     def levels_label(self) -> str:
-        if self.kind == COLOUR or self.auto_levels is None:
-            return "-"
+        """What the Levels cell shows: never applies, follows the setting, or set."""
+        if self.kind == COLOUR:
+            return "\u2014"
+        if self.auto_levels is None:
+            return "default"
         return "on" if self.auto_levels else "off"
 
+    def enabled_mark(self) -> str:
+        """The on/off dot the table shows in its first column."""
+        return "\u25cf" if self.enabled else "\u25cb"
+
     def columns(self) -> tuple[str, str, str, str]:
-        """The four cells the interface shows for this rule."""
+        """The four content cells the interface shows for this rule."""
         return (self.when_label(), self.size_label(), self.model, self.levels_label())
+
+    def cells(self) -> tuple[str, str, str, str, str]:
+        """Every cell of the table row, including the enabled indicator."""
+        return (self.enabled_mark(), *self.columns())
 
     def describe(self) -> str:
         return f"{self.when_label()} / {self.size_label()} -> {self.model}"
@@ -387,6 +406,8 @@ def problems(rule: Rule, installed: Sequence[str] = ()) -> list[str]:
     """Human-readable warnings for one rule: never fatal, just honest."""
     out: list[str] = []
     names = {str(n) for n in installed}
+    if rule.is_auto:
+        out.append("no model chosen - open the row and pick one")
     if not rule.is_auto and names and rule.model not in names:
         out.append(f"{rule.model} is not installed")
     factor = model_scale(rule.model) if not rule.is_auto else 0
@@ -425,24 +446,55 @@ def nearest_height_model(names: Sequence[str], bucket: int) -> str:
     return min(tagged, key=lambda n: (abs(model_height(n) - bucket), model_height(n), n))
 
 
+def gray_bucket(height: int) -> int:
+    """The MangaJaNai page-height bucket (1200p, 1300p, ...) for a page height."""
+    for limit, bucket in GRAY_HEIGHT_BANDS:
+        if height <= limit:
+            return bucket
+    return GRAY_TOP_BUCKET
+
+
+def gray_model(installed: Sequence[str], scale: int, bucket: int) -> str:
+    """The best installed grayscale model for a factor and a height band."""
+    pool = [str(n) for n in installed if model_scale(n) == scale]
+    manga = [n for n in pool if is_manga_model(n) and model_height(n)]
+    if manga:
+        return nearest_height_model(manga, bucket)
+    rest = [n for n in pool if is_manga_model(n)] or pool
+    return min(rest) if rest else ""
+
+
+def colour_model(installed: Sequence[str], scale: int) -> str:
+    """The best installed colour model for a factor."""
+    names = [str(n) for n in installed]
+    wanted = COLOUR_DEFAULTS.get(scale, "")
+    if wanted and wanted in names:
+        return wanted
+    pool = [n for n in names if model_scale(n) == scale]
+    illustration = [n for n in pool if not is_manga_model(n)] or pool
+    denoise = [n for n in illustration if "denoise" in n.lower()] or illustration
+    return min(denoise) if denoise else ""
+
+
 def default_working_set(
     installed: Sequence[str] = (), scales: Sequence[int] = (2, 4)
 ) -> list[Rule]:
-    """The shipped rules: exactly what "auto" used to do, written out.
+    """The shipped table: what the old hidden "auto" did, written out in full.
 
-    Built against the models actually installed, so it never points at a file
-    that is not there, and adjacent height bands that resolve to the same file
-    are merged into one row to keep the table readable.
+    Every row names a real file from the models actually installed - the table
+    is the only thing that picks a model, so it must never ship a placeholder.
+    Adjacent height bands that resolve to the same file are merged into one row
+    to keep it readable, and two unsized catch-alls at the end cover targets
+    that are neither 2x nor 4x.
     """
     names = [str(n) for n in installed]
     out: list[Rule] = []
     for scale in scales:
-        pool = [n for n in names if model_scale(n) == scale]
-        gray_pool = [n for n in pool if is_manga_model(n) and model_height(n)]
-
         rows: list[list] = []
         for low, high, bucket in bands():
-            pick = nearest_height_model(gray_pool, bucket) or AUTO
+            pick = gray_model(names, scale, bucket)
+            if not pick:
+                continue
             if rows and rows[-1][2] == pick:
                 rows[-1][1] = high  # same file, so widen the previous band
             else:
@@ -458,15 +510,56 @@ def default_working_set(
                     note="default working set",
                 )
             )
+        colour = colour_model(names, scale)
+        if colour:
+            out.append(
+                Rule(kind=COLOUR, scale=float(scale), model=colour, note="default working set")
+            )
 
-        colour = COLOUR_DEFAULTS.get(scale, "")
-        if colour not in names:
-            candidates = [n for n in pool if "denoise" in n.lower()] or pool
-            colour = min(candidates) if candidates else AUTO
-        out.append(Rule(kind=COLOUR, scale=float(scale), model=colour, note="default working set"))
-
-    out.append(Rule(kind=ANY, model=AUTO, note="fallback: let the picker decide"))
+    # Width, height and fit targets produce factors like 1.8 or 3.7, so keep an
+    # unsized row per page kind as the last resort. They are the least specific
+    # rules in the table, so they can never shadow a sized one.
+    gray_any = gray_model(names, 2, GRAY_TOP_BUCKET) or gray_model(names, 4, GRAY_TOP_BUCKET)
+    if gray_any:
+        out.append(
+            Rule(kind=GRAYSCALE, model=gray_any, auto_levels=True, note="catch-all: any target")
+        )
+    colour_any = colour_model(names, 2) or colour_model(names, 4)
+    if colour_any:
+        out.append(Rule(kind=COLOUR, model=colour_any, note="catch-all: any target"))
     return out
+
+
+def materialise(
+    items: Iterable[Rule], installed: Sequence[str] = ()
+) -> tuple[list[Rule], list[str]]:
+    """Turn legacy ``auto`` rows into real files. Returns (rules, notes).
+
+    Settings written before the table became the single source of truth could
+    say ``auto``; that is resolved here once, against the installed models, so
+    what the table shows is what will actually run.
+    """
+    names = [str(n) for n in installed]
+    out: list[Rule] = []
+    notes: list[str] = []
+    for rule in items:
+        if not rule.is_auto:
+            out.append(rule)
+            continue
+        scale = bucket_scale(rule.scale) or 2
+        if scale < 2:
+            scale = 2
+        if rule.kind == GRAYSCALE:
+            low, high = parse_dim(rule.height)
+            pick = gray_model(names, scale, gray_bucket(high or low or GRAY_TOP_BUCKET))
+        else:
+            pick = colour_model(names, scale)
+        if not pick:
+            notes.append(f"dropped {rule.describe()} (nothing installed to run it)")
+            continue
+        out.append(replace(rule, model=pick, note=rule.note or "resolved from auto"))
+        notes.append(f"{rule.when_label()} / {rule.size_label()} -> {pick}")
+    return out, notes
 
 
 def default_dicts(installed: Sequence[str] = ()) -> list[dict]:

@@ -1947,12 +1947,13 @@ def run_job(job: dict) -> int:
     do_gray = bool(ups.get("grayscale_convert", True))
     do_levels = bool(ups.get("auto_levels", True))
     pre_h = int(ups.get("pre_downscale_height") or 0)
+    # The rules table is the only chooser the interface exposes. These two
+    # names remain as an internal fallback for a page no rule claims, and for
+    # job files written before the table existed; "auto" hands the page to the
+    # built-in height-band picker.
     model_colour = str(ups.get("model") or "auto")
     model_gray = str(ups.get("model_gray") or "auto") if do_gray else model_colour
-    # Rules decide the model and auto-levels per page; the two names above are
-    # the fallback for pages no rule matches (and for jobs with no rules).
-    use_rules = bool(ups.get("rules_enabled", True))
-    rule_set = _rules.RuleSet.from_dicts(ups.get("rules") if use_rules else [])
+    rule_set = _rules.RuleSet.from_dicts(ups.get("rules"))
     rules_logged: set[str] = set()
     overwrite = bool(outp.get("overwrite", False))
     pattern = str(outp.get("pattern") or "{name}")
@@ -2008,8 +2009,9 @@ def run_job(job: dict) -> int:
     def page_plan(gray: bool, oh: int, ow: int) -> tuple[dict | None, bool]:
         """What happens to one page: which model, and whether to auto-level.
 
-        A matching rule decides; with no rules, or no rule matching this page,
-        the two model choices are used exactly as before.
+        A matching rule decides. A page no rule claims falls back to the
+        built-in picker, which is exactly what the shipped table's catch-all
+        rows do explicitly.
         """
         is_gray = gray and do_gray
         levels = do_levels
