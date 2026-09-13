@@ -28,16 +28,18 @@ from janai.app.runlog import (
     format_start,
 )
 from janai.app.runner import Runner, open_in_explorer
-from janai.app.state import Settings
+from janai.app.state import Settings, defaults
 from janai.app.theme import Theme
 from janai.app.widgets import (
     Card,
     Collapsible,
     ScrollArea,
     Segmented,
+    Table,
     Tooltip,
     clear,
     combo,
+    entry,
     int_spin,
     row_label,
 )
@@ -86,30 +88,6 @@ TILE_CHOICES = [
 ]
 
 MODE_OPTIONS = [("Scale", "scale"), ("Width", "width"), ("Height", "height"), ("Fit", "fit")]
-
-AUTO_MODEL = "auto"
-
-
-def model_scale(name: str) -> int | None:
-    """The scale a model file advertises in its own name, else None.
-
-    Every weight ships with the factor in the filename (``4x_Illustration...``,
-    ``2x-AnimeSharp...``), so the name is enough to catch a 4x model pointed at
-    a 2x job before anything is loaded.
-    """
-    stem = Path(str(name or "")).stem.lower()
-    for token in stem.replace("-", "_").replace(" ", "_").split("_"):
-        head, tail = token[:-1], token[1:]
-        if token.endswith("x") and head.isdigit():
-            value = int(head)
-        elif token.startswith("x") and tail.isdigit():
-            value = int(tail)
-        else:
-            continue
-        if 1 <= value <= 16:
-            return value
-    return None
-
 
 LOG_TAGS = ("info", "debug", "warn", "error", "ok", "skip", "dry")
 
@@ -169,7 +147,6 @@ class App:
         self.runner.probe()
         self.render_format_options()
         self.render_target()
-        self.render_models()
         self.seed_rules()
         self.render_rules()
         self.update_start_state()
@@ -198,15 +175,12 @@ class App:
             value=displays.label_for_id(str(u.get("display", displays.CUSTOM)))
         )
         self.var_portrait = tk.BooleanVar(value=bool(u.get("display_portrait", True)))
-        self.var_model = tk.StringVar(value=str(u.get("model", AUTO_MODEL)))
-        self.var_model_gray = tk.StringVar(value=str(u.get("model_gray", AUTO_MODEL)))
         self.var_levels = tk.BooleanVar(value=bool(u.get("auto_levels", True)))
         self.var_gray = tk.BooleanVar(value=bool(u.get("grayscale_convert", True)))
         self.var_threshold = tk.IntVar(value=int(u.get("grayscale_threshold", 12)))
         self.var_colour_pct = tk.DoubleVar(value=float(u.get("grayscale_colour_percent", 0.25)))
         self.var_pre_h = tk.IntVar(value=int(u.get("pre_downscale_height", 0)))
         self.var_skip_long = tk.BooleanVar(value=bool(u.get("skip_long_strips", False)))
-        self.var_rules_on = tk.BooleanVar(value=bool(u.get("rules_enabled", True)))
         self.rules: list[rules.Rule] = [rules.Rule.from_dict(r) for r in (u.get("rules") or [])]
         self._rules_seeded = bool(self.rules)
 
@@ -329,29 +303,55 @@ class App:
         self.lbl_env.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
         btns = ttk.Frame(head)
         btns.grid(row=0, column=2, rowspan=2, sticky="e")
-        ttk.Button(btns, text="Theme", style="Ghost.TButton", command=self.toggle_theme).grid(
-            row=0, column=0, padx=(0, 6)
+        btn_theme = ttk.Button(
+            btns, text="Theme", style="GhostBg.TButton", command=self.toggle_theme
         )
+        btn_theme.grid(row=0, column=0, padx=(0, 6))
+        Tooltip(btn_theme, "Switch between the dark and light palette.", self.theme)
         self.btn_refresh = ttk.Button(
-            btns, text="Re-detect", style="Ghost.TButton", command=self.refresh_probe
+            btns, text="Re-detect", style="GhostBg.TButton", command=self.refresh_probe
         )
         self.btn_refresh.grid(row=0, column=1)
+        Tooltip(
+            self.btn_refresh,
+            "Ask the backend again which GPU, encoders and models are available. "
+            "Use it after installing models or changing drivers \u2014 the answer "
+            "is cached between runs so the window can open instantly.",
+            self.theme,
+        )
         self.btn_presets = ttk.Button(
-            btns, text="Presets", style="Ghost.TButton", command=self.preset_menu
+            btns, text="Presets", style="GhostBg.TButton", command=self.preset_menu
         )
         self.btn_presets.grid(row=0, column=2, padx=(6, 0))
         Tooltip(
             self.btn_presets,
-            "Save the current settings as a preset, load one from a "
-            "file, or switch to one you already saved. A preset "
-            "carries the target, models, rules, format, output layout "
-            "and performance options \u2014 never your folders or your "
-            "device.",
+            "Save the current settings as a preset, load one from a file, or "
+            "switch to one you already saved. A preset carries the target, the "
+            "rules table, the format, the output layout and the performance "
+            "options \u2014 never your folders or your device, so someone "
+            "else's preset cannot redirect your output.",
+            self.theme,
+        )
+        self.btn_reset = ttk.Button(
+            btns, text="Reset all", style="GhostBg.TButton", command=self.reset_all
+        )
+        self.btn_reset.grid(row=0, column=3, padx=(6, 0))
+        Tooltip(
+            self.btn_reset,
+            "Put every setting back to the shipped defaults: target, rules table, "
+            "output format and layout, performance options and log view. Your "
+            "input and output folders are kept, and you get a confirmation "
+            "prompt first.",
             self.theme,
         )
 
     def _build_input(self, body: tk.Misc) -> None:
-        card = Card(body, "1 \u00b7 Input", badge="")
+        card = Card(
+            body,
+            "Input",
+            subtitle="A folder, an archive, or single images. Drop them here.",
+            badge="",
+        )
         card.grid(row=1, column=0, sticky="ew", pady=(6, 10))
         self.card_input = card
         b = card.body
@@ -411,7 +411,11 @@ class App:
         )
 
     def _build_upscale(self, body: tk.Misc) -> None:
-        card = Card(body, "2 \u00b7 Upscale")
+        card = Card(
+            body,
+            "Upscale",
+            subtitle="How big the result is, and which model each page gets.",
+        )
         card.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         self.card_upscale = card
         b = card.body
@@ -468,17 +472,16 @@ class App:
             command=lambda _v: self.on_display_change(),
         ).grid(row=0, column=2, padx=(10, 0))
 
-        # Page kind comes before the models, because it decides how many
-        # models the run needs.
+        # Page kind comes before the table, because it decides which rules can
+        # ever fire: with detection off every page is treated as colour.
         row_label(
             b,
             2,
             "Pages",
-            "Grayscale detection sorts every page into gray or colour "
-            "and sends it to the matching model.",
+            "Whether each page is judged on its own or the whole run is treated as colour.",
             self.theme,
         )
-        kinds = ttk.Frame(b, style="Card.TFrame")
+        kinds = ttk.Frame(b, style="Plain.TFrame")
         kinds.grid(row=2, column=1, sticky="w", pady=4)
         c1 = ttk.Checkbutton(
             kinds, text="Grayscale detection", variable=self.var_gray, command=self.on_gray_toggle
@@ -486,137 +489,132 @@ class App:
         c1.grid(row=0, column=0, sticky="w")
         Tooltip(
             c1,
-            "Detects effectively grayscale pages, converts them to 1 channel, uses "
-            "the dot-gain aware downscale for them \u2014 and picks the grayscale "
-            "model instead of the colour one.",
+            "Measures each page and decides whether it is really grayscale. A "
+            "grayscale page is stored as one channel (smaller files, faster), "
+            "downscaled with the dot-gain aware filter, and matched against the "
+            "grayscale rules in the table. Turn this off and every page is "
+            "treated as colour, so only the colour rules can fire - useful for "
+            "an all-colour artbook.",
             self.theme,
         )
         c2 = ttk.Checkbutton(
-            kinds, text="Auto levels", variable=self.var_levels, command=self.update_summary
+            kinds, text="Auto levels", variable=self.var_levels, command=self.on_levels_toggle
         )
         c2.grid(row=0, column=1, sticky="w", padx=(18, 0))
         Tooltip(
             c2,
-            "Stretches black and white points on grayscale pages before upscaling. "
-            "Colour pages are never touched by this.",
+            "Stretches the black and white points of grayscale pages before "
+            "upscaling, which lifts washed-out scans. Colour pages are never "
+            "touched. This is the setting a rule follows when its Levels cell "
+            "says \u201cdefault\u201d; a rule can override it per page size.",
             self.theme,
         )
 
-        self.models_box = ttk.Frame(b, style="Card.TFrame")
-        self.models_box.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        self.models_box.columnconfigure(1, weight=1)
-        self.lbl_model = ttk.Label(self.models_box, text="Model", style="Card.TLabel")
-        self.lbl_model.grid(row=0, column=0, sticky="w", padx=(0, 12), pady=4)
-        self.cb_model = combo(
-            self.models_box, self.var_model, [AUTO_MODEL], width=44, on_change=self.update_summary
-        )
-        self.cb_model.grid(row=0, column=1, sticky="w", pady=4)
-        self.lbl_model_gray = ttk.Label(
-            self.models_box, text="Grayscale pages", style="Card.TLabel"
-        )
-        self.cb_model_gray = combo(
-            self.models_box,
-            self.var_model_gray,
-            [AUTO_MODEL],
-            width=44,
-            on_change=self.update_summary,
-        )
-        self.lbl_models_hint = ttk.Label(
-            self.models_box, text="", style="Muted.TLabel", wraplength=620, justify="left"
-        )
-        self.lbl_model_warn = ttk.Label(
-            self.models_box, text="", style="Warn.TLabel", wraplength=620, justify="left"
-        )
-
-        # Rules replace the old hidden "auto": each row says what a page has to
-        # look like and which model it gets. First match wins, and a row that
-        # names a size beats a row that says "any" wherever it sits.
-        self.rules_box = ttk.Frame(b, style="Card.TFrame")
-        self.rules_box.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        # The table is the only thing that chooses a model. There is no picker
+        # beside it to contradict it, and no "auto" row to hide the choice.
+        self.rules_box = ttk.Frame(b, style="Plain.TFrame")
+        self.rules_box.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(16, 0))
         self.rules_box.columnconfigure(0, weight=1)
 
-        rules_head = ttk.Frame(self.rules_box, style="Card.TFrame")
-        rules_head.grid(row=0, column=0, sticky="ew")
+        rules_head = ttk.Frame(self.rules_box, style="Plain.TFrame")
+        rules_head.grid(row=0, column=0, columnspan=2, sticky="ew")
         rules_head.columnconfigure(1, weight=1)
-        cr = ttk.Checkbutton(
-            rules_head, text="Rules", variable=self.var_rules_on, command=self.on_rules_toggle
-        )
-        cr.grid(row=0, column=0, sticky="w")
-        Tooltip(
-            cr,
-            "Per-page selection: page kind, target scale and page size decide the "
-            "model and whether grayscale pages get auto levels. Pages that match "
-            "no rule fall back to the two models above.",
-            self.theme,
-        )
-        ttk.Label(
+        lbl_rules = ttk.Label(rules_head, text="Model rules", style="Field.TLabel")
+        lbl_rules.grid(row=0, column=0, sticky="w")
+        lbl_rules_how = ttk.Label(
             rules_head,
-            text="first match wins \u00b7 a rule with sizes beats a rule with \u201cany\u201d",
+            text="page kind + size decide the model \u00b7 a sized row always "
+            "beats an \u201cany\u201d row",
             style="Muted.TLabel",
-        ).grid(row=0, column=1, sticky="w", padx=(12, 0))
-
-        table = ttk.Frame(self.rules_box, style="Card.TFrame")
-        table.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        table.columnconfigure(0, weight=1)
-        self.tree_rules = ttk.Treeview(
-            table,
-            columns=("when", "size", "model", "levels"),
-            show="headings",
-            height=7,
-            selectmode="browse",
-            style="Rules.Treeview",
         )
-        for key, head, width, anchor in (
-            ("when", "When", 150, "w"),
-            ("size", "Page size", 120, "w"),
-            ("model", "Model", 430, "w"),
-            ("levels", "Levels", 64, "center"),
-        ):
-            self.tree_rules.heading(key, text=head)
-            self.tree_rules.column(key, width=width, anchor=anchor, stretch=(key == "model"))
-        self.tree_rules.grid(row=0, column=0, sticky="ew")
-        self.tree_rules.bind("<Double-1>", lambda _e: self.rule_edit())
+        lbl_rules_how.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        for w in (lbl_rules, lbl_rules_how):
+            Tooltip(
+                w,
+                "Every page is matched against this table top to bottom. The "
+                "first row whose conditions fit decides which model runs, and "
+                "for grayscale pages whether auto levels is applied. A row that "
+                "names a page size wins over a row that says \u201cany\u201d "
+                "wherever the two sit, so a catch-all at the top cannot swallow "
+                "everything by accident. Double-click a row to edit it, or click "
+                "its dot to switch it off without deleting it.",
+                self.theme,
+            )
 
-        side = ttk.Frame(table, style="Card.TFrame")
-        side.grid(row=0, column=1, sticky="n", padx=(10, 0))
-        self.rule_buttons: list[ttk.Button] = []
-        for index, (text, action) in enumerate(
+        self.rules_table = Table(
+            self.rules_box,
             (
-                ("Add", self.rule_add),
-                ("Edit", self.rule_edit),
-                ("Remove", self.rule_remove),
-                ("Up", lambda: self.rule_move(-1)),
-                ("Down", lambda: self.rule_move(1)),
-                ("Defaults", self.rules_reset),
+                ("on", "On", 40, "center", False),
+                ("when", "When", 150, "w", False),
+                ("size", "Page size", 120, "w", False),
+                ("model", "Model", 420, "w", True),
+                ("levels", "Auto levels", 86, "center", False),
+            ),
+            height=8,
+        )
+        self.rules_table.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self.tree_rules = self.rules_table.tree
+        self.tree_rules.bind("<Double-1>", self.on_rule_double_click)
+        self.tree_rules.bind("<Button-1>", self.on_rule_click, add="+")
+        self.tree_rules.bind("<space>", lambda _e: self.rule_toggle(), add="+")
+
+        side = ttk.Frame(self.rules_box, style="Plain.TFrame")
+        side.grid(row=1, column=1, sticky="n", padx=(10, 0), pady=(8, 0))
+        for index, (text, action, tip) in enumerate(
+            (
+                ("Add", self.rule_add, "Add a rule below the selected one."),
+                ("Edit", self.rule_edit, "Edit the selected rule (or double-click it)."),
+                (
+                    "Toggle",
+                    self.rule_toggle,
+                    (
+                        "Switch the selected rule off without deleting it. The dot "
+                        "in the first column shows the state; clicking the dot does "
+                        "the same thing."
+                    ),
+                ),
+                ("Remove", self.rule_remove, "Delete the selected rule."),
+                (
+                    "Up",
+                    lambda: self.rule_move(-1),
+                    "Move the rule up. Order only decides between rules that are equally specific.",
+                ),
+                ("Down", lambda: self.rule_move(1), "Move the rule down."),
+                (
+                    "Defaults",
+                    self.rules_reset,
+                    (
+                        "Rewrite this table as the shipped set: the MangaJaNai "
+                        "height bands for grayscale pages and the IllustrationJaNai "
+                        "denoise models for colour, built from the models you have "
+                        "installed. Only the table is touched, nothing else."
+                    ),
+                ),
             )
         ):
             button = ttk.Button(side, text=text, style="Ghost.TButton", command=action)
             button.grid(row=index, column=0, sticky="ew", pady=(0 if index == 0 else 4, 0))
-            self.rule_buttons.append(button)
-        Tooltip(
-            self.rule_buttons[-1],
-            "Rewrite the table as the shipped working set, built "
-            "from the models you actually have installed.",
-            self.theme,
-        )
+            Tooltip(button, tip, self.theme)
 
         self.lbl_rules_hint = ttk.Label(
             self.rules_box, text="", style="Muted.TLabel", wraplength=760, justify="left"
         )
-        self.lbl_rules_hint.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.lbl_rules_hint.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.lbl_rules_warn = ttk.Label(
             self.rules_box, text="", style="Warn.TLabel", wraplength=760, justify="left"
         )
 
-        adv = ttk.Frame(b, style="Card.TFrame")
-        adv.grid(row=5, column=1, sticky="w", pady=(10, 0))
+        adv = ttk.Frame(b, style="Plain.TFrame")
+        adv.grid(row=4, column=1, sticky="w", pady=(14, 0))
         ttk.Label(adv, text="Gray threshold", style="Muted.TLabel").grid(row=0, column=0)
         sp = int_spin(adv, self.var_threshold, 0, 64, 1, 5, self.update_summary)
         sp.grid(row=0, column=1, padx=(8, 16))
         Tooltip(
             sp,
-            "How much colour a page may carry and still count as grayscale. 12 is "
-            "the original default.",
+            "How far a pixel's red, green and blue may drift apart (0-255) before "
+            "it counts as coloured. 12 matches the original app. Raise it to send "
+            "yellowed or sepia scans to the grayscale model anyway; lower it if "
+            "faintly tinted pages should be treated as colour.",
             self.theme,
         )
         ttk.Label(adv, text="Colour pixels %", style="Muted.TLabel").grid(row=0, column=2)
@@ -624,9 +622,11 @@ class App:
         sp3.grid(row=0, column=3, padx=(8, 16))
         Tooltip(
             sp3,
-            "Second opinion: a page is colour as soon as this percentage of its "
-            "pixels are clearly coloured, even if the average looks gray. "
-            "Catches spot colour on otherwise black-and-white pages.",
+            "The second test, for pages whose average still looks gray: once this "
+            "share of pixels is clearly coloured, the page is treated as colour. "
+            "0.25% catches a coloured title or one spot-colour panel on an "
+            "otherwise black-and-white page. Set it to 0 to judge by the "
+            "threshold alone.",
             self.theme,
         )
         ttk.Label(adv, text="Pre-downscale height", style="Muted.TLabel").grid(row=0, column=4)
@@ -634,33 +634,42 @@ class App:
         sp2.grid(row=0, column=5, padx=(8, 0))
         Tooltip(
             sp2,
-            "0 = off. Shrinks very large scans to this height before the model runs: "
-            "much faster, and often cleaner on oversized raws.",
+            "0 = off. Shrinks an oversized page to this height first and then "
+            "upscales it as usual. Worth using when raws are far larger than the "
+            "model was trained for - a 3000px scan through a 1600p model - since "
+            "the model sees fewer pixels, which is both faster and often cleaner. "
+            "The page is still upscaled: this is not the long-strip option below.",
             self.theme,
         )
         c3 = ttk.Checkbutton(
             adv,
-            text="Pass through huge long strips",
+            text="Convert huge long strips without upscaling",
             variable=self.var_skip_long,
             command=self.update_summary,
         )
-        c3.grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        c3.grid(row=1, column=0, columnspan=6, sticky="w", pady=(10, 0))
         Tooltip(
             c3,
-            "Webtoon-style mega strips \u2014 very tall and already huge \u2014 are "
-            "copied straight through in the chosen output format instead of being "
-            "upscaled. Off by default: the adaptive tiler handles them fine, so "
-            "this is only for when you want the conversion and nothing else.",
+            "For webtoon mega-strips: very tall, very many pixels. Those pages "
+            "skip the model completely and are only re-encoded into the chosen "
+            "output format, because upscaling a 20000px strip costs minutes and "
+            "gains little. Off by default - the adaptive tiler copes with them. "
+            "This is the opposite of Pre-downscale height, which shrinks a page "
+            "and still upscales it.",
             self.theme,
         )
 
         self.lbl_upscale_sum = ttk.Label(
             b, text="", style="Muted.TLabel", wraplength=620, justify="left"
         )
-        self.lbl_upscale_sum.grid(row=6, column=1, sticky="w", pady=(10, 0))
+        self.lbl_upscale_sum.grid(row=5, column=1, sticky="w", pady=(12, 0))
 
     def _build_output(self, body: tk.Misc) -> None:
-        card = Card(body, "3 \u00b7 Output")
+        card = Card(
+            body,
+            "Output",
+            subtitle="The encoder, how pages are packaged, and where they land.",
+        )
         card.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         self.card_output = card
         b = card.body
@@ -719,14 +728,14 @@ class App:
             variable=self.var_same,
             command=self.on_dest_change,
         ).grid(row=0, column=0, sticky="w")
-        self.e_sub = ttk.Entry(dest, textvariable=self.var_subfolder, width=18)
+        self.e_sub = entry(dest, self.var_subfolder, width=18)
         self.e_sub.grid(row=0, column=1, sticky="w", padx=(8, 0))
         self.e_sub.bind("<KeyRelease>", lambda _e: self.update_summary(), add="+")
 
         self.dest_custom = ttk.Frame(b, style="Card.TFrame")
         self.dest_custom.grid(row=9, column=1, sticky="ew", pady=(4, 0))
         self.dest_custom.columnconfigure(0, weight=1)
-        self.e_out = ttk.Entry(self.dest_custom, textvariable=self.var_out_dir)
+        self.e_out = entry(self.dest_custom, self.var_out_dir)
         self.e_out.grid(row=0, column=0, sticky="ew")
         self.e_out.bind("<KeyRelease>", lambda _e: self.update_summary(), add="+")
         ttk.Button(
@@ -740,7 +749,7 @@ class App:
         names = ttk.Frame(b, style="Card.TFrame")
         names.grid(row=10, column=1, sticky="ew", pady=(6, 0))
         names.columnconfigure(0, weight=1)
-        e_pat = ttk.Entry(names, textvariable=self.var_pattern)
+        e_pat = entry(names, self.var_pattern)
         e_pat.grid(row=0, column=0, sticky="ew")
         e_pat.bind("<KeyRelease>", lambda _e: self.update_summary(), add="+")
         Tooltip(
@@ -1128,28 +1137,15 @@ class App:
             self.var_height.set(wh[1])
         self.update_summary()
 
-    def render_models(self) -> None:
-        """One model box, or two when grayscale detection is doing the sorting."""
-        gray = bool(self.var_gray.get())
-        if gray:
-            self.lbl_model.configure(text="Colour pages")
-            self.lbl_model_gray.grid(row=1, column=0, sticky="w", padx=(0, 12), pady=4)
-            self.cb_model_gray.grid(row=1, column=1, sticky="w", pady=4)
-            self.lbl_models_hint.grid(row=2, column=1, columnspan=2, sticky="w", pady=(2, 0))
-            self.lbl_models_hint.configure(
-                text="Both are required: colour pages go to the first model, detected "
-                "grayscale pages to the second. \u201cauto\u201d picks the closest "
-                "MangaJaNai or IllustrationJaNai variant per page."
-            )
-        else:
-            self.lbl_model.configure(text="Model")
-            self.lbl_model_gray.grid_remove()
-            self.cb_model_gray.grid_remove()
-            self.lbl_models_hint.grid_remove()
+    def on_gray_toggle(self) -> None:
+        """Detection decides which half of the table can fire, so redraw it."""
+        self.render_rules()
         self.update_summary()
 
-    def on_gray_toggle(self) -> None:
-        self.render_models()
+    def on_levels_toggle(self) -> None:
+        """Rows whose Levels cell says "default" follow this checkbox."""
+        self.render_rules()
+        self.update_summary()
 
     # ------------------------------------------------------------------ #
     # rules
@@ -1158,74 +1154,114 @@ class App:
         return [str(m.get("name")) for m in self.models if m.get("name")]
 
     def seed_rules(self) -> None:
-        """Write the shipped working set out in full, once.
+        """Make sure the table is filled in and names real files, once.
 
-        What used to be a hidden "auto" becomes rows that can be read and
-        edited, built against the models that are actually installed.
+        Both cases need the probe to have reported the installed models: a
+        first run gets the shipped working set written out in full, and a
+        settings file from an older build gets its legacy "auto" rows resolved
+        to the file they would have picked.
         """
         if self._rules_seeded or not self.models:
             return
-        self.rules = rules.default_working_set(self.model_names())
+        installed = self.model_names()
+        if not self.rules:
+            self.rules = rules.default_working_set(installed)
+        elif any(r.is_auto for r in self.rules):
+            self.rules, notes = rules.materialise(self.rules, installed)
+            for note in notes:
+                self.log(f"rule resolved: {note}", "debug")
+            if not self.rules:
+                self.rules = rules.default_working_set(installed)
         self._rules_seeded = True
         self.save_rules()
 
     def render_rules(self) -> None:
-        """Redraw the table, its hint, and anything wrong with it."""
+        """Redraw the table and its hint. Warnings are refreshed separately."""
         tree = self.tree_rules
+        keep = self.selected_rule()
         tree.delete(*tree.get_children())
-        installed = self.model_names()
-        notes: list[str] = []
+        gray_on = bool(self.var_gray.get())
         for index, rule in enumerate(self.rules):
-            tree.insert(
-                "",
-                "end",
-                iid=str(index),
-                values=rule.columns(),
-                tags=() if rule.enabled else ("off",),
-            )
-            notes.extend(
-                f"row {index + 1}: {problem}" for problem in rules.problems(rule, installed)
-            )
+            tags: tuple[str, ...] = ()
+            if not rule.enabled:
+                tags = ("off",)
+            elif rule.kind == rules.GRAYSCALE and not gray_on:
+                tags = ("idle",)
+            tree.insert("", "end", iid=str(index), values=rule.cells(), tags=tags)
         tree.tag_configure("off", foreground=self.theme.p.muted)
+        tree.tag_configure("idle", foreground=self.theme.p.muted)
+        if 0 <= keep < len(self.rules):
+            tree.selection_set(str(keep))
 
-        on = bool(self.var_rules_on.get())
-        tree.state(["!disabled"] if on else ["disabled"])
-        for button in self.rule_buttons:
-            button.state(["!disabled"] if on else ["disabled"])
-
-        if not on:
+        if not self.rules:
             hint = (
-                "Rules are off. Colour pages go to the colour model, grayscale pages to "
-                "the grayscale model."
-            )
-        elif not self.rules:
-            hint = (
-                "No rules yet. \u201cDefaults\u201d writes out the shipped working set: "
-                "MangaJaNai by page height for grayscale pages, IllustrationJaNai for "
-                "colour."
+                "The table is empty, so nothing can run. \u201cDefaults\u201d fills it "
+                "with the shipped set, built from the models you have installed."
             )
         else:
             active = sum(1 for r in self.rules if r.enabled)
-            hint = (
-                f"{active} of {len(self.rules)} rules active. A page that matches no rule "
-                f"falls back to the two models above."
-            )
+            hint = f"{active} of {len(self.rules)} rules on"
+            if not gray_on:
+                hint += "  \u00b7  grayscale rules are idle while detection is off"
+            hint += "  \u00b7  click a dot to switch a row off, double-click a row to edit"
         self.lbl_rules_hint.configure(text=hint)
-        if on and notes:
+        self.refresh_rule_warnings()
+
+    def refresh_rule_warnings(self) -> None:
+        """Everything wrong with the table, on one line underneath it.
+
+        Kept apart from :meth:`render_rules` because the target scale can change
+        without the rows changing, and rebuilding the rows would drop the
+        selection under the user's cursor.
+        """
+        installed = self.model_names()
+        notes: list[str] = []
+        for index, rule in enumerate(self.rules):
+            if not rule.enabled:
+                continue
+            notes.extend(f"row {index + 1}: {note}" for note in rules.problems(rule, installed))
+        notes.extend(self.scale_mismatches())
+        if notes:
             self.lbl_rules_warn.configure(text="\u26a0  " + "; ".join(notes[:4]))
-            self.lbl_rules_warn.grid(row=3, column=0, sticky="w", pady=(4, 0))
+            self.lbl_rules_warn.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
         else:
             self.lbl_rules_warn.grid_remove()
 
-    def on_rules_toggle(self) -> None:
-        self.render_rules()
-        self.save_rules()
-        self.update_summary()
+    def rules_summary(self) -> str:
+        """One phrase for the card summary: how much of the table is live."""
+        if not self.rules:
+            return "no rules \u2014 the table is empty"
+        active = sum(1 for r in self.rules if r.enabled)
+        return f"{active} of {len(self.rules)} rules on"
+
+    def scale_mismatches(self) -> list[str]:
+        """Rows whose model name advertises a factor the target will not use.
+
+        Only a plain scale target has one fixed factor. In width, height and
+        fit modes the factor depends on each page, so comparing a name there
+        would fire on perfectly sensible setups. Rules that deliberately target
+        another factor are skipped too - they simply will not match.
+        """
+        if self.var_mode.get() != "scale":
+            return []
+        want = self.safe_float(self.var_scale, 2.0)
+        out: list[str] = []
+        for index, rule in enumerate(self.rules):
+            if not rule.enabled or rule.is_auto:
+                continue
+            if rule.scale and abs(rule.scale - want) > 0.01:
+                continue
+            found = rules.model_scale(rule.model)
+            if found and abs(found - want) > 0.01:
+                out.append(
+                    f"row {index + 1} runs a {found}\u00d7 model but the target is "
+                    f"{want:g}\u00d7, so the result gets resampled"
+                )
+        return out
 
     def save_rules(self) -> None:
         """Rules are remembered as they are edited, not only on Start."""
         self.settings.set("upscale", "rules", [r.to_dict() for r in self.rules])
-        self.settings.set("upscale", "rules_enabled", bool(self.var_rules_on.get()))
         self.settings.save()
 
     def selected_rule(self) -> int:
@@ -1239,9 +1275,49 @@ class App:
         self.save_rules()
         self.update_summary()
 
+    def on_rule_click(self, event: tk.Event) -> str | None:
+        """Clicking the On dot toggles that row; anywhere else just selects."""
+        tree = self.tree_rules
+        if tree.identify_region(event.x, event.y) != "cell":
+            return None
+        if tree.identify_column(event.x) != "#1":
+            return None
+        item = tree.identify_row(event.y)
+        if not item:
+            return None
+        tree.selection_set(item)
+        self.rule_toggle()
+        return "break"
+
+    def on_rule_double_click(self, event: tk.Event) -> str:
+        """Double-click edits - except on the dot, where it would toggle twice."""
+        if self.tree_rules.identify_column(event.x) != "#1":
+            self.rule_edit()
+        return "break"
+
+    def rule_toggle(self) -> None:
+        index = self.selected_rule()
+        if index < 0:
+            return
+        data = self.rules[index].to_dict()
+        data["enabled"] = not self.rules[index].enabled
+        self.rules[index] = rules.Rule.from_dict(data)
+        self.rules_changed(index)
+
+    def default_rule_model(self) -> str:
+        """A sensible model to open a new rule with - never a placeholder."""
+        names = self.model_names()
+        if not names:
+            return ""
+        scale = max(1, round(self.safe_float(self.var_scale, 2.0)))
+        return rules.gray_model(names, scale, rules.GRAY_TOP_BUCKET) or names[0]
+
     def rule_add(self) -> None:
         draft = rules.Rule(
-            kind=rules.GRAYSCALE, scale=self.safe_float(self.var_scale, 2.0), auto_levels=True
+            kind=rules.GRAYSCALE,
+            scale=self.safe_float(self.var_scale, 2.0),
+            auto_levels=True,
+            model=self.default_rule_model(),
         )
         made = self.rule_dialog("Add rule", draft)
         if made is not None:
@@ -1273,19 +1349,24 @@ class App:
 
     def rules_reset(self) -> None:
         if self.rules and not messagebox.askyesno(
-            "Replace rules",
-            "Replace the current rules with the shipped working set?",
+            "Reset the rules table",
+            "Replace every row with the shipped set, built from the models you "
+            "have installed?\n\nOnly this table changes \u2014 the rest of your "
+            "settings are left alone.",
             parent=self.root,
         ):
             return
         self.rules = rules.default_working_set(self.model_names())
         self._rules_seeded = True
         self.rules_changed(0)
+        self.log(f"rules reset to the shipped set ({len(self.rules)} rows)")
 
     def rule_dialog(self, title: str, draft: rules.Rule) -> rules.Rule | None:
         """A small modal editor for one rule."""
         scales = {"any": 0.0, "1x": 1.0, "2x": 2.0, "4x": 4.0}
-        levels: dict[str, bool | None] = {"inherit": None, "on": True, "off": False}
+        # "default" follows the Auto levels checkbox in the Upscale card. It
+        # used to read "inherit", which never said what it inherited from.
+        levels: dict[str, bool | None] = {"default": None, "on": True, "off": False}
 
         win = tk.Toplevel(self.root)
         win.title(title)
@@ -1305,28 +1386,84 @@ class App:
         v_on = tk.BooleanVar(value=draft.enabled)
 
         fields = (
-            ("Page kind", combo(box, v_kind, list(rules.KINDS), width=16)),
-            ("Target scale", combo(box, v_scale, list(scales), width=16)),
-            ("Page width", ttk.Entry(box, textvariable=v_width, width=18)),
-            ("Page height", ttk.Entry(box, textvariable=v_height, width=18)),
-            ("Model", combo(box, v_model, [AUTO_MODEL, *self.model_names()], width=54)),
-            ("Auto levels", combo(box, v_levels, list(levels), width=16)),
+            (
+                "Page kind",
+                combo(box, v_kind, list(rules.KINDS), width=16),
+                (
+                    "Which pages this rule may claim: ones detected as grayscale, "
+                    "ones detected as colour, or any page. Grayscale rules never "
+                    "fire while Grayscale detection is off."
+                ),
+            ),
+            (
+                "Target scale",
+                combo(box, v_scale, list(scales), width=16),
+                (
+                    "Restricts the rule to one output factor, so 2x and 4x rows can "
+                    "live in the same table. \u201cany\u201d fires whatever the "
+                    "target is, which is what width, height and fit targets need "
+                    "since their factor changes per page."
+                ),
+            ),
+            (
+                "Page width",
+                entry(box, v_width, width=18),
+                (
+                    "Matched against the source page width in pixels, before "
+                    "upscaling. Leave it on any unless you need to separate double "
+                    "spreads from single pages."
+                ),
+            ),
+            (
+                "Page height",
+                entry(box, v_height, width=18),
+                (
+                    "Matched against the source page height in pixels, before "
+                    "upscaling. This is the one that matters for manga: the "
+                    "MangaJaNai models are trained per page height."
+                ),
+            ),
+            (
+                "Model",
+                combo(box, v_model, self.model_names(), width=54),
+                (
+                    "The weights this rule runs. Only installed models are listed, "
+                    "and the factor in the name (1x, 2x, 4x) is what the model was "
+                    "trained for - matching it to your target avoids a resample."
+                ),
+            ),
+            (
+                "Auto levels",
+                combo(box, v_levels, list(levels), width=16),
+                (
+                    "Grayscale pages only. \u201cdefault\u201d follows the Auto "
+                    "levels checkbox in the Upscale card; \u201con\u201d and "
+                    "\u201coff\u201d override it for the pages this rule claims."
+                ),
+            ),
         )
-        for row, (label, widget) in enumerate(fields):
-            ttk.Label(box, text=label, style="MutedBg.TLabel").grid(
-                row=row, column=0, sticky="w", padx=(0, 14), pady=4
-            )
+        for row, (label, widget, tip) in enumerate(fields):
+            lbl = ttk.Label(box, text=label, style="MutedBg.TLabel")
+            lbl.grid(row=row, column=0, sticky="w", padx=(0, 14), pady=4)
             widget.grid(row=row, column=1, sticky="w", pady=4)
+            Tooltip(lbl, tip, self.theme)
+            Tooltip(widget, tip, self.theme)
         ttk.Label(
             box,
-            text="Sizes take 1920, 1600-1920, 1985-, -1250 or any. Auto levels "
-            "only ever touches grayscale pages.",
+            text="Sizes accept 1920, 1920p, a range 1600-1920, an open end 1985- "
+            "or -1250, or any. A rule that names a size always beats a rule that "
+            "says any, wherever the two sit in the table.",
             style="MutedBg.TLabel",
             wraplength=430,
             justify="left",
-        ).grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(box, text="Enabled", variable=v_on).grid(
-            row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        ).grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(10, 0))
+        chk = ttk.Checkbutton(box, text="Rule is on", variable=v_on, style="Bg.TCheckbutton")
+        chk.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        Tooltip(
+            chk,
+            "A rule that is off stays in the table and is skipped. The table "
+            "shows it as a hollow dot in the first column.",
+            self.theme,
         )
 
         out: dict[str, rules.Rule] = {}
@@ -1451,15 +1588,12 @@ class App:
         self.var_height.set(int(u.get("height", 2160)))
         self.var_display.set(displays.label_for_id(str(u.get("display", displays.CUSTOM))))
         self.var_portrait.set(bool(u.get("display_portrait", True)))
-        self.var_model.set(str(u.get("model", AUTO_MODEL)))
-        self.var_model_gray.set(str(u.get("model_gray", AUTO_MODEL)))
         self.var_levels.set(bool(u.get("auto_levels", True)))
         self.var_gray.set(bool(u.get("grayscale_convert", True)))
         self.var_threshold.set(int(u.get("grayscale_threshold", 12)))
         self.var_colour_pct.set(float(u.get("grayscale_colour_percent", 0.25)))
         self.var_pre_h.set(int(u.get("pre_downscale_height", 0)))
         self.var_skip_long.set(bool(u.get("skip_long_strips", False)))
-        self.var_rules_on.set(bool(u.get("rules_enabled", True)))
         self.rules = [rules.Rule.from_dict(r) for r in (u.get("rules") or [])]
         self._rules_seeded = bool(self.rules)
 
@@ -1502,7 +1636,6 @@ class App:
 
         self.render_format_options()
         self.render_target()
-        self.render_models()
         self.render_rules()
         self.apply_log_wrap()
         self.update_summary()
@@ -1698,22 +1831,17 @@ class App:
                 self.var_display.set(displays.label_for_id(found))
             if found != displays.CUSTOM:
                 target += f" ({self.var_display.get()})"
-        dash = "\u2014"
-        bits = [target]
+        bits = [target, self.rules_summary()]
         if self.var_gray.get():
-            bits.append(f"colour: {self.var_model.get() or dash}")
-            bits.append(f"gray: {self.var_model_gray.get() or dash}")
-        else:
-            bits.append(f"model: {self.var_model.get() or dash}")
-        if self.var_rules_on.get() and self.rules:
-            active = sum(1 for r in self.rules if r.enabled)
-            bits.append(f"{active} rule{'' if active == 1 else 's'}")
+            bits.append("grayscale detection")
         if self.var_levels.get():
             bits.append("auto levels")
         if self.safe_int(self.var_pre_h, 0):
             bits.append(f"pre-downscale {self.safe_int(self.var_pre_h, 0)}px")
+        if self.var_skip_long.get():
+            bits.append("long strips passed through")
         self.lbl_upscale_sum.configure(text=" \u00b7 ".join(bits))
-        self.update_model_warning()
+        self.refresh_rule_warnings()
 
         cid = self.container_value()
         self.lbl_container_hint.configure(text=CONTAINERS[cid].hint)
@@ -1737,37 +1865,6 @@ class App:
         if self.var_wake.get():
             hint.append("GPU kept awake")
         self.panel_perf.set_hint(" \u00b7 ".join(hint))
-
-    def update_model_warning(self) -> None:
-        """Flag a model whose name advertises a scale other than the target.
-
-        Only the plain scale mode is checked. In width/height/fit modes the
-        effective factor depends on each page's own size, so comparing against a
-        name there would fire on perfectly sensible setups.
-        """
-        notes: list[str] = []
-        if self.var_mode.get() == "scale":
-            want = self.safe_float(self.var_scale, 2.0)
-            gray_on = bool(self.var_gray.get())
-            pairs = [("Colour" if gray_on else "Selected", self.var_model.get())]
-            if gray_on:
-                pairs.append(("Grayscale", self.var_model_gray.get()))
-            for label, name in pairs:
-                name = str(name or "").strip()
-                if not name or name == AUTO_MODEL:
-                    continue
-                found = model_scale(name)
-                if found is not None and abs(found - want) > 0.01:
-                    notes.append(f"{label} model is {found}\u00d7 but the target is {want:g}\u00d7")
-        if notes:
-            self.lbl_model_warn.configure(
-                text="\u26a0  " + "; ".join(notes) + ". The output gets resampled to the "
-                "target, which throws away detail \u2014 pick a matching model or "
-                "change the scale."
-            )
-            self.lbl_model_warn.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        else:
-            self.lbl_model_warn.grid_remove()
 
     def container_value(self) -> str:
         cid = str(self.var_container.get() or "files")
@@ -1801,12 +1898,8 @@ class App:
 
     def update_start_state(self) -> None:
         ok = bool(self.var_in_path.get().strip()) and self.resolved_out_dir() is not None
-        if self.var_gray.get():
-            ok = (
-                ok
-                and bool(self.var_model.get().strip())
-                and bool(self.var_model_gray.get().strip())
-            )
+        # An empty table means no model would run, so there is nothing to start.
+        ok = ok and any(r.enabled for r in self.rules)
         if self.runner.running:
             self.btn_start.configure(text="Cancel", style="TButton", command=self.cancel)
             self.btn_start.state(["!disabled"])
@@ -1884,8 +1977,6 @@ class App:
             self.cb_device.configure(values=self._device_labels())
             if not self.var_device.get():
                 self.var_device.set(AUTO_DEVICE)
-            self.cb_model.configure(values=[AUTO_MODEL])
-            self.cb_model_gray.configure(values=[AUTO_MODEL])
             return
         self.probe = probe
         self.caps = probe.get("formats", {}) or {}
@@ -1901,16 +1992,8 @@ class App:
             labels = self._device_labels()
         self.cb_device.configure(values=labels)
 
-        names = [AUTO_MODEL] + [str(m.get("name")) for m in self.models]
-        self.cb_model.configure(values=names)
-        self.cb_model_gray.configure(values=names)
-        if self.var_model.get() not in names:
-            self.var_model.set(AUTO_MODEL)
-        if self.var_model_gray.get() not in names:
-            self.var_model_gray.set(AUTO_MODEL)
-
-        # The shipped working set is built from the models actually installed,
-        # so it can only be seeded once the probe has reported them.
+        # The shipped table is built from the models actually installed, so it
+        # can only be seeded once the probe has reported them.
         self.seed_rules()
         self.render_rules()
 
@@ -1968,7 +2051,7 @@ class App:
                 self.hide_banner()
         self.on_device_change()
         self.render_format_options()
-        self.render_models()
+        self.update_summary()
 
     def show_banner(self, text: str) -> None:
         self.banner.configure(text=text)
@@ -1999,8 +2082,6 @@ class App:
             "height": self.safe_int(self.var_height, 2160),
             "display": displays.id_for_label(self.var_display.get()),
             "display_portrait": bool(self.var_portrait.get()),
-            "model": self.var_model.get(),
-            "model_gray": self.var_model_gray.get(),
             "auto_levels": bool(self.var_levels.get()),
             "grayscale_convert": bool(self.var_gray.get()),
             "grayscale_threshold": self.safe_int(self.var_threshold, 12),
@@ -2008,7 +2089,6 @@ class App:
             "pre_downscale_height": self.safe_int(self.var_pre_h, 0),
             "skip_long_strips": bool(self.var_skip_long.get()),
             "rules": [r.to_dict() for r in self.rules],
-            "rules_enabled": bool(self.var_rules_on.get()),
         }
         d["format"]["id"] = self.var_fmt.get()
         for fid in FORMATS:
@@ -2063,12 +2143,10 @@ class App:
         if self.caps and not self.caps.get(fid, {}).get("ok", False):
             self.show_banner(f"{FORMATS[fid].label} cannot be written in this install.")
             return None
-        if d["upscale"]["grayscale_convert"] and not (
-            d["upscale"]["model"] and d["upscale"]["model_gray"]
-        ):
+        if not [r for r in d["upscale"]["rules"] if r.get("enabled", True)]:
             self.show_banner(
-                "Grayscale detection needs two models: one for colour pages "
-                "and one for grayscale pages."
+                "The rules table has no rows switched on, so no model would run. "
+                "Add a rule, or press Defaults beside the table."
             )
             return None
         self.hide_banner()
@@ -2283,11 +2361,13 @@ class App:
     def begin_run_log(self, job: dict, dry: bool) -> None:
         u, o, p = job["upscale"], job["output"], job["perf"]
         fid = job["format"]["id"]
-        models = (
-            f"colour={u.get('model')} gray={u.get('model_gray')}"
-            if u.get("grayscale_convert")
-            else f"model={u.get('model')}"
-        )
+        rows = [r for r in (u.get("rules") or []) if r.get("enabled", True)]
+        used = sorted({str(r.get("model") or "") for r in rows})
+        models = f"{len(rows)} rule(s)"
+        if used:
+            models += "  \u00b7  " + ", ".join(used[:3])
+            if len(used) > 3:
+                models += f", +{len(used) - 3} more"
         header = [
             (
                 f"JaNai Upscaler \u2014 {'dry run' if dry else 'run'} "
@@ -2296,7 +2376,7 @@ class App:
             f"input    {job['input']['path']}",
             f"output   {o['dir']}",
             f"format   {FORMATS[fid].label}  \u00b7  package {CONTAINERS[o['container']].label}",
-            f"models   {models}",
+            f"rules    {models}",
             (
                 f"device   {p.get('device') or 'auto'}  \u00b7  "
                 f"{'FP16' if p.get('use_fp16') else 'FP32'}  \u00b7  tile {p.get('tile')}"
@@ -2418,6 +2498,41 @@ class App:
         self.scroll.restyle()
         self.restyle_log()
         self.render_format_options()
+        self.render_rules()  # the on/off row colours come from the palette
+
+    def reset_all(self) -> None:
+        """Every setting back to the shipped defaults, folders excluded.
+
+        Deliberately keeps the input and output paths and the cached hardware
+        probe: nobody presses this wanting to retype where their manga lives or
+        to wait for the backend to be detected again.
+        """
+        if not messagebox.askyesno(
+            "Reset all settings",
+            "Put every setting back to its default?\n\nThe rules table, target, "
+            "output format and layout, performance options and log view are "
+            "reset. Your input and output folders are kept.",
+            parent=self.root,
+        ):
+            return
+        old = self.settings.data
+        fresh = defaults()
+        fresh["theme"] = old.get("theme", fresh.get("theme"))
+        fresh["probe"] = old.get("probe", {})
+        fresh["input"]["path"] = str((old.get("input") or {}).get("path", ""))
+        out = old.get("output") or {}
+        fresh["output"]["dir"] = str(out.get("dir", ""))
+        fresh["output"]["same_as_input"] = bool(out.get("same_as_input", True))
+        fresh["ui"] = dict(
+            fresh.get("ui") or {}, geometry=(old.get("ui") or {}).get("geometry", "")
+        )
+        self.settings.data = fresh
+        self._rules_seeded = False
+        self.reload_widgets()
+        self.seed_rules()
+        self.render_rules()
+        self.update_summary()
+        self.log("all settings reset to defaults")
 
     # ------------------------------------------------------------------ #
     def on_close(self) -> None:
