@@ -1,4 +1,10 @@
-"""Dark/light theme for ttk. Pure stdlib, no third-party dependencies."""
+"""Dark/light theme for ttk. Pure stdlib, no third-party dependencies.
+
+The look is deliberately minimal: one background, one card surface, one inset
+surface for controls, a single accent, and a 1px border instead of shadows or
+gradients. Everything is expressed as ttk styles so the widgets stay native -
+real focus rings, real DPI scaling, real keyboard behaviour.
+"""
 
 from __future__ import annotations
 
@@ -27,36 +33,36 @@ class Palette:
 
 DARK = Palette(
     name="dark",
-    bg="#15171c",
-    surface="#1c1f26",
-    surface2="#23272f",
-    border="#2f3542",
-    text="#e7eaf0",
-    muted="#98a1b0",
-    accent="#4f7cff",
-    accent_hi="#6a92ff",
+    bg="#0f1115",
+    surface="#161920",
+    surface2="#1e222b",
+    border="#272c37",
+    text="#e6e9ef",
+    muted="#8b93a3",
+    accent="#6a8cff",
+    accent_hi="#88a3ff",
     accent_text="#ffffff",
-    ok="#3fb950",
-    warn="#d9a129",
-    err="#f2544b",
-    sel="#2b3242",
+    ok="#4ec38a",
+    warn="#e0b341",
+    err="#f36d64",
+    sel="#243050",
 )
 
 LIGHT = Palette(
     name="light",
-    bg="#f3f4f7",
+    bg="#f6f7f9",
     surface="#ffffff",
-    surface2="#eceef3",
-    border="#d6dae2",
-    text="#1a1d24",
-    muted="#5d6675",
-    accent="#2f6bff",
-    accent_hi="#1f5af0",
+    surface2="#f0f2f6",
+    border="#e1e4ea",
+    text="#14171d",
+    muted="#5f6673",
+    accent="#3b6cf6",
+    accent_hi="#2a5be0",
     accent_text="#ffffff",
-    ok="#1a7f37",
-    warn="#9a6700",
-    err="#cf222e",
-    sel="#dbe5ff",
+    ok="#147d45",
+    warn="#8a6200",
+    err="#c92a2a",
+    sel="#dde6ff",
 )
 
 PALETTES = {"dark": DARK, "light": LIGHT}
@@ -111,14 +117,14 @@ class Theme:
         self.family = pick_family()
         self.mono_family = pick_family(MONO_FAMILIES, "TkFixedFont")
         # One ramp used everywhere: 9 for supporting text, 10 for body and the
-        # log, 11 and 15 for the two heading levels. Nothing sits at 8 any more,
+        # log, 11 and 16 for the two heading levels. Nothing sits at 8 any more,
         # which was too small to read on a scaled display.
         self.fonts = {
             "body": tkfont.Font(family=self.family, size=10),
             "bold": tkfont.Font(family=self.family, size=10, weight="bold"),
             "small": tkfont.Font(family=self.family, size=9),
             "tiny": tkfont.Font(family=self.family, size=9),
-            "title": tkfont.Font(family=self.family, size=15, weight="bold"),
+            "title": tkfont.Font(family=self.family, size=16, weight="bold"),
             "card": tkfont.Font(family=self.family, size=11, weight="bold"),
             "mono": tkfont.Font(family=self.mono_family, size=10),
             "mono_bold": tkfont.Font(family=self.mono_family, size=10, weight="bold"),
@@ -158,6 +164,7 @@ class Theme:
             ("*TCombobox*Listbox.selectBackground", p.accent),
             ("*TCombobox*Listbox.selectForeground", p.accent_text),
             ("*TCombobox*Listbox.font", f["body"]),
+            ("*TCombobox*Listbox.borderWidth", "0"),
             ("*Menu.background", p.surface2),
             ("*Menu.foreground", p.text),
             ("*Menu.activeBackground", p.accent),
@@ -176,14 +183,36 @@ class Theme:
         )
         s.configure("TFrame", background=p.bg)
         s.configure("Surface.TFrame", background=p.surface)
-        s.configure("Card.TFrame", background=p.surface, relief="flat")
+        # The card shell is a flat surface plus a hairline border - no shadow,
+        # no bevel. Card.TFrame and Plain.TFrame are the borderless surface used
+        # for everything nested inside a card, so nesting never draws lines.
+        s.configure(
+            "CardShell.TFrame",
+            background=p.surface,
+            bordercolor=p.border,
+            lightcolor=p.border,
+            darkcolor=p.border,
+            borderwidth=1,
+            relief="solid",
+        )
+        s.configure("Card.TFrame", background=p.surface, borderwidth=0, relief="flat")
+        s.configure("Plain.TFrame", background=p.surface, borderwidth=0, relief="flat")
         s.configure("Inset.TFrame", background=p.surface2)
-        s.configure("Drop.TFrame", background=p.surface2)
+        s.configure(
+            "Drop.TFrame",
+            background=p.surface2,
+            bordercolor=p.border,
+            lightcolor=p.border,
+            darkcolor=p.border,
+            borderwidth=1,
+            relief="solid",
+        )
         s.configure("DropActive.TFrame", background=p.sel)
 
         s.configure("TLabel", background=p.bg, foreground=p.text)
         s.configure("Card.TLabel", background=p.surface, foreground=p.text)
         s.configure("CardTitle.TLabel", background=p.surface, foreground=p.text, font=f["card"])
+        s.configure("Field.TLabel", background=p.surface, foreground=p.text, font=f["body"])
         s.configure("Muted.TLabel", background=p.surface, foreground=p.muted, font=f["small"])
         s.configure("MutedBg.TLabel", background=p.bg, foreground=p.muted, font=f["small"])
         s.configure("Inset.TLabel", background=p.surface2, foreground=p.text)
@@ -193,16 +222,17 @@ class Theme:
         s.configure("Warn.TLabel", background=p.surface, foreground=p.warn, font=f["small"])
         s.configure("Err.TLabel", background=p.surface, foreground=p.err, font=f["small"])
         s.configure(
-            "Chip.TLabel", background=p.surface2, foreground=p.muted, font=f["tiny"], padding=(6, 2)
+            "Chip.TLabel", background=p.surface2, foreground=p.muted, font=f["tiny"], padding=(8, 3)
         )
 
         s.configure(
             "TButton",
             background=p.surface2,
             foreground=p.text,
-            padding=(12, 6),
+            padding=(13, 7),
             borderwidth=0,
             relief="flat",
+            anchor="center",
         )
         s.map(
             "TButton",
@@ -213,7 +243,7 @@ class Theme:
             "Accent.TButton",
             background=p.accent,
             foreground=p.accent_text,
-            padding=(18, 8),
+            padding=(20, 8),
             font=f["bold"],
         )
         s.map(
@@ -221,8 +251,19 @@ class Theme:
             background=[("disabled", p.surface2), ("pressed", p.accent), ("active", p.accent_hi)],
             foreground=[("disabled", p.muted)],
         )
-        s.configure("Ghost.TButton", background=p.surface, foreground=p.muted, padding=(8, 4))
-        s.map("Ghost.TButton", background=[("active", p.surface2)], foreground=[("active", p.text)])
+        s.configure("Ghost.TButton", background=p.surface, foreground=p.muted, padding=(10, 5))
+        s.map(
+            "Ghost.TButton",
+            background=[("disabled", p.surface), ("active", p.surface2)],
+            foreground=[("disabled", p.border), ("active", p.text)],
+        )
+        # Same as Ghost, for toolbars that sit on the window background.
+        s.configure("GhostBg.TButton", background=p.bg, foreground=p.muted, padding=(10, 5))
+        s.map(
+            "GhostBg.TButton",
+            background=[("disabled", p.bg), ("active", p.surface2)],
+            foreground=[("disabled", p.border), ("active", p.text)],
+        )
         s.configure(
             "Link.TButton", background=p.bg, foreground=p.accent, padding=(4, 2), font=f["small"]
         )
@@ -233,7 +274,7 @@ class Theme:
             "Seg.Toolbutton",
             background=p.surface2,
             foreground=p.muted,
-            padding=(12, 5),
+            padding=(14, 6),
             anchor="center",
             font=f["small"],
             relief="flat",
@@ -250,7 +291,8 @@ class Theme:
             background=p.surface,
             foreground=p.text,
             indicatorcolor=p.surface2,
-            padding=(0, 3),
+            bordercolor=p.border,
+            padding=(0, 4),
         )
         s.map(
             "TCheckbutton",
@@ -266,6 +308,14 @@ class Theme:
             background=[("active", p.surface2)],
             indicatorcolor=[("selected", p.accent)],
         )
+        s.configure(
+            "Bg.TCheckbutton", background=p.bg, foreground=p.text, indicatorcolor=p.surface2
+        )
+        s.map(
+            "Bg.TCheckbutton",
+            background=[("active", p.bg)],
+            indicatorcolor=[("selected", p.accent)],
+        )
 
         s.configure(
             "TEntry",
@@ -275,7 +325,7 @@ class Theme:
             lightcolor=p.surface2,
             darkcolor=p.surface2,
             insertcolor=p.text,
-            padding=(6, 5),
+            padding=(8, 6),
         )
         s.map(
             "TEntry",
@@ -290,10 +340,11 @@ class Theme:
             foreground=p.text,
             bordercolor=p.border,
             arrowcolor=p.muted,
+            arrowsize=12,
             insertcolor=p.text,
             lightcolor=p.surface2,
             darkcolor=p.surface2,
-            padding=(6, 4),
+            padding=(8, 5),
         )
         s.map(
             "TSpinbox",
@@ -309,9 +360,10 @@ class Theme:
             foreground=p.text,
             bordercolor=p.border,
             arrowcolor=p.muted,
+            arrowsize=13,
             lightcolor=p.surface2,
             darkcolor=p.surface2,
-            padding=(6, 4),
+            padding=(8, 5),
             selectbackground=p.surface2,
             selectforeground=p.text,
         )
@@ -332,7 +384,7 @@ class Theme:
             bordercolor=p.border,
             borderwidth=0,
             relief="flat",
-            rowheight=24,
+            rowheight=26,
             font=f["small"],
         )
         s.map(
@@ -346,7 +398,7 @@ class Theme:
             foreground=p.muted,
             font=f["small"],
             relief="flat",
-            padding=(6, 4),
+            padding=(8, 6),
             borderwidth=0,
         )
         s.map("Rules.Treeview.Heading", background=[("active", p.surface2)])
@@ -359,28 +411,44 @@ class Theme:
             bordercolor=p.surface2,
             lightcolor=p.accent,
             darkcolor=p.accent,
-            thickness=6,
+            thickness=5,
         )
         s.configure("TSeparator", background=p.border)
         s.configure("TScale", background=p.surface, troughcolor=p.surface2)
+        for orient in ("Vertical", "Horizontal"):
+            s.configure(
+                f"{orient}.TScrollbar",
+                background=p.border,
+                troughcolor=p.bg,
+                bordercolor=p.bg,
+                arrowcolor=p.muted,
+                darkcolor=p.border,
+                lightcolor=p.border,
+                arrowsize=12,
+                relief="flat",
+            )
+            s.map(
+                f"{orient}.TScrollbar",
+                background=[("active", p.muted), ("disabled", p.surface2)],
+                arrowcolor=[("active", p.text)],
+            )
+        # Inside a card the scrollbar trough should read as the card, not as
+        # the window behind it.
         s.configure(
-            "Vertical.TScrollbar",
-            background=p.surface2,
-            troughcolor=p.bg,
-            bordercolor=p.bg,
+            "Card.Vertical.TScrollbar",
+            background=p.border,
+            troughcolor=p.surface2,
+            bordercolor=p.surface2,
+            darkcolor=p.border,
+            lightcolor=p.border,
             arrowcolor=p.muted,
-            darkcolor=p.surface2,
-            lightcolor=p.surface2,
+            arrowsize=12,
+            relief="flat",
         )
-        s.map("Vertical.TScrollbar", background=[("active", p.border)])
-        s.configure(
-            "Horizontal.TScrollbar",
-            background=p.surface2,
-            troughcolor=p.bg,
-            bordercolor=p.bg,
-            arrowcolor=p.muted,
-            darkcolor=p.surface2,
-            lightcolor=p.surface2,
+        s.map(
+            "Card.Vertical.TScrollbar",
+            background=[("active", p.muted), ("disabled", p.surface2)],
+            arrowcolor=[("active", p.text)],
         )
 
     # ------------------------------------------------------------------ #

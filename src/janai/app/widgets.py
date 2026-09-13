@@ -1,4 +1,15 @@
-"""Small reusable ttk widgets: cards, segmented controls, tooltips, scroll area."""
+"""Small reusable ttk widgets: cards, segmented controls, tables, tooltips.
+
+Two things in here are load-bearing beyond looking tidy:
+
+* **Wheel routing.** Tk's own class bindings make the wheel *change the value*
+  of a combobox or spinbox. Inside a scrolling page that means a flick of the
+  wheel silently edits a setting. Every control built here swallows the wheel
+  and scrolls the page instead (see ``wheel_guard``).
+* **Tables scroll themselves.** ``Table`` owns a scrollbar that hides when it
+  is not needed, and the wheel over it moves the rows, handing the gesture back
+  to the page only once the rows are at the end.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +17,69 @@ import tkinter as tk
 from collections.abc import Callable, Iterable, Sequence
 from tkinter import ttk
 from typing import Any
+
+WHEEL_EVENTS = ("<MouseWheel>", "<Button-4>", "<Button-5>")
+
+
+def wheel_units(event: tk.Event) -> int:
+    """Scroll units for a wheel event: negative up, positive down.
+
+    Windows and macOS report ``delta`` (120 per notch, 1 per pixel on some
+    trackpads); X11 reports buttons 4 and 5 instead.
+    """
+    num = int(getattr(event, "num", 0) or 0)
+    if num == 4:
+        return -1
+    if num == 5:
+        return 1
+    delta = int(getattr(event, "delta", 0) or 0)
+    if delta == 0:
+        return 0
+    if abs(delta) >= 120:
+        return -int(delta / 120)
+    return -1 if delta > 0 else 1
+
+
+def _is_inside(parent: tk.Misc, widget: Any) -> bool:
+    """True when ``widget`` is ``parent`` or one of its descendants.
+
+    Compares Tk path names, so it works even when the event carries a widget
+    that has already been destroyed.
+    """
+    if widget is None:
+        return False
+    top = str(parent)
+    name = str(widget)
+    return name == top or name.startswith(top + ".")
+
+
+def find_scroll_area(widget: tk.Misc | None) -> ScrollArea | None:
+    """The nearest scrolling page above ``widget``, if any."""
+    node: tk.Misc | None = widget
+    while node is not None:
+        if isinstance(node, ScrollArea):
+            return node
+        node = getattr(node, "master", None)
+    return None
+
+
+def wheel_guard(widget: tk.Misc) -> tk.Misc:
+    """Stop the wheel from editing a control; scroll the page instead.
+
+    The binding is installed on the widget itself, which runs before Tk's class
+    binding, and returns ``break`` so the class binding (the one that would
+    change the value) never runs.
+    """
+
+    def handler(event: tk.Event) -> str:
+        area = find_scroll_area(widget)
+        if area is not None:
+            area.scroll_by(wheel_units(event))
+        return "break"
+
+    for seq in WHEEL_EVENTS:
+        widget.bind(seq, handler, add="+")
+    return widget
 
 
 class ScrollArea(ttk.Frame):
@@ -28,13 +102,18 @@ class ScrollArea(ttk.Frame):
         self._win = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
         self.body.bind("<Configure>", self._on_body)
         self.canvas.bind("<Configure>", self._on_canvas)
-        self.canvas.bind("<Enter>", lambda _e: self._bind_wheel(True))
-        self.canvas.bind("<Leave>", lambda _e: self._bind_wheel(False))
+        # One global wheel binding, filtered by "is the pointer over us". The
+        # old Enter/Leave pair broke as soon as the pointer moved onto a child
+        # widget, which is most of the page.
+        for seq in WHEEL_EVENTS:
+            self.bind_all(seq, self._wheel, add="+")
 
     def _on_scroll(self, first: str, last: str) -> None:
         self.vbar.set(first, last)
-        hidden = float(first) <= 0.0 and float(last) >= 1.0
-        self.vbar.grid_remove() if hidden else self.vbar.grid()
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self.vbar.grid_remove()
+        else:
+            self.vbar.grid()
 
     def _on_body(self, _e: tk.Event) -> None:
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -42,17 +121,18 @@ class ScrollArea(ttk.Frame):
     def _on_canvas(self, e: tk.Event) -> None:
         self.canvas.itemconfigure(self._win, width=e.width)
 
-    def _bind_wheel(self, on: bool) -> None:
-        if on:
-            self.canvas.bind_all("<MouseWheel>", self._wheel)
-        else:
-            self.canvas.unbind_all("<MouseWheel>")
-
     def _wheel(self, e: tk.Event) -> None:
+        if _is_inside(self, getattr(e, "widget", None)):
+            self.scroll_by(wheel_units(e))
+
+    def scroll_by(self, units: int) -> None:
+        """Scroll the page, unless everything already fits."""
+        if not units:
+            return
         first, last = self.canvas.yview()
         if first <= 0.0 and last >= 1.0:
             return
-        self.canvas.yview_scroll(-1 * int(e.delta / 120) or (-1 if e.delta > 0 else 1), "units")
+        self.canvas.yview_scroll(units, "units")
 
     def restyle(self) -> None:
         self.canvas.configure(background=self.theme.p.bg)
@@ -64,9 +144,9 @@ class Card(ttk.Frame):
     def __init__(
         self, master: tk.Misc, title: str, subtitle: str = "", badge: str = "", **kw: Any
     ) -> None:
-        super().__init__(master, style="Card.TFrame", padding=(16, 14, 16, 16), **kw)
+        super().__init__(master, style="CardShell.TFrame", padding=(18, 15, 18, 18), **kw)
         self.columnconfigure(0, weight=1)
-        head = ttk.Frame(self, style="Card.TFrame")
+        head = ttk.Frame(self, style="Plain.TFrame")
         head.grid(row=0, column=0, sticky="ew")
         head.columnconfigure(1, weight=1)
         ttk.Label(head, text=title, style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
@@ -75,9 +155,9 @@ class Card(ttk.Frame):
             self.badge.grid(row=0, column=2, sticky="e")
         self.subtitle = ttk.Label(head, text=subtitle, style="Muted.TLabel")
         if subtitle:
-            self.subtitle.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
-        self.body = ttk.Frame(self, style="Card.TFrame")
-        self.body.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+            self.subtitle.grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        self.body = ttk.Frame(self, style="Plain.TFrame")
+        self.body.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
         self.body.columnconfigure(1, weight=1)
         self.rowconfigure(1, weight=1)
 
@@ -91,7 +171,7 @@ class Card(ttk.Frame):
     def set_subtitle(self, text: str) -> None:
         self.subtitle.configure(text=text)
         if text:
-            self.subtitle.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+            self.subtitle.grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
         else:
             self.subtitle.grid_remove()
 
@@ -122,6 +202,7 @@ class Segmented(ttk.Frame):
             rb.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 2, 0))
             self.columnconfigure(i, weight=1)
             self.buttons[value] = rb
+            wheel_guard(rb)
 
     def set_enabled(self, value: Any, enabled: bool) -> None:
         btn = self.buttons.get(value)
@@ -135,10 +216,10 @@ class Collapsible(ttk.Frame):
     def __init__(
         self, master: tk.Misc, title: str, expanded: bool = False, subtitle: str = "", **kw: Any
     ) -> None:
-        super().__init__(master, style="Card.TFrame", padding=(16, 12, 16, 12), **kw)
+        super().__init__(master, style="CardShell.TFrame", padding=(18, 13, 18, 13), **kw)
         self.columnconfigure(0, weight=1)
         self._open = tk.BooleanVar(value=expanded)
-        self.head = ttk.Frame(self, style="Card.TFrame")
+        self.head = ttk.Frame(self, style="Plain.TFrame")
         self.head.grid(row=0, column=0, sticky="ew")
         self.head.columnconfigure(1, weight=1)
         self.arrow = ttk.Label(
@@ -149,10 +230,10 @@ class Collapsible(ttk.Frame):
         self.title.grid(row=0, column=1, sticky="w")
         self.hint = ttk.Label(self.head, text=subtitle, style="Muted.TLabel")
         self.hint.grid(row=0, column=2, sticky="e")
-        self.body = ttk.Frame(self, style="Card.TFrame")
+        self.body = ttk.Frame(self, style="Plain.TFrame")
         self.body.columnconfigure(1, weight=1)
         if expanded:
-            self.body.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+            self.body.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
         for w in (self.head, self.arrow, self.title, self.hint):
             w.bind("<Button-1>", lambda _e: self.toggle())
             w.configure(cursor="hand2")
@@ -164,7 +245,7 @@ class Collapsible(ttk.Frame):
         self._open.set(value)
         self.arrow.configure(text="\u25be" if value else "\u25b8")
         if value:
-            self.body.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+            self.body.grid(row=1, column=0, sticky="nsew", pady=(14, 0))
         else:
             self.body.grid_remove()
 
@@ -175,10 +256,75 @@ class Collapsible(ttk.Frame):
         self.hint.configure(text=text)
 
 
+class Table(ttk.Frame):
+    """A Treeview that scrolls itself: visible scrollbar plus wheel support.
+
+    ``columns`` is a sequence of ``(key, heading, width, anchor, stretch)``.
+    The tree is exposed as ``.tree`` so callers keep the full Treeview API.
+    """
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        columns: Sequence[tuple[str, str, int, str, bool]],
+        height: int = 8,
+        style: str = "Rules.Treeview",
+        **kw: Any,
+    ) -> None:
+        super().__init__(master, style="Plain.TFrame", **kw)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(
+            self,
+            columns=[c[0] for c in columns],
+            show="headings",
+            height=height,
+            selectmode="browse",
+            style=style,
+        )
+        for key, heading, width, anchor, stretch in columns:
+            self.tree.heading(key, text=heading)
+            self.tree.column(
+                key, width=width, minwidth=min(width, 40), anchor=anchor, stretch=stretch
+            )
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.vbar = ttk.Scrollbar(
+            self, orient="vertical", style="Card.Vertical.TScrollbar", command=self.tree.yview
+        )
+        self.vbar.grid(row=0, column=1, sticky="ns", padx=(3, 0))
+        self.tree.configure(yscrollcommand=self._on_scroll)
+        for seq in WHEEL_EVENTS:
+            self.tree.bind(seq, self._wheel, add="+")
+
+    def _on_scroll(self, first: str, last: str) -> None:
+        self.vbar.set(first, last)
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self.vbar.grid_remove()
+        else:
+            self.vbar.grid()
+
+    def _wheel(self, e: tk.Event) -> str:
+        units = wheel_units(e)
+        if not units:
+            return "break"
+        first, last = self.tree.yview()
+        at_top = units < 0 and first <= 0.0
+        at_end = units > 0 and last >= 1.0
+        fits = first <= 0.0 and last >= 1.0
+        if fits or at_top or at_end:
+            # Nothing left to scroll here - let the page keep moving.
+            area = find_scroll_area(self)
+            if area is not None:
+                area.scroll_by(units)
+            return "break"
+        self.tree.yview_scroll(units, "units")
+        return "break"
+
+
 class Tooltip:
     """Lightweight hover tooltip."""
 
-    def __init__(self, widget: tk.Misc, text: str, theme: Any, delay: int = 450) -> None:
+    def __init__(self, widget: tk.Misc, text: str, theme: Any, delay: int = 400) -> None:
         self.widget = widget
         self.text = text
         self.theme = theme
@@ -212,8 +358,8 @@ class Tooltip:
         if self._tip is not None or not self.text:
             return
         p = self.theme.p
-        x = self.widget.winfo_rootx() + 12
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        x = self.widget.winfo_rootx() + 10
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 7
         tip = tk.Toplevel(self.widget)
         tip.wm_overrideredirect(True)
         tip.wm_geometry(f"+{x}+{y}")
@@ -225,9 +371,9 @@ class Tooltip:
             foreground=p.text,
             font=self.theme.fonts["small"],
             justify="left",
-            wraplength=320,
-            padx=8,
-            pady=6,
+            wraplength=380,
+            padx=10,
+            pady=8,
         ).pack(padx=1, pady=1)
         try:
             tip.wm_attributes("-topmost", True)
@@ -242,11 +388,11 @@ def row_label(
     text: str,
     hint: str = "",
     theme: Any = None,
-    style: str = "Card.TLabel",
+    style: str = "Field.TLabel",
 ) -> ttk.Label:
-    """Grid a right-aligned field label in column 0."""
+    """Grid a field label in column 0, with its explanation on hover."""
     lbl = ttk.Label(parent, text=text, style=style)
-    lbl.grid(row=row, column=0, sticky="w", padx=(0, 12), pady=4)
+    lbl.grid(row=row, column=0, sticky="w", padx=(0, 14), pady=5)
     if hint and theme is not None:
         Tooltip(lbl, hint, theme)
     return lbl
@@ -260,7 +406,7 @@ def hint_label(
     column: int = 1,
     columnspan: int = 1,
 ) -> ttk.Label:
-    lbl = ttk.Label(parent, text=text, style=style, wraplength=520, justify="left")
+    lbl = ttk.Label(parent, text=text, style=style, wraplength=560, justify="left")
     lbl.grid(row=row, column=column, columnspan=columnspan, sticky="w", pady=(0, 6))
     return lbl
 
@@ -277,7 +423,8 @@ def int_spin(
     """Spinbox for a numeric field.
 
     A fractional step gets an explicit format, so the arrows produce 0.25
-    instead of 0.30000000000000004.
+    instead of 0.30000000000000004. The wheel is disarmed: scrolling past a
+    spinbox scrolls the page instead of editing the number underneath.
     """
     extra: dict[str, Any] = {}
     if float(step) != int(float(step)):
@@ -297,6 +444,7 @@ def int_spin(
         sp.configure(command=on_change)
         sp.bind("<FocusOut>", lambda _e: on_change(), add="+")
         sp.bind("<Return>", lambda _e: on_change(), add="+")
+    wheel_guard(sp)
     return sp
 
 
@@ -307,12 +455,31 @@ def combo(
     width: int = 28,
     on_change: Callable[[], None] | None = None,
 ) -> ttk.Combobox:
+    """Read-only dropdown. The wheel scrolls the page, it never picks a value."""
     cb = ttk.Combobox(
         parent, textvariable=variable, values=list(values), width=width, state="readonly"
     )
     if on_change is not None:
         cb.bind("<<ComboboxSelected>>", lambda _e: on_change(), add="+")
+    wheel_guard(cb)
     return cb
+
+
+def entry(
+    parent: tk.Misc,
+    variable: tk.Variable,
+    width: int | None = None,
+    on_change: Callable[[], None] | None = None,
+) -> ttk.Entry:
+    """Text field that reports edits and does not react to the wheel."""
+    kw: dict[str, Any] = {"textvariable": variable}
+    if width is not None:
+        kw["width"] = width
+    e = ttk.Entry(parent, **kw)
+    if on_change is not None:
+        e.bind("<KeyRelease>", lambda _e: on_change(), add="+")
+    wheel_guard(e)
+    return e
 
 
 def clear(container: tk.Misc) -> None:
