@@ -41,7 +41,6 @@ import tempfile
 import threading
 import time
 import traceback
-import warnings
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -78,6 +77,7 @@ from janai.core.formats import (
     merged,
     save_kwargs,
 )
+from janai.worker import runtime
 from janai.worker.control import CTRL, Cancelled
 from janai.worker.events import emit, log
 from janai.worker.pipeline import BundleWriter, WritePool, prefetch
@@ -93,36 +93,6 @@ from janai.worker.planning import (
 
 MODEL_EXTS = {".pth", ".safetensors", ".pt", ".ckpt"}
 
-_warnings_installed = False
-
-
-def install_warning_filters() -> None:
-    """Silence the known-harmless library chatter; route the rest into the log.
-
-    ``torch.meshgrid: in an upcoming release, it will be required to pass the
-    indexing argument`` comes from inside the model architectures, which build
-    their coordinate grids the old way. It says nothing about the job, cannot be
-    fixed from here, and used to reach the GUI as a two line stderr dump with a
-    site-packages path in it, once per model load. Everything else that warns is
-    kept, but arrives as a single tidy debug line.
-    """
-    global _warnings_installed
-    if _warnings_installed:
-        return
-    _warnings_installed = True
-    warnings.filterwarnings("ignore", message=r".*torch\.meshgrid.*")
-    warnings.filterwarnings("ignore", message=r".*indexing argument.*")
-    warnings.filterwarnings("ignore", message=r".*__floordiv__ is deprecated.*")
-
-    def show(message, category, filename, lineno, file=None, line=None) -> None:
-        try:
-            name = getattr(category, "__name__", str(category))
-            log(f"{name}: {message} ({Path(str(filename)).name}:{lineno})", "debug")
-        except Exception:
-            pass
-
-    warnings.showwarning = show
-
 
 def hwc(image: Any) -> tuple[int, int, int]:
     """(height, width, channels) without needing the backend helpers imported."""
@@ -132,7 +102,16 @@ def hwc(image: Any) -> tuple[int, int, int]:
 
 
 # --------------------------------------------------------------------------- #
-# heavy backend, imported on demand
+# heavy handles, mirrored from janai.worker.runtime
+#
+# Transitional scaffolding for the Phase 1 split. runtime.py owns the lazy
+# imports now, but the pixel, model, tiling and profiling code that reads these
+# names still lives further down this file. Each extraction repoints one group
+# of consumers at ``runtime.<name>``; the last one deletes this block.
+#
+# Mirroring is safe because the loaders are idempotent and the handles are
+# module objects, and it is what lets every intermediate commit stay runnable
+# and bisectable instead of forcing one unreviewable mega-move.
 # --------------------------------------------------------------------------- #
 np = None
 cv2 = None
@@ -151,114 +130,38 @@ _load_model_node = None
 _SettingsParser = None
 _NodeContext = None
 _ProgressController = None
-TILE = {}
-_heavy_loaded = False
+TILE: dict[str, Any] = {}
+
+# Not a runtime handle: the ICC cache belongs to icc_transforms() and moves with
+# it. Kept here only because that function has not been extracted yet.
 _icc_pair = None
 _icc_warned = False
 
 
-def apply_perf_env(perf: dict) -> None:
-    """Environment that must be set before libvips/torch are imported."""
-    vc = int(perf.get("vips_concurrency") or 0)
-    if vc > 0:
-        os.environ["VIPS_CONCURRENCY"] = str(vc)
-    tt = int(perf.get("torch_threads") or 0)
-    if tt > 0:
-        os.environ.setdefault("OMP_NUM_THREADS", str(tt))
-        os.environ.setdefault("MKL_NUM_THREADS", str(tt))
+def _mirror_runtime() -> None:
+    """Publish runtime's loaded handles under the names this file still uses."""
+    global np, cv2, pyvips, torch, _PILImage, _ImageCms, _ImageFilter
+    global _cx_resize, _ResizeFilter, _normalize, _to_uint8, _get_h_w_c
+    global _upscale_image_node, _load_model_node, _SettingsParser, _NodeContext
+    global _ProgressController, TILE
+    np, cv2, pyvips, torch = runtime.np, runtime.cv2, runtime.pyvips, runtime.torch
+    _PILImage, _ImageCms, _ImageFilter = runtime.PILImage, runtime.ImageCms, runtime.ImageFilter
+    _cx_resize, _ResizeFilter = runtime.cx_resize, runtime.ResizeFilter
+    _normalize, _to_uint8, _get_h_w_c = runtime.normalize, runtime.to_uint8, runtime.get_h_w_c
+    _upscale_image_node, _load_model_node = runtime.upscale_image_node, runtime.load_model_node
+    _SettingsParser, _NodeContext = runtime.SettingsParser, runtime.NodeContext
+    _ProgressController = runtime.ProgressController
+    TILE = runtime.TILE
 
 
 def load_imaging(perf: dict | None = None) -> None:
-    """Import only what pixels need: numpy, OpenCV, libvips, Pillow.
-
-    A dry run and the encoder capability probe stop here, so neither pays for
-    importing torch or for creating a device context.
-    """
-    global np, cv2, pyvips, _PILImage, _ImageCms, _ImageFilter
-    if np is not None:
-        return
-    if perf:
-        apply_perf_env(perf)
-    install_warning_filters()
-
-    import cv2 as cv2_mod
-    import numpy
-    import pyvips as pyvips_mod
-    from PIL import Image as PILImage, ImageCms, ImageFilter
-
-    np = numpy
-    cv2 = cv2_mod
-    pyvips = pyvips_mod
-    _PILImage, _ImageCms, _ImageFilter = PILImage, ImageCms, ImageFilter
+    runtime.load_imaging(perf)
+    _mirror_runtime()
 
 
 def load_backend(perf: dict | None = None) -> None:
-    global torch, _cx_resize, _ResizeFilter, _normalize, _to_uint8, _get_h_w_c
-    global _upscale_image_node, _load_model_node, _SettingsParser, _NodeContext
-    global _ProgressController, TILE, _heavy_loaded
-    load_imaging(perf)
-    if _heavy_loaded:
-        return
-
-    import spandrel_custom
-    import torch as torch_mod
-    from api import NodeContext, SettingsParser
-    from chainner_ext import ResizeFilter, resize as cx_resize
-    from nodes.impl.image_utils import normalize, to_uint8
-    from nodes.impl.upscale.auto_split_tiles import (
-        ESTIMATE,
-        MAX_TILE_SIZE,
-        NO_TILING,
-        TileSize,
-    )
-    from nodes.utils.utils import get_h_w_c
-    from packages.chaiNNer_pytorch.pytorch.io.load_model import load_model_node
-    from packages.chaiNNer_pytorch.pytorch.processing.upscale_image import (
-        upscale_image_node,
-    )
-    from progress_controller import ProgressController
-
-    installer = getattr(spandrel_custom, "install", None)
-    if callable(installer):
-        try:
-            installer()
-        except Exception as exc:
-            log(f"spandrel_custom.install() failed: {exc}", "warn")
-
-    torch = torch_mod
-    _cx_resize, _ResizeFilter = cx_resize, ResizeFilter
-    _normalize, _to_uint8, _get_h_w_c = normalize, to_uint8, get_h_w_c
-    _upscale_image_node, _load_model_node = upscale_image_node, load_model_node
-    _SettingsParser, _NodeContext = SettingsParser, NodeContext
-    _ProgressController = ProgressController
-    TILE = {
-        "estimate": ESTIMATE,
-        "maximum": MAX_TILE_SIZE,
-        "none": NO_TILING,
-        "cls": TileSize,
-    }
-    _heavy_loaded = True
-
-
-def apply_torch_perf(perf: dict) -> None:
-    """Knobs that genuinely affect throughput. No placebo switches."""
-    tt = int(perf.get("torch_threads") or 0)
-    try:
-        if tt > 0:
-            torch.set_num_threads(tt)
-    except Exception as exc:
-        log(f"set_num_threads({tt}) ignored: {exc}", "warn")
-    try:
-        torch.backends.cudnn.benchmark = bool(perf.get("cudnn_benchmark", False))
-        if bool(perf.get("allow_tf32", True)):
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-    except Exception:
-        pass
-    try:
-        torch.set_grad_enabled(False)
-    except Exception:
-        pass
+    runtime.load_backend(perf)
+    _mirror_runtime()
 
 
 # --------------------------------------------------------------------------- #
@@ -1767,7 +1670,7 @@ def run_job(job: dict) -> int:
         load_imaging(perf)  # a dry run never imports torch
     else:
         load_backend(perf)
-        apply_torch_perf(perf)
+        runtime.apply_torch_perf(perf)
     CTRL.start()  # only safe after the imports; see the note in main()
 
     models_dir = Path(str(ups.get("models_dir") or MODELS_DIR))
@@ -2693,7 +2596,7 @@ def do_profile(job: dict) -> int:
     started = time.time()
     try:
         load_backend(perf)
-        apply_torch_perf(perf)
+        runtime.apply_torch_perf(perf)
     except Exception as exc:
         emit("profile", ok=False, error=f"backend import failed: {type(exc).__name__}: {exc}")
         return 1
@@ -2783,7 +2686,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
-    install_warning_filters()  # before torch is imported anywhere in this process
+    runtime.install_warning_filters()  # before torch is imported anywhere in this process
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace", newline="\n")
