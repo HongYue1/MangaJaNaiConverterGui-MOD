@@ -6,12 +6,12 @@ import os
 import platform
 import sys
 import time
+import traceback
 from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
-from queue import Queue
-from multiprocessing import Queue as MPQueue, Process
-from threading import Thread
+from queue import Full, Queue
+from threading import Event, Lock, Thread
 from typing import Any, Literal
 from zipfile import ZipFile, ZIP_DEFLATED
 
@@ -436,10 +436,38 @@ def final_target_resize(
     return image
 
 
-def save_image_zip(
+def get_encode_worker_count() -> int:
+    """
+    how many images may be encoded at the same time
+
+    encoding happens in libvips, which releases the GIL, so these workers really
+    do run in parallel with each other and with the upscale loop. override with
+    the MJN_ENCODE_WORKERS environment variable.
+    """
+    env_worker_count = os.environ.get("MJN_ENCODE_WORKERS", "").strip()
+    if env_worker_count.isdecimal() and int(env_worker_count) > 0:
+        return int(env_worker_count)
+
+    return max(2, min(4, (os.cpu_count() or 2) - 1))
+
+
+def get_pipeline_queue_depth(encode_worker_count: int) -> int:
+    """
+    how many images may wait in each pipeline queue
+
+    with a depth of 1, the upscale thread blocks on put() as soon as a single
+    result is waiting to be encoded, so one slow encode stalls the GPU. override
+    with the MJN_PIPELINE_DEPTH environment variable.
+    """
+    env_queue_depth = os.environ.get("MJN_PIPELINE_DEPTH", "").strip()
+    if env_queue_depth.isdecimal() and int(env_queue_depth) > 0:
+        return int(env_queue_depth)
+
+    return max(2, encode_worker_count)
+
+
+def encode_image_to_buffer(
     image: np.ndarray,
-    file_name: str,
-    output_zip: ZipFile,
     image_format: str,
     lossy_compression_quality: int,
     use_lossless_compression: bool,
@@ -449,10 +477,17 @@ def save_image_zip(
     target_width: int,
     target_height: int,
     is_grayscale: bool,
-) -> None:
-    print(f"save image to zip: {file_name}", flush=True)
+) -> bytes:
+    """
+    resize an upscaled image to its final size and encode it into file bytes
 
-    image = to_uint8(image, normalized=True)
+    this is the expensive half of the old postprocess step. it runs in the encode
+    workers, so several images can be encoded at the same time while the next
+    image is still being upscaled.
+    """
+    # upscale_worker already converts to uint8, this is a no-op for uint8 input
+    if image.dtype != np.uint8:
+        image = to_uint8(image, normalized=True)
 
     image = final_target_resize(
         image,
@@ -469,49 +504,131 @@ def save_image_zip(
     if image_format in {"webp"}:
         args["lossless"] = use_lossless_compression
     buf_img = pyvips.Image.new_from_array(image).write_to_buffer(f".{image_format}", **args)
-    output_buffer = io.BytesIO(buf_img)  # type: ignore
 
-    upscaled_image_data = output_buffer.getvalue()
-
-    # Add the resized image to the output zip
-    output_zip.writestr(file_name, upscaled_image_data)
+    return io.BytesIO(buf_img).getvalue()  # type: ignore
 
 
-def save_image(
-    image: np.ndarray,
-    output_file_path: str,
-    image_format: str,
-    lossy_compression_quality: int,
-    use_lossless_compression: bool,
-    original_width: int,
-    original_height: int,
-    target_scale: float,
-    target_width: int,
-    target_height: int,
-    is_grayscale: bool,
-) -> None:
+def write_image_file(output_file_path: str, image_data: bytes) -> None:
+    """
+    write already encoded image bytes to disk
+    """
     print(f"save image: {output_file_path}", flush=True)
 
-    image = to_uint8(image, normalized=True)
+    output_file_directory = os.path.dirname(output_file_path)
+    if output_file_directory:
+        os.makedirs(output_file_directory, exist_ok=True)
 
-    image = final_target_resize(
-        image,
-        target_scale,
-        target_width,
-        target_height,
-        original_width,
-        original_height,
-        is_grayscale,
-    )
+    with open(output_file_path, "wb") as output_file:
+        output_file.write(image_data)
 
-    args = {"Q": int(lossy_compression_quality)}
-    if image_format in {"webp"}:
-        args["lossless"] = use_lossless_compression
-    pyvips.Image.new_from_array(image).write_to_file(output_file_path, **args)
+
+PIPELINE_PUT_POLL_SECONDS = 0.5
+
+
+class PipelineConsumerGone(RuntimeError):
+    """
+    raised by PipelineQueue.put when no consumer is left to take the item
+    """
+
+
+class PipelineQueue(Queue):
+    """
+    a bounded queue whose put() stops waiting once its consumers are gone
+
+    Queue.put() on a full queue waits forever, so a consumer that dies mid-job
+    leaves its producer blocked on a queue nobody will ever drain again: the
+    job hangs with no error, which is the missing-sentinel hang in reverse.
+    Every consumer reports its own exit here, and put() rechecks that while it
+    waits, so a producer is told to stop instead of waiting for a reader that
+    no longer exists.
+    """
+
+    def __init__(self, maxsize: int = 0, consumer_count: int = 1) -> None:
+        super().__init__(maxsize=maxsize)
+        self._live_consumer_count = consumer_count
+        self._live_consumer_lock = Lock()
+        self._consumers_gone = Event()
+
+    def consumer_exited(self) -> None:
+        """
+        report that one consumer of this queue has stopped reading
+
+        the flag is only set when the last consumer leaves, because the
+        remaining ones still drain the queue.
+        """
+        with self._live_consumer_lock:
+            self._live_consumer_count -= 1
+            if self._live_consumer_count <= 0:
+                self._consumers_gone.set()
+
+    def put(
+        self, item: Any, block: bool = True, timeout: float | None = None
+    ) -> None:
+        """
+        put an item on the queue, waiting only while a consumer could take it
+        """
+        if not block or timeout is not None:
+            super().put(item, block=block, timeout=timeout)
+            return
+
+        while not self._consumers_gone.is_set():
+            try:
+                super().put(item, timeout=PIPELINE_PUT_POLL_SECONDS)
+                return
+            except Full:
+                continue
+
+        raise PipelineConsumerGone("every consumer of this queue has exited")
+
+    def put_sentinel(self, sentinel: Any) -> bool:
+        """
+        put a sentinel, accepting that the consumers may already be gone
+
+        a sentinel exists only to release a consumer, so there is nothing left
+        to report when none of them is waiting for it. sentinels are emitted
+        from finally blocks, which must not raise over the exception that
+        brought the worker down in the first place.
+        """
+        try:
+            self.put(sentinel)
+        except PipelineConsumerGone:
+            return False
+
+        return True
+
+
+def run_preprocess_worker(
+    upscale_queue: PipelineQueue,
+    preprocess_worker: Callable[..., None],
+    *args: Any,
+) -> None:
+    """
+    run a preprocess worker and always release the upscale worker afterwards
+
+    upscale_worker only stops when it reads UPSCALE_SENTINEL, so whoever fills
+    the upscale queue has to emit it however it leaves: normally, by raising,
+    or by returning early (for example "file exists, skip"). Emitting it from a
+    finally block here is what keeps a dead preprocess thread from leaving the
+    upscale thread blocked on get() forever, which used to hang the whole job.
+    """
+    try:
+        preprocess_worker(upscale_queue, *args)
+    except PipelineConsumerGone:
+        # the upscale worker already left and printed why, so the images that
+        # are left have nowhere to go
+        print("upscale worker exited, no more images will be queued", flush=True)
+    except Exception as e:
+        print(
+            f"preprocess failed, no more images will be queued: {e}",
+            flush=True,
+        )
+        traceback.print_exc()
+    finally:
+        upscale_queue.put_sentinel(UPSCALE_SENTINEL)
 
 
 def preprocess_worker_archive(
-    upscale_queue: Queue,
+    upscale_queue: PipelineQueue,
     input_archive_path: str,
     output_archive_path: str,
     target_scale: float | None,
@@ -554,7 +671,7 @@ def preprocess_worker_archive(
 
 
 def preprocess_worker_archive_file(
-    upscale_queue: Queue,
+    upscale_queue: PipelineQueue,
     input_archive: RarFile | ZipFile,
     output_archive_path: str,
     target_scale: float | None,
@@ -682,6 +799,9 @@ def preprocess_worker_archive_file(
                         model,
                     )
                 )
+        except PipelineConsumerGone:
+            # nothing is wrong with this file: there is no consumer left at all
+            raise
         except Exception as e:
             print(
                 f"could not read as image, copying file to zip instead of upscaling: {decoded_filename}, {e}",
@@ -691,13 +811,14 @@ def preprocess_worker_archive_file(
                 (image_data, decoded_filename, False, False, None, None, None, None)
             )
         #     pass
-    upscale_queue.put(UPSCALE_SENTINEL)
 
+    # the sentinel belongs to run_preprocess_worker, so that failing to open or
+    # read the archive releases the upscale worker just the same
     # print("preprocess_worker_archive exiting")
 
 
 def preprocess_worker_folder(
-    upscale_queue: Queue,
+    upscale_queue: PipelineQueue,
     input_folder_path: str,
     output_folder_path: str,
     output_filename: str,
@@ -873,12 +994,11 @@ def preprocess_worker_folder(
                         loaded_models,
                         grayscale_detection_threshold,
                     )  # TODO custom output extension
-    upscale_queue.put(UPSCALE_SENTINEL)
     # print("preprocess_worker_folder exiting")
 
 
 def preprocess_worker_image(
-    upscale_queue: Queue,
+    upscale_queue: PipelineQueue,
     input_image_path: str,
     output_image_path: str,
     overwrite_existing_files: bool,
@@ -994,57 +1114,23 @@ def preprocess_worker_image(
                 model,
             )
         )
-    upscale_queue.put(UPSCALE_SENTINEL)
 
 
-def upscale_worker(upscale_queue: Queue, postprocess_queue: Queue) -> None:
-    """
-    wait for upscale queue, for each queue entry, upscale image and add result to postprocess queue
-    """
-    # print("upscale_worker entering")
-    while True:
-        (
-            image,
-            file_name,
-            is_image,
-            is_grayscale,
-            original_width,
-            original_height,
-            model_tile_size,
-            model,
-        ) = upscale_queue.get()
-        if image is None:
-            break
-
-        if is_image:
-            image = ai_upscale_image(image, model_tile_size, model)
-
-            # convert back to grayscale
-            if is_grayscale:
-                image = convert_image_to_grayscale(image)
-
-        postprocess_queue.put(
-            (image, file_name, is_image, is_grayscale, original_width, original_height)
-        )
-    postprocess_queue.put(POSTPROCESS_SENTINEL)
-    # print("upscale_worker exiting")
-
-
-def postprocess_worker_zip(
-    postprocess_queue: Queue,
-    output_zip_path: str,
-    image_format: str,
-    lossy_compression_quality: int,
-    use_lossless_compression: bool,
-    target_scale: float,
-    target_width: int,
-    target_height: int,
+def upscale_worker(
+    upscale_queue: PipelineQueue,
+    encode_queue: PipelineQueue,
+    encode_worker_count: int = 1,
 ) -> None:
     """
-    wait for postprocess queue, for each queue entry, save the image to the zip file
+    wait for upscale queue, for each queue entry, upscale image and add result to encode queue
+
+    the result is converted to uint8 before it is queued: that is the same order
+    of operations as before, it makes a queued image use four times less memory,
+    and it leaves the encode workers with only resizing and encoding to do.
     """
-    # print("postprocess_worker_zip entering")
-    with ZipFile(output_zip_path, "w", ZIP_DEFLATED) as output_zip:
+    # print("upscale_worker entering")
+    sequence_number = 0
+    try:
         while True:
             (
                 image,
@@ -1053,34 +1139,54 @@ def postprocess_worker_zip(
                 is_grayscale,
                 original_width,
                 original_height,
-            ) = postprocess_queue.get()
+                model_tile_size,
+                model,
+            ) = upscale_queue.get()
             if image is None:
                 break
+
             if is_image:
-                # image = postprocess_image(image)
-                save_image_zip(
+                image = ai_upscale_image(image, model_tile_size, model)
+
+                # convert back to grayscale
+                if is_grayscale:
+                    image = convert_image_to_grayscale(image)
+
+                image = to_uint8(image, normalized=True)
+
+            # the sequence number lets the writer restore the original order,
+            # because the encode workers finish out of order
+            encode_queue.put(
+                (
+                    sequence_number,
                     image,
-                    str(Path(file_name).with_suffix(f".{image_format}")),
-                    output_zip,
-                    image_format,
-                    lossy_compression_quality,
-                    use_lossless_compression,
+                    file_name,
+                    is_image,
+                    is_grayscale,
                     original_width,
                     original_height,
-                    target_scale,
-                    target_width,
-                    target_height,
-                    is_grayscale,
                 )
-            else:  # copy file
-                output_zip.writestr(file_name, image)
-            print("PROGRESS=postprocess_worker_zip_image", flush=True)
-        print("PROGRESS=postprocess_worker_zip_archive", flush=True)
+            )
+            sequence_number += 1
+    except PipelineConsumerGone:
+        print(
+            "every encode worker exited, no more images will be encoded",
+            flush=True,
+        )
+    finally:
+        # a preprocess worker blocked on a full upscale queue has to learn
+        # that its only reader is gone
+        upscale_queue.consumer_exited()
+        # one sentinel per encode worker, in a finally block so that a failed
+        # upscale cannot leave the rest of the pipeline waiting forever
+        for _ in range(max(1, encode_worker_count)):
+            encode_queue.put_sentinel(ENCODE_SENTINEL)
+    # print("upscale_worker exiting")
 
 
-def postprocess_worker_folder(
-    postprocess_queue: Queue,
-    output_folder_path: str,
+def encode_worker(
+    encode_queue: PipelineQueue,
+    write_queue: PipelineQueue,
     image_format: str,
     lossy_compression_quality: int,
     use_lossless_compression: bool,
@@ -1089,69 +1195,214 @@ def postprocess_worker_folder(
     target_height: int,
 ) -> None:
     """
-    wait for postprocess queue, for each queue entry, save the image to the output folder
+    wait for encode queue, encode each upscaled image into file bytes, pass the
+    bytes on to the write queue
+
+    several of these run at the same time, so an image no longer waits for the
+    previous image to finish encoding, and the upscaler only waits for an
+    encoder when every worker is already busy.
+    """
+    try:
+        while True:
+            (
+                sequence_number,
+                image,
+                file_name,
+                is_image,
+                is_grayscale,
+                original_width,
+                original_height,
+            ) = encode_queue.get()
+            if sequence_number is None:
+                break
+
+            image_data = image
+            if is_image:
+                try:
+                    image_data = encode_image_to_buffer(
+                        image,
+                        image_format,
+                        lossy_compression_quality,
+                        use_lossless_compression,
+                        original_width,
+                        original_height,
+                        target_scale,
+                        target_width,
+                        target_height,
+                        is_grayscale,
+                    )
+                except Exception as e:
+                    print(
+                        f"could not encode image, skipping: {file_name}, {e}",
+                        flush=True,
+                    )
+                    image_data = None
+
+            write_queue.put((sequence_number, file_name, image_data, is_image))
+    except PipelineConsumerGone:
+        print("writer exited, encoded images are being dropped", flush=True)
+    finally:
+        encode_queue.consumer_exited()
+        write_queue.put_sentinel(WRITE_SENTINEL)
+
+
+def start_encode_workers(
+    encode_queue: PipelineQueue,
+    write_queue: PipelineQueue,
+    encode_worker_count: int,
+    image_format: str,
+    lossy_compression_quality: int,
+    use_lossless_compression: bool,
+    target_scale: float,
+    target_width: int,
+    target_height: int,
+) -> list[Thread]:
+    """
+    start the encode workers that sit between the upscaler and the writer
+    """
+    encode_processes = [
+        Thread(
+            target=encode_worker,
+            args=(
+                encode_queue,
+                write_queue,
+                image_format,
+                lossy_compression_quality,
+                use_lossless_compression,
+                target_scale,
+                target_width,
+                target_height,
+            ),
+        )
+        for _ in range(encode_worker_count)
+    ]
+    for encode_process in encode_processes:
+        encode_process.start()
+
+    return encode_processes
+
+
+def ordered_write_worker(
+    write_queue: PipelineQueue,
+    encode_worker_count: int,
+    write_entry: Callable[[str, Any, bool], None],
+) -> None:
+    """
+    consume the write queue and write each entry in the original image order
+
+    an image that is encoded early is held back until every earlier image has
+    been written, so parallel encoding can never reorder the pages of an archive
+    or the progress output.
+    """
+    pending: dict[int, tuple[str, Any, bool]] = {}
+    next_sequence_number = 0
+    finished_encode_workers = 0
+
+    def write_pending_entry(sequence_number: int) -> None:
+        file_name, image_data, is_image = pending.pop(sequence_number)
+        try:
+            write_entry(file_name, image_data, is_image)
+        except Exception as e:
+            print(f"could not write image: {file_name}, {e}", flush=True)
+
+    try:
+        while finished_encode_workers < encode_worker_count:
+            sequence_number, file_name, image_data, is_image = write_queue.get()
+            if sequence_number is None:
+                finished_encode_workers += 1
+                continue
+
+            pending[sequence_number] = (file_name, image_data, is_image)
+
+            while next_sequence_number in pending:
+                write_pending_entry(next_sequence_number)
+                next_sequence_number += 1
+
+        # only reachable if a sequence number went missing, and dropping images
+        # silently would be worse than writing them late
+        for sequence_number in sorted(pending):
+            write_pending_entry(sequence_number)
+    finally:
+        # an encode worker blocked on a full write queue would otherwise wait
+        # for a writer that is no longer there
+        write_queue.consumer_exited()
+
+
+def postprocess_worker_zip(
+    write_queue: PipelineQueue,
+    output_zip_path: str,
+    image_format: str,
+    encode_worker_count: int,
+) -> None:
+    """
+    wait for write queue, for each queue entry, save the image to the zip file
+
+    a single writer owns the zip file, and writes the already encoded bytes in
+    the original page order.
+    """
+    # print("postprocess_worker_zip entering")
+    output_zip_directory = os.path.dirname(output_zip_path)
+    if output_zip_directory:
+        os.makedirs(output_zip_directory, exist_ok=True)
+
+    with ZipFile(output_zip_path, "w", ZIP_DEFLATED) as output_zip:
+
+        def write_entry(file_name: str, image_data: Any, is_image: bool) -> None:
+            if image_data is not None:
+                if is_image:
+                    entry_name = str(Path(file_name).with_suffix(f".{image_format}"))
+                    print(f"save image to zip: {entry_name}", flush=True)
+                    output_zip.writestr(entry_name, image_data)
+                else:  # copy file
+                    output_zip.writestr(file_name, image_data)
+            print("PROGRESS=postprocess_worker_zip_image", flush=True)
+
+        ordered_write_worker(write_queue, encode_worker_count, write_entry)
+
+    print("PROGRESS=postprocess_worker_zip_archive", flush=True)
+
+
+def postprocess_worker_folder(
+    write_queue: PipelineQueue,
+    output_folder_path: str,
+    image_format: str,
+    encode_worker_count: int,
+) -> None:
+    """
+    wait for write queue, for each queue entry, save the image to the output folder
     """
     # print("postprocess_worker_folder entering")
-    while True:
-        image, file_name, _, is_grayscale, original_width, original_height = (
-            postprocess_queue.get()
-        )
-        if image is None:
-            break
-        image = postprocess_image(image)
-        save_image(
-            image,
-            os.path.join(output_folder_path, str(Path(f"{file_name}.{image_format}"))),
-            image_format,
-            lossy_compression_quality,
-            use_lossless_compression,
-            original_width,
-            original_height,
-            target_scale,
-            target_width,
-            target_height,
-            is_grayscale,
-        )
+
+    def write_entry(file_name: str, image_data: Any, _is_image: bool) -> None:
+        if image_data is not None:
+            write_image_file(
+                os.path.join(
+                    output_folder_path, str(Path(f"{file_name}.{image_format}"))
+                ),
+                image_data,
+            )
         print("PROGRESS=postprocess_worker_folder", flush=True)
+
+    ordered_write_worker(write_queue, encode_worker_count, write_entry)
 
     # print("postprocess_worker_folder exiting")
 
 
 def postprocess_worker_image(
-    postprocess_queue: Queue,
+    write_queue: PipelineQueue,
     output_file_path: str,
-    image_format: str,
-    lossy_compression_quality: int,
-    use_lossless_compression: bool,
-    target_scale: float,
-    target_width: int,
-    target_height: int,
+    encode_worker_count: int,
 ) -> None:
     """
-    wait for postprocess queue, for each queue entry, save the image to the output file path
+    wait for write queue, for each queue entry, save the image to the output file path
     """
-    while True:
-        image, _, _, is_grayscale, original_width, original_height = (
-            postprocess_queue.get()
-        )
-        if image is None:
-            break
-        # image = postprocess_image(image)
 
-        save_image(
-            image,
-            output_file_path,
-            image_format,
-            lossy_compression_quality,
-            use_lossless_compression,
-            original_width,
-            original_height,
-            target_scale,
-            target_width,
-            target_height,
-            is_grayscale,
-        )
+    def write_entry(_file_name: str, image_data: Any, _is_image: bool) -> None:
+        if image_data is not None:
+            write_image_file(output_file_path, image_data)
         print("PROGRESS=postprocess_worker_image", flush=True)
+
+    ordered_write_worker(write_queue, encode_worker_count, write_entry)
 
 
 def upscale_archive_file(
@@ -1169,14 +1420,23 @@ def upscale_archive_file(
 ) -> None:
     # TODO accept multiple paths to reuse simple queues?
 
-    upscale_queue = Queue(maxsize=1)
-    postprocess_queue = MPQueue(maxsize=1)
+    encode_worker_count = get_encode_worker_count()
+    queue_depth = get_pipeline_queue_depth(encode_worker_count)
+
+    # bounded queues that tell a producer when their consumers are gone, so a
+    # worker that dies downstream cannot leave one blocked on put() forever
+    upscale_queue = PipelineQueue(maxsize=queue_depth)
+    encode_queue = PipelineQueue(
+        maxsize=queue_depth, consumer_count=encode_worker_count
+    )
+    write_queue = PipelineQueue(maxsize=queue_depth)
 
     # start preprocess zip process
     preprocess_process = Thread(
-        target=preprocess_worker_archive,
+        target=run_preprocess_worker,
         args=(
             upscale_queue,
+            preprocess_worker_archive,
             input_zip_path,
             output_zip_path,
             target_scale,
@@ -1191,22 +1451,33 @@ def upscale_archive_file(
 
     # start upscale process
     upscale_process = Thread(
-        target=upscale_worker, args=(upscale_queue, postprocess_queue)
+        target=upscale_worker,
+        args=(upscale_queue, encode_queue, encode_worker_count),
     )
     upscale_process.start()
 
+    # start encode processes, which encode images in parallel so that the
+    # upscaler never waits for an image to finish encoding
+    encode_processes = start_encode_workers(
+        encode_queue,
+        write_queue,
+        encode_worker_count,
+        image_format,
+        lossy_compression_quality,
+        use_lossless_compression,
+        target_scale,
+        target_width,
+        target_height,
+    )
+
     # start postprocess zip process
-    postprocess_process = Process(
+    postprocess_process = Thread(
         target=postprocess_worker_zip,
         args=(
-            postprocess_queue,
+            write_queue,
             output_zip_path,
             image_format,
-            lossy_compression_quality,
-            use_lossless_compression,
-            target_scale,
-            target_width,
-            target_height,
+            encode_worker_count,
         ),
     )
     postprocess_process.start()
@@ -1214,6 +1485,8 @@ def upscale_archive_file(
     # wait for all processes
     preprocess_process.join()
     upscale_process.join()
+    for encode_process in encode_processes:
+        encode_process.join()
     postprocess_process.join()
 
 
@@ -1231,14 +1504,23 @@ def upscale_image_file(
     loaded_models: dict[str, ModelDescriptor],
     grayscale_detection_threshold: int,
 ) -> None:
-    upscale_queue = Queue(maxsize=1)
-    postprocess_queue = MPQueue(maxsize=1)
+    encode_worker_count = get_encode_worker_count()
+    queue_depth = get_pipeline_queue_depth(encode_worker_count)
+
+    # bounded queues that tell a producer when their consumers are gone, so a
+    # worker that dies downstream cannot leave one blocked on put() forever
+    upscale_queue = PipelineQueue(maxsize=queue_depth)
+    encode_queue = PipelineQueue(
+        maxsize=queue_depth, consumer_count=encode_worker_count
+    )
+    write_queue = PipelineQueue(maxsize=queue_depth)
 
     # start preprocess image process
     preprocess_process = Thread(
-        target=preprocess_worker_image,
+        target=run_preprocess_worker,
         args=(
             upscale_queue,
+            preprocess_worker_image,
             input_image_path,
             output_image_path,
             overwrite_existing_files,
@@ -1254,22 +1536,31 @@ def upscale_image_file(
 
     # start upscale process
     upscale_process = Thread(
-        target=upscale_worker, args=(upscale_queue, postprocess_queue)
+        target=upscale_worker,
+        args=(upscale_queue, encode_queue, encode_worker_count),
     )
     upscale_process.start()
 
+    # start encode processes
+    encode_processes = start_encode_workers(
+        encode_queue,
+        write_queue,
+        encode_worker_count,
+        image_format,
+        lossy_compression_quality,
+        use_lossless_compression,
+        target_scale,
+        target_width,
+        target_height,
+    )
+
     # start postprocess image process
-    postprocess_process = Process(
+    postprocess_process = Thread(
         target=postprocess_worker_image,
         args=(
-            postprocess_queue,
+            write_queue,
             output_image_path,
-            image_format,
-            lossy_compression_quality,
-            use_lossless_compression,
-            target_scale,
-            target_width,
-            target_height,
+            encode_worker_count,
         ),
     )
     postprocess_process.start()
@@ -1277,6 +1568,8 @@ def upscale_image_file(
     # wait for all processes
     preprocess_process.join()
     upscale_process.join()
+    for encode_process in encode_processes:
+        encode_process.join()
     postprocess_process.join()
 
 
@@ -1368,14 +1661,23 @@ def upscale_folder(
     # print("upscale_folder: entering")
 
     # preprocess_queue = Queue(maxsize=1)
-    upscale_queue = Queue(maxsize=1)
-    postprocess_queue = MPQueue(maxsize=1)
+    encode_worker_count = get_encode_worker_count()
+    queue_depth = get_pipeline_queue_depth(encode_worker_count)
+
+    # bounded queues that tell a producer when their consumers are gone, so a
+    # worker that dies downstream cannot leave one blocked on put() forever
+    upscale_queue = PipelineQueue(maxsize=queue_depth)
+    encode_queue = PipelineQueue(
+        maxsize=queue_depth, consumer_count=encode_worker_count
+    )
+    write_queue = PipelineQueue(maxsize=queue_depth)
 
     # start preprocess folder process
     preprocess_process = Thread(
-        target=preprocess_worker_folder,
+        target=run_preprocess_worker,
         args=(
             upscale_queue,
+            preprocess_worker_folder,
             input_folder_path,
             output_folder_path,
             output_filename,
@@ -1397,22 +1699,32 @@ def upscale_folder(
 
     # start upscale process
     upscale_process = Thread(
-        target=upscale_worker, args=(upscale_queue, postprocess_queue)
+        target=upscale_worker,
+        args=(upscale_queue, encode_queue, encode_worker_count),
     )
     upscale_process.start()
 
+    # start encode processes
+    encode_processes = start_encode_workers(
+        encode_queue,
+        write_queue,
+        encode_worker_count,
+        image_format,
+        lossy_compression_quality,
+        use_lossless_compression,
+        target_scale,
+        target_width,
+        target_height,
+    )
+
     # start postprocess folder process
-    postprocess_process = Process(
+    postprocess_process = Thread(
         target=postprocess_worker_folder,
         args=(
-            postprocess_queue,
+            write_queue,
             output_folder_path,
             image_format,
-            lossy_compression_quality,
-            use_lossless_compression,
-            target_scale,
-            target_width,
-            target_height,
+            encode_worker_count,
         ),
     )
     postprocess_process.start()
@@ -1420,6 +1732,8 @@ def upscale_folder(
     # wait for all processes
     preprocess_process.join()
     upscale_process.join()
+    for encode_process in encode_processes:
+        encode_process.join()
     postprocess_process.join()
 
 
@@ -1519,7 +1833,8 @@ workflow = settings["Workflows"]["$values"][settings["SelectedWorkflowIndex"]]
 models_directory = settings["ModelsDirectory"]
 
 UPSCALE_SENTINEL = (None, None, None, None, None, None, None, None)
-POSTPROCESS_SENTINEL = (None, None, None, None, None, None)
+ENCODE_SENTINEL = (None, None, None, None, None, None, None)
+WRITE_SENTINEL = (None, None, None, None)
 CV2_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 IMAGE_EXTENSIONS = (*CV2_IMAGE_EXTENSIONS, ".avif")
 ZIP_EXTENSIONS = (".zip", ".cbz")
