@@ -209,6 +209,8 @@ class MainWindow(QMainWindow):
         self.completed = 0
         self.failed = 0
         self.skipped = 0
+        self.started_index = 0
+        self.progress_sub = ""
         self.started_at = 0.0
         self.dry = False
         self.last_out_dir: Path | None = None
@@ -2367,8 +2369,9 @@ class MainWindow(QMainWindow):
         self.dry = bool(event.get("dry")) or self.dry
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
-        head = "Planning" if self.dry else "Upscaling"
-        self.lbl_status.setText(f"{head} 0/{self.total}")
+        self.started_index = 0
+        self.progress_sub = ""
+        self.render_status()
         self.lbl_detail.setText(
             f"{event.get('device')} \u00b7 "
             f"{'FP16' if event.get('fp16') else 'FP32'} \u00b7 "
@@ -2377,13 +2380,43 @@ class MainWindow(QMainWindow):
         for text, level in format_start(event):
             self.log(text, level)
 
+    def render_status(self, total: int = 0) -> None:
+        """Write the status line from one place.
+
+        Two counters used to fight over this label: the worker's progress
+        index, which counts the files it has *started*, and the finished count.
+        The worker reads, upscales and writes on separate threads, so by the
+        time a file is finished it has already announced the next one or two -
+        which made the number jump forward and then fall back a moment later.
+        Show the oldest file still in flight instead (finished + 1, never past
+        what the worker has actually started): that only ever moves forward.
+        """
+        total = total or self.total or 0
+        finished = self.completed + self.failed + self.skipped
+        current = min(finished + 1, self.started_index) if self.started_index else finished
+        current = max(current, finished)
+        if total:
+            current = min(current, total)
+        elapsed = max(0.001, time.time() - self.started_at)
+        rate = self.completed / elapsed if self.completed else 0.0
+        left = max(0, total - finished)
+        eta = f" \u00b7 ETA {fmt_secs(left / rate)}" if rate > 0 and left > 0 else ""
+        head = "Planning" if self.dry else "Upscaling"
+        self.lbl_status.setText(f"{head} {current}/{total}{self.progress_sub}{eta}")
+
     def on_progress(self, event: dict) -> None:
         name = Path(str(event.get("path", ""))).name
         index = int(event.get("i") or 0)
-        total = int(event.get("total") or self.total or 0)
-        sub = f" (page {event.get('sub_i')}/{event.get('sub_n')})" if event.get("sub_n") else ""
-        head = "Planning" if self.dry else "Upscaling"
-        self.lbl_status.setText(f"{head} {index}/{total}{sub}")
+        total = int(event.get("total") or 0)
+        if total:
+            self.total = total
+        # keep the furthest file the worker has started, but let render_status
+        # decide which number to show, so read-ahead cannot reach the label
+        self.started_index = max(self.started_index, index)
+        self.progress_sub = (
+            f" (page {event.get('sub_i')}/{event.get('sub_n')})" if event.get("sub_n") else ""
+        )
+        self.render_status(total)
         self.lbl_detail.setText(name)
 
     def on_file(self, event: dict) -> None:
@@ -2400,12 +2433,7 @@ class MainWindow(QMainWindow):
         self.log(text, level)
         finished = self.completed + self.failed + self.skipped
         self.bar.setValue(int(min(100.0, 100.0 * finished / max(1, total))))
-        elapsed = max(0.001, time.time() - self.started_at)
-        rate = self.completed / elapsed if self.completed else 0.0
-        left = total - finished
-        eta = f" \u00b7 ETA {fmt_secs(left / rate)}" if rate > 0 and left > 0 else ""
-        head = "Planning" if self.dry else "Upscaling"
-        self.lbl_status.setText(f"{head} {finished}/{total}{eta}")
+        self.render_status(total)
 
     def on_done(self, event: dict) -> None:
         elapsed = float(event.get("elapsed") or (time.time() - self.started_at))
@@ -2584,6 +2612,8 @@ class MainWindow(QMainWindow):
         self.completed = 0
         self.failed = 0
         self.skipped = 0
+        self.started_index = 0
+        self.progress_sub = ""
         self.started_at = time.time()
         self.bar.setValue(0)
         self.last_out_dir = Path(job["output"]["dir"])
