@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, Signal
-from PySide6.QtGui import QColor, QKeyEvent
+from PySide6.QtGui import QColor, QKeyEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -30,6 +30,10 @@ from janai.core import rules
 
 #: Column order. The first one is the on/off checkbox and has no heading.
 HEADERS: tuple[str, ...] = ("", "When", "Page size", "Model", "Auto levels")
+
+#: The exclusions table shares this model and shows only the cells that mean
+#: anything for a row that runs no model at all: no Model, no auto levels.
+EXCLUSION_HEADERS: tuple[str, ...] = ("", "When", "Page size", "What happens")
 
 #: Presets for the target-scale box. The box is editable, so a custom model
 #: factor - 3x, 1.5x, 8x - can simply be typed in.
@@ -97,12 +101,14 @@ class RulesModel(QAbstractTableModel):
         gray_on: bool = True,
         installed: Sequence[str] = (),
         parent: QObject | None = None,
+        headers: Sequence[str] = HEADERS,
     ) -> None:
         super().__init__(parent)
         self._palette = palette
         self._rules: list[rules.Rule] = list(items)
         self._gray_on = bool(gray_on)
         self._installed: list[str] = list(installed)
+        self._headers: tuple[str, ...] = tuple(headers)
 
     # ---- python side -------------------------------------------------- #
     @property
@@ -131,7 +137,7 @@ class RulesModel(QAbstractTableModel):
         if not self._rules:
             return
         top = self.index(0, 0)
-        bottom = self.index(len(self._rules) - 1, len(HEADERS) - 1)
+        bottom = self.index(len(self._rules) - 1, len(self._headers) - 1)
         self.dataChanged.emit(top, bottom)
 
     def rule_at(self, row: int) -> rules.Rule | None:
@@ -152,7 +158,7 @@ class RulesModel(QAbstractTableModel):
     def columnCount(self, parent: QModelIndex | None = None) -> int:
         if parent is not None and parent.isValid():
             return 0
-        return len(HEADERS)
+        return len(self._headers)
 
     def headerData(
         self,
@@ -168,8 +174,8 @@ class RulesModel(QAbstractTableModel):
             if role == Qt.ItemDataRole.TextAlignmentRole:
                 return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             return None
-        if role == Qt.ItemDataRole.DisplayRole and 0 <= section < len(HEADERS):
-            return HEADERS[section]
+        if role == Qt.ItemDataRole.DisplayRole and 0 <= section < len(self._headers):
+            return self._headers[section]
         if role == Qt.ItemDataRole.TextAlignmentRole:
             return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         return None
@@ -238,7 +244,7 @@ class RulesModel(QAbstractTableModel):
             return False
         self._rules[row] = rules.with_enabled(rule, Qt.CheckState(value) == Qt.CheckState.Checked)
         left = self.index(row, 0)
-        right = self.index(row, len(HEADERS) - 1)
+        right = self.index(row, len(self._headers) - 1)
         self.dataChanged.emit(left, right)
         self.edited.emit()
         return True
@@ -255,7 +261,12 @@ class RulesModel(QAbstractTableModel):
 class RulesTable(QTableView):
     """The view: rows, no grid, and the model column takes the slack."""
 
-    def __init__(self, model: RulesModel, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        model: RulesModel,
+        parent: QWidget | None = None,
+        rows: int = 6,
+    ) -> None:
         super().__init__(parent)
         self.setModel(model)
         self._model = model
@@ -273,21 +284,27 @@ class RulesTable(QTableView):
         head = self.horizontalHeader()
         head.setHighlightSections(False)
         head.setSectionsClickable(False)
+        # Column 3 takes the slack in both tables: the model file in the rules
+        # table, what happens to the page in the exclusions table.
+        last = max(1, model.columnCount() - 1)
         head.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        head.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        head.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        head.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        head.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        for column in range(1, last + 1):
+            head.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        head.setSectionResizeMode(min(3, last), QHeaderView.ResizeMode.Stretch)
+        if last >= 4:
+            head.setSectionResizeMode(last, QHeaderView.ResizeMode.Fixed)
+            self.setColumnWidth(last, 96)
         self.setColumnWidth(0, 34)
-        self.setColumnWidth(4, 96)
 
-        rows = self.verticalHeader()
-        rows.setVisible(True)  # the warnings under the table cite row numbers
-        rows.setHighlightSections(False)
-        rows.setFixedWidth(36)
-        rows.setDefaultSectionSize(28)
-        rows.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        self.setMinimumHeight(28 * 6 + 34)
+        # Not named `rows`: that shadowed the row-count argument below and made
+        # the table impossible to construct at all.
+        side = self.verticalHeader()
+        side.setVisible(True)  # the warnings under the table cite row numbers
+        side.setHighlightSections(False)
+        side.setFixedWidth(36)
+        side.setDefaultSectionSize(28)
+        side.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.setMinimumHeight(28 * max(2, int(rows)) + 34)
 
     def current_row(self) -> int:
         index = self.currentIndex()
@@ -297,6 +314,22 @@ class RulesTable(QTableView):
         if 0 <= row < self._model.rowCount():
             self.selectRow(row)
             self.setCurrentIndex(self._model.index(row, 1))
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        """Keep the wheel in the table instead of handing it to the page.
+
+        A scroll area ignores a wheel event it cannot use, and Qt then offers it
+        to the parent: reaching either end of the table threw the wheel at the
+        whole page, which jumped under the pointer. So the table swallows the
+        wheel whenever it has somewhere to scroll, and only lets it through when
+        there is genuinely nothing left to scroll here.
+        """
+        bar = self.verticalScrollBar()
+        if bar is not None and bar.maximum() > bar.minimum():
+            super().wheelEvent(event)
+            event.accept()
+            return
+        event.ignore()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         """Space toggles the selected rule wherever the cursor sits."""

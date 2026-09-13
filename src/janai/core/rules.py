@@ -431,15 +431,21 @@ def problems(rule: Rule, installed: Sequence[str] = ()) -> list[str]:
     """Human-readable warnings for one rule: never fatal, just honest."""
     out: list[str] = []
     names = {str(n) for n in installed}
-    if rule.is_auto:
-        out.append("no model chosen - open the row and pick one")
-    if not rule.is_auto and names and rule.model not in names:
-        out.append(f"{rule.model} is not installed")
-    factor = model_scale(rule.model) if not rule.is_auto else 0
-    if factor and rule.scale and bucket_scale(factor) != bucket_scale(rule.scale):
-        out.append(f"{rule.model} is x{factor} but the rule targets {rule.scale:g}x")
-    if rule.kind == COLOUR and rule.auto_levels:
-        out.append("auto-levels only applies to grayscale pages")
+    # An exclusion runs no model, so none of the model checks apply to it:
+    # warning that its model is missing would be warning about a field the
+    # row never uses.
+    if rule.action != PASSTHROUGH:
+        if rule.is_auto:
+            out.append("no model chosen - open the row and pick one")
+        if not rule.is_auto and names and rule.model not in names:
+            out.append(f"{rule.model} is not installed")
+        factor = model_scale(rule.model) if not rule.is_auto else 0
+        if factor and rule.scale and bucket_scale(factor) != bucket_scale(rule.scale):
+            out.append(f"{rule.model} is x{factor} but the rule targets {rule.scale:g}x")
+        if rule.kind == COLOUR and rule.auto_levels:
+            out.append("auto-levels only applies to grayscale pages")
+    elif rule.width in (ANY, "") and rule.height in (ANY, ""):
+        out.append("this exclusion has no page size, so it would skip every page")
     w_low, w_high = parse_dim(rule.width)
     h_low, h_high = parse_dim(rule.height)
     if w_low and w_high and w_low > w_high:

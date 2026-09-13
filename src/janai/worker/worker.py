@@ -506,6 +506,17 @@ class TilePlanner:
       that came within a hair of the memory actually free. A tile that fitted
       is a tile worth keeping: on a 6 GB laptop card, stepping 1248px down to
       864px costs about 9% throughput on every page that follows.
+    * prices a tile through the cut the splitter will really make - the tile
+      grid, the per-edge overlap and the channel count - rather than pricing
+      tile x tile, which overstated the affordable tile by about sqrt(3) on a
+      colour page: that is what planned a 1930px whole-page pass on a 6 GB
+      card and left auto_split to clean the miss up,
+    * distrusts the inherited constant until it has measured the model once.
+      For FDAT it is optimistic by roughly 9x, so the first page of an unseen
+      model is clamped to UNVERIFIED_TILE instead of being sized from a guess.
+      One cautious page is nearly free - a 1920x1080 page is cut into the same
+      3x2 grid by any tile from 672px to 960px - while a miss costs a whole
+      wasted full-page pass.
     """
 
     ALIGN = 32
@@ -514,6 +525,7 @@ class TilePlanner:
     HEADROOM = 256 * 1024**2
     SAFETY = 0.85
     MARGIN = 1.10  # applied to a measured cost before reusing it
+    UNVERIFIED_TILE = 1024  # ceiling until this model has been measured once
 
     def __init__(
         self, mode: str, fixed: int, device: str, fp16: bool, budget_limit_gib: int = 0
@@ -532,7 +544,9 @@ class TilePlanner:
         self._retries = 0
         self._pressure: dict[int, int] = {}
         self._good: dict[int, int] = {}
+        self._failed: dict[int, int] = {}
         self._last_page: tuple[int, int, int, int] | None = None
+        self._contaminated = False
 
     # -- memory ------------------------------------------------------------ #
     def _free_bytes(self) -> int:
@@ -602,6 +616,31 @@ class TilePlanner:
         size_y = min(h + 2 * self.OVERLAP, math.ceil(h / count_y) + 2 * self.OVERLAP)
         return max(1, size_x * size_y * max(1, c))
 
+    def _fit(self, w: int, h: int, c: int, budget: int, per_px: float) -> int:
+        """The largest aligned tile whose real cut is predicted to fit.
+
+        What costs memory is the grid the splitter cuts, not the number it was
+        asked for, and _tile_pixels is a step function of that number: every
+        tile from 672px to 960px cuts a 1920x1080 page into the same 3x2 grid.
+        So walk the aligned sizes down from a whole-page pass and take the
+        first that fits. Inverting tile x tile algebraically instead is what
+        dropped the channel count and the overlap from the price.
+        """
+        affordable = budget / max(per_px, 1e-6)
+        tile = self._align(max(w, h) + self.ALIGN)
+        while tile > self.MIN_TILE:
+            if self._tile_pixels(w, h, tile, c) <= affordable:
+                return tile
+            tile -= self.ALIGN
+        return self.MIN_TILE
+
+    def _ceiling(self, key: int) -> int:
+        """The largest aligned tile still below a size that missed, if any."""
+        failed = self._failed.get(key, 0)
+        if not failed:
+            return 0
+        return max(self.MIN_TILE, self._align(failed - self.ALIGN))
+
     def choose(self, model: Any, image: Any):
         """A TileSize for this image, in the backend's own encoding."""
         h, w, c = hwc(image)
@@ -630,16 +669,25 @@ class TilePlanner:
             # back to the backend's blind guess.
             proven = self._good.get(key, 0)
             if proven:
-                limit = self._cap.get(key) or proven
+                limit = min(self._cap.get(key) or proven, self._ceiling(key) or proven)
                 return self._arm(key, model, w, h, c, min(proven, limit), 0, 0)
             self.last = 0
             return TILE["estimate"]
 
         per_px = self._per_px.get(key)
+        calibrated = per_px is not None
         if per_px is None:
-            # chaiNNer's calibration, used until a real measurement replaces it
-            per_px = (model_bytes / (1024 * 52)) * max(1, c) * self.elem
-        tile = self._align(math.sqrt(budget / max(per_px, 1e-6)))
+            # chaiNNer's calibration, put in the same units as a measurement:
+            # bytes per channel-pixel of tile input. The `* c` it used to carry
+            # is already inside _tile_pixels, so keeping both counted colour
+            # twice while the algebraic inversion dropped it again.
+            per_px = (model_bytes / (1024 * 52)) * self.elem
+        tile = self._fit(w, h, c, budget, per_px)
+        if not calibrated:
+            # An unmeasured model is a guess, and this is the guess that
+            # planned 1930px and missed. Clamp the first page, measure it, then
+            # trust the measurement for every page after it.
+            tile = min(tile, self.UNVERIFIED_TILE)
         free = self._free_bytes()
         proven = self._good.get(key, 0)
         if proven > tile:
@@ -657,6 +705,10 @@ class TilePlanner:
         cap = self._cap.get(key)
         if cap:
             tile = min(tile, cap)
+        ceiling = self._ceiling(key)
+        if ceiling:
+            # a size that missed is a ceiling, not a target
+            tile = min(tile, ceiling)
         return self._arm(key, model, w, h, c, tile, budget, free)
 
     def _arm(
@@ -681,6 +733,7 @@ class TilePlanner:
     # -- measurement ------------------------------------------------------- #
     def before(self) -> None:
         self._retries = self._alloc_retries()
+        self._contaminated = False
         if self._pending and self.device.startswith("cuda"):
             try:
                 torch.cuda.reset_peak_memory_stats(self.device)
@@ -705,11 +758,18 @@ class TilePlanner:
             activations = peak - model_bytes
         if activations <= 0:
             return
-        measured = (activations / pixels) * self.MARGIN
-        previous = self._per_px.get(key)
-        self._per_px[key] = measured if previous is None else max(previous, measured)
-        if previous is None:
-            log(f"tile cost calibrated at {tile}px, peak {peak // 1024**2} MiB", "debug")
+        if self._contaminated:
+            # This page's peak belongs partly to an attempt that ran out of
+            # memory, so dividing it by the tile that did finish would inflate
+            # the model's cost and shrink every page after it. Keep what the
+            # page proved about what fits, discard its measurement.
+            log("re-tiled page: not calibrating from its peak", "debug")
+        else:
+            measured = (activations / pixels) * self.MARGIN
+            previous = self._per_px.get(key)
+            self._per_px[key] = measured if previous is None else max(previous, measured)
+            if previous is None:
+                log(f"tile cost calibrated at {tile}px, peak {peak // 1024**2} MiB", "debug")
         # this tile finished, so it is the one to repeat when the driver stops
         # reporting usable free memory on later pages
         self._good[key] = max(self._good.get(key, 0), tile)
@@ -755,10 +815,18 @@ class TilePlanner:
         warning in the same log. Called before `after()` so the calibration
         measures the tiles that did run, and so the next page starts at the
         size that worked instead of repeating the failed full-page attempt.
+
+        What a miss proves is that the *planned* size was too big, not that the
+        size auto_split fell back to is the ceiling: halving 1930px to 965px
+        says nothing against 1024px, which measures faster than both. So the
+        planned size becomes a ceiling, the fallback becomes a proven floor,
+        and the measured cost chooses between them.
         """
-        if tile <= 0 or self.last <= 0 or tile >= self.last:
+        attempted = self.last
+        if tile <= 0 or attempted <= 0 or tile >= attempted:
             return
         self.last = tile
+        self._contaminated = True
         if self._last_page is None:
             return
         key, w, h, c = self._last_page
@@ -772,11 +840,11 @@ class TilePlanner:
                 page_bytes,
                 free,
             )
-        self._good[key] = min(self._good.get(key) or tile, tile)
-        cap = self._cap.get(key) or 0
-        if not cap or tile < cap:
-            self._cap[key] = tile
-            log(f"tile capped at {tile}px: the page had to be re-tiled mid-pass", "debug")
+        self._good[key] = max(self._good.get(key, 0), tile)
+        known = self._failed.get(key, 0)
+        if not known or attempted < known:
+            self._failed[key] = attempted
+            log(f"{attempted}px missed, {tile}px fitted: planning under {attempted}px", "debug")
 
 
 # --------------------------------------------------------------------------- #

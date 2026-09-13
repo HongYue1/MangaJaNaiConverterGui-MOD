@@ -65,11 +65,11 @@ def pump(app: QApplication, rounds: int = 3) -> None:
         app.processEvents()
 
 
-def send_wheel(app: QApplication, widget: QWidget, notches: int = -1) -> bool:
-    """One wheel notch over a widget. False if Qt will not build the event."""
+def wheel_event(widget: QWidget, notches: int = -1) -> QWheelEvent | None:
+    """One wheel notch over a widget, or None if Qt will not build the event."""
     centre = widget.rect().center()
     try:
-        event = QWheelEvent(
+        return QWheelEvent(
             QPointF(centre),
             QPointF(widget.mapToGlobal(centre)),
             QPoint(0, notches * 40),
@@ -81,10 +81,44 @@ def send_wheel(app: QApplication, widget: QWidget, notches: int = -1) -> bool:
         )
     except Exception as exc:
         print(f"  skip  synthetic wheel events unavailable ({exc})")
+        return None
+
+
+def send_wheel(app: QApplication, widget: QWidget, notches: int = -1) -> bool:
+    """Post a wheel notch the way the application would. False if unavailable."""
+    event = wheel_event(widget, notches)
+    if event is None:
         return False
     QApplication.sendEvent(widget, event)
     pump(app)
     return True
+
+
+def dispatch_wheel(
+    app: QApplication,
+    widget: QWidget,
+    notches: int = -1,
+    accepted: bool = False,
+) -> bool | None:
+    """Hand a wheel notch to a widget's own handler and report that handler's verdict.
+
+    Posting through the application cannot answer what a widget decided: an
+    ignored event travels on to the ancestors, so the accepted flag ends up
+    reporting whoever took it last. Calling the handler directly keeps the answer
+    local, and presetting the flag to the opposite of the expected outcome means a
+    handler that quietly does nothing cannot pass. None means Qt would not build
+    the event, so the caller should skip rather than fail.
+    """
+    event = wheel_event(widget, notches)
+    if event is None:
+        return None
+    if accepted:
+        event.accept()
+    else:
+        event.ignore()
+    widget.wheelEvent(event)
+    pump(app)
+    return event.isAccepted()
 
 
 def check_fonts(theme: Theme) -> None:
@@ -109,10 +143,11 @@ def check_fonts(theme: Theme) -> None:
 def check_cards(window: MainWindow) -> None:
     print("cards")
     cards = [c for c in window.findChildren(Card) if c.isVisible()]
-    # Input, Upscale and Output are cards; Performance is a collapsible panel.
+    # Input, Upscale and Output are cards; Performance and Size exclusions are
+    # collapsible panels that start folded.
     check("the three cards are laid out", len(cards) == 3, f"{len(cards)} visible")
     panels = [p for p in window.findChildren(Collapsible) if p.isVisible()]
-    check("the collapsible section is laid out", len(panels) >= 1, f"{len(panels)} visible")
+    check("both collapsible panels are laid out", len(panels) >= 2, f"{len(panels)} visible")
     narrow = [c for c in cards if c.width() < 320]
     check("no card collapsed narrower than 320px", not narrow, f"{len(narrow)} too narrow")
     short = [c for c in cards if c.height() < 48]
@@ -165,10 +200,12 @@ def check_wheel_guard(window: MainWindow, app: QApplication) -> None:
 
 def check_rules_table(window: MainWindow, theme: Theme, app: QApplication) -> None:
     print("rules table")
-    tables = window.findChildren(RulesTable)
-    if not check("the rules table is present", bool(tables)):
+    # Named, not searched for: the exclusions table is a RulesTable too and it
+    # starts folded away, so findChildren order can hand back a hidden widget
+    # whose column geometry means nothing.
+    table = window.rules_view
+    if not check("the rules table is present", isinstance(table, RulesTable)):
         return
-    table = tables[0]
     pump(app)
     model = table.model()
     columns = model.columnCount() if model is not None else 0
@@ -260,14 +297,29 @@ def check_page_kind(window: MainWindow, app: QApplication) -> None:
     check("declaring colour reads back", window.page_kind() == "colour")
     check("declaring colour stands down the grayscale rules", not window.gray_rules_live())
     check(
-        "the summary says every page is colour",
-        "every page colour" in window.lbl_upscale_sum.text(),
-        window.lbl_upscale_sum.text(),
+        "the hint says the grayscale rules are idle",
+        "every page is colour" in window.lbl_rules_hint.text(),
+        window.lbl_rules_hint.text(),
+    )
+    # Detection only decides how a page is measured, so once every page is
+    # declared these numbers cannot change anything and must not look live.
+    check(
+        "declaring colour greys out the detection settings",
+        not window.sp_threshold.isEnabled() and not window.sp_colour.isEnabled(),
+        f"threshold {window.sp_threshold.isEnabled()}, colour {window.sp_colour.isEnabled()}",
     )
     window.set_page_kind("grayscale")
     window.on_pagekind_change()
     pump(app)
     check("declaring grayscale keeps the grayscale rules live", window.gray_rules_live())
+    check("declaring grayscale also greys out detection", not window.sp_threshold.isEnabled())
+    window.set_page_kind("detect")
+    window.on_pagekind_change()
+    pump(app)
+    check(
+        "detect per page brings the detection settings back",
+        window.sp_threshold.isEnabled() and window.sp_colour.isEnabled(),
+    )
     window.set_page_kind(was)
     window.on_pagekind_change()
     pump(app)
@@ -279,10 +331,7 @@ def check_row_numbers(window: MainWindow) -> None:
 
     print()
     print("rule rows")
-    tables = window.findChildren(RulesTable)
-    if not check("the rules table is present", bool(tables)):
-        return
-    table = tables[0]
+    table = window.rules_view
     check("row numbers are shown", table.verticalHeader().isVisible())
     model = table.model()
     first = model.headerData(0, Qt.Orientation.Vertical, Qt.ItemDataRole.DisplayRole)
@@ -293,6 +342,118 @@ def check_row_numbers(window: MainWindow) -> None:
     check("no scale warnings on the shipped table", not window.scale_mismatches())
 
 
+def check_table_wheel(window: MainWindow, app: QApplication) -> None:
+    """The table keeps the wheel while it can scroll, and frees it when it cannot.
+
+    Reaching an end used to hand the wheel to the page, which then jumped under
+    the pointer, so holding on to it at the end is the fix and not a side effect.
+    A table with nothing to scroll is the one case that should pass it on.
+    """
+    print()
+    print("table wheel")
+    table = window.rules_view
+    areas = window.findChildren(QScrollArea)
+    page = areas[0].verticalScrollBar() if areas else None
+    table.setMaximumHeight(70)  # force a scrollbar without touching any data
+    pump(app)
+    bar = table.verticalScrollBar()
+    if bar.maximum() <= 0:
+        print("  skip  the table will not scroll at this size")
+        table.setMaximumHeight(16777215)
+        pump(app)
+        return
+    if page is not None:
+        page.setValue(0)
+    bar.setValue(0)
+    pump(app)
+
+    behind = page.value() if page is not None else 0
+    verdict = dispatch_wheel(app, table)
+    if verdict is None:
+        table.setMaximumHeight(16777215)
+        pump(app)
+        return
+    now = page.value() if page is not None else 0
+    check(
+        "the wheel scrolls the table, not the page behind it",
+        verdict and bar.value() > 0 and now == behind,
+        f"table 0 -> {bar.value()}, page {behind} -> {now}",
+    )
+
+    bar.setValue(bar.maximum())
+    pump(app)
+    end = bar.value()
+    behind = page.value() if page is not None else 0
+    verdict = dispatch_wheel(app, table)
+    now = page.value() if page is not None else 0
+    check(
+        "at its end it keeps the wheel rather than scrolling the page",
+        bool(verdict) and bar.value() == end and now == behind,
+        f"page {behind} -> {now}, table still at {bar.value()}",
+    )
+
+    empty = window.excl_view
+    if empty.verticalScrollBar().maximum() <= 0:
+        passed_on = dispatch_wheel(app, empty, accepted=True)
+        if passed_on is not None:
+            check(
+                "a table with nothing to scroll hands the wheel on",
+                not passed_on,
+                "the empty exclusions table",
+            )
+
+    table.setMaximumHeight(16777215)
+    bar.setValue(0)
+    if page is not None:
+        page.setValue(0)
+    pump(app)
+
+
+def check_panels(window: MainWindow, app: QApplication) -> None:
+    """Settings most runs never touch start folded, and exclusions get own table."""
+    print()
+    print("panels")
+    check("the performance panel starts collapsed", not window.panel_perf.is_open())
+    check("the size-exclusion panel starts collapsed", not window.panel_excl.is_open())
+    check(
+        "exclusions are a table of their own",
+        isinstance(window.excl_view, RulesTable) and window.excl_view is not window.rules_view,
+    )
+    check("each table has its own model", window.excl_model is not window.rules_model)
+    upscale = window.rules_model.rowCount()
+    excluded = window.excl_model.rowCount()
+    check(
+        "the two tables together hold every rule",
+        upscale + excluded == len(window.rules),
+        f"{upscale} upscale + {excluded} excluded, {len(window.rules)} rules",
+    )
+    window.panel_excl.set_open(True)
+    pump(app)
+    check("opening the panel shows its table", window.excl_view.isVisible())
+    header = window.excl_view.horizontalHeader()
+    used = sum(header.sectionSize(c) for c in range(window.excl_model.columnCount()))
+    room = window.excl_view.viewport().width()
+    check("its columns fit the viewport", used <= room + 2, f"{used}px in {room}px")
+    window.panel_excl.set_open(False)
+    pump(app)
+    check("it folds away again", not window.panel_excl.is_open())
+
+
+def check_tile_ladder(window: MainWindow) -> None:
+    """The fixed tile sizes were too coarse to land on the one that fits."""
+    print()
+    print("tile sizes")
+    items = [window.cb_tile.itemText(i) for i in range(window.cb_tile.count())]
+    check("the ladder offers a full range", len(items) >= 19, f"{len(items)} entries")
+    missing = [w for w in ("640 px", "896 px", "1024 px", "1152 px", "2048 px") if w not in items]
+    check("the sizes worth trying are offered", not missing, f"missing {missing}")
+    check(
+        "no tiling says plainly that it can fail",
+        any("fails if it will not fit" in t for t in items),
+        next((t for t in items if t.lower().startswith("no tiling")), "missing"),
+    )
+
+
 def check_geometry_clamp(window: MainWindow, app: QApplication) -> None:
     """A saved size larger than the desktop must be clamped, not restored as-is."""
     print()
@@ -300,6 +461,19 @@ def check_geometry_clamp(window: MainWindow, app: QApplication) -> None:
     was = window._geometry_text()
     screen = app.primaryScreen()
     area = screen.availableGeometry() if screen is not None else None
+
+    def centred(label: str) -> None:
+        """Centred, clamped exactly the way _apply_geometry clamps it."""
+        if area is None:
+            return
+        want_x = area.x() + max(0, (area.width() - window.width()) // 2)
+        want_y = area.y() + max(0, (area.height() - window.height()) // 2)
+        check(
+            label,
+            abs(window.x() - want_x) <= 4 and abs(window.y() - want_y) <= 4,
+            f"at +{window.x()}+{window.y()}, centred is +{want_x}+{want_y}",
+        )
+
     window._apply_geometry("4000x3000+0+0")
     pump(app)
     check(
@@ -313,9 +487,11 @@ def check_geometry_clamp(window: MainWindow, app: QApplication) -> None:
             window.width() < area.width() and window.height() < area.height(),
             f"{window.width()}x{window.height()} in {area.width()}x{area.height()}",
         )
+    centred("a size trimmed to fit is re-centred, not left in the corner")
     window._apply_geometry("")
     pump(app)
     check("an unsaved window still opens workably", window.width() >= 920, f"{window.width()}px")
+    centred("a first run opens centred on the desktop")
     window._apply_geometry(was)
     pump(app)
 
@@ -353,6 +529,9 @@ def main() -> int:
         check_scrolling(window, app)
         check_wheel_guard(window, app)
         check_rules_table(window, theme, app)
+        check_table_wheel(window, app)
+        check_panels(window, app)
+        check_tile_ladder(window)
         check_log_panel(window, app)
         check_theme_toggle(window, app)
         check_text_entry(window, app)

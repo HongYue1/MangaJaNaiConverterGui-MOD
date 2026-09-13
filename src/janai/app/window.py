@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from janai import __version__
-from janai.app.rules_table import RuleDialog, RulesModel, RulesTable
+from janai.app.rules_table import EXCLUSION_HEADERS, RuleDialog, RulesModel, RulesTable
 from janai.app.runlog import (
     RunLog,
     fmt_bytes,
@@ -104,17 +104,29 @@ FILE_FILTER = (
     "*.tif *.tiff *.gif *.heic *.heif *.cbz *.zip *.cbr *.rar);;All files (*)"
 )
 
+# Fixed sizes in 128px steps up to 1024 and 256px steps above it: the useful
+# range is wide, and the difference between neighbouring sizes is worth having
+# because the fastest tile is usually the largest one that still fits.
 TILE_CHOICES: tuple[tuple[str, str], ...] = (
     ("Auto (adaptive)", "auto"),
     ("Maximum", "maximum"),
-    ("No tiling", "none"),
+    ("No tiling (fails if it will not fit)", "none"),
     ("128 px", "128"),
     ("192 px", "192"),
     ("256 px", "256"),
     ("384 px", "384"),
     ("512 px", "512"),
+    ("640 px", "640"),
     ("768 px", "768"),
+    ("896 px", "896"),
     ("1024 px", "1024"),
+    ("1152 px", "1152"),
+    ("1280 px", "1280"),
+    ("1536 px", "1536"),
+    ("1792 px", "1792"),
+    ("2048 px", "2048"),
+    ("2560 px", "2560"),
+    ("3072 px", "3072"),
 )
 
 MODE_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -486,12 +498,13 @@ class MainWindow(QMainWindow):
             ),
         )
         body.field(
-            "Pages",
+            "Page type",
             "Whether each page is judged on its own, or the whole run is declared.",
             row(self.cb_pagekind, self.chk_levels, spacing=18),
         )
 
         body.full(self._build_rules_block(seeded))
+        body.full(self._build_exclusions_block(seeded))
 
         self.sp_threshold = spin_int(
             0,
@@ -548,12 +561,117 @@ class MainWindow(QMainWindow):
         )
         body.field("Pre-downscale height", "Shrink huge pages before the model.", self.sp_pre_h)
 
-        self.lbl_upscale_sum = label("", "muted", wrap=True)
-        body.control(self.lbl_upscale_sum)
+        # Kept so the detection numbers can be greyed out together with their
+        # labels when the run declares its pages instead of measuring them.
+        self.upscale_body = body
         self.page.addWidget(card)
 
+    def _rule_buttons(self, which: str) -> QWidget:
+        """The column of buttons beside one of the two rule tables."""
+        side = QWidget()
+        sbox = QVBoxLayout(side)
+        sbox.setContentsMargins(0, 0, 0, 0)
+        sbox.setSpacing(6)
+        actions: tuple[tuple[str, Callable[[], None], str], ...] = (
+            ("Add", lambda: self.rule_add(which), "Add a row below the selected one."),
+            (
+                "Edit",
+                lambda: self.rule_edit(which),
+                "Edit the selected row (or double-click it).",
+            ),
+            (
+                "Toggle",
+                lambda: self.rule_toggle(which),
+                (
+                    "Switch the selected row off without deleting it. The checkbox "
+                    "in the first column shows the state, and the space bar does the "
+                    "same thing."
+                ),
+            ),
+            ("Remove", lambda: self.rule_remove(which), "Delete the selected row."),
+            (
+                "Up",
+                lambda: self.rule_move(-1, which),
+                (
+                    "Move the row up (Alt+Up). Order only decides between rows that "
+                    "are equally specific."
+                ),
+            ),
+            ("Down", lambda: self.rule_move(1, which), "Move the row down (Alt+Down)."),
+        )
+        if which == "rules":
+            actions = (
+                *actions,
+                (
+                    "Defaults",
+                    self.rules_reset,
+                    (
+                        "Rewrite this table as the shipped set: the MangaJaNai height "
+                        "bands for grayscale pages and the IllustrationJaNai denoise "
+                        "models for colour, built from the models you have installed. "
+                        "Only this table is touched - your exclusions and the rest of "
+                        "your settings are left alone."
+                    ),
+                ),
+            )
+        for text, action, hint in actions:
+            btn = button(text, action, variant="ghost", tip=hint)
+            btn.setMinimumWidth(96)
+            sbox.addWidget(btn)
+        sbox.addStretch(1)
+        return side
+
+    def _table_row(self, view: RulesTable, side: QWidget) -> QWidget:
+        """A table with its buttons beside it."""
+        holder = QWidget()
+        tbox = QHBoxLayout(holder)
+        tbox.setContentsMargins(0, 0, 0, 0)
+        tbox.setSpacing(10)
+        tbox.addWidget(view, 1)
+        tbox.addWidget(side, 0)
+        return holder
+
+    def _build_exclusions_block(self, seeded: list[rules.Rule]) -> QWidget:
+        """Size exclusions, in their own panel, closed until they are wanted.
+
+        They answer a different question from the model rules - which pages
+        should not go through a model at all - and most runs never touch them,
+        so they sit in a panel that starts collapsed rather than taking up half
+        of the card.
+        """
+        panel = Collapsible(
+            "Size exclusions",
+            "pages that skip the model",
+            expanded=False,
+        )
+        self.panel_excl = panel
+        panel.setToolTip(
+            "Pages that skip the model and are only re-encoded: the long webtoon "
+            "strips the old build skipped with numbers nobody could see. An "
+            "exclusion names a page size, and a sized row always beats a model "
+            "rule that says \u201cany\u201d, so those pages pass through untouched."
+        )
+        body = panel.body
+
+        self.excl_model = RulesModel(
+            self.theme.p,
+            [r for r in seeded if r.action == rules.PASSTHROUGH],
+            bool(self.settings.data["upscale"].get("grayscale_convert", True)),
+            self.model_names(),
+            parent=self,
+            headers=EXCLUSION_HEADERS,
+        )
+        self.excl_model.edited.connect(self.on_rule_checked)
+        self.excl_view = RulesTable(self.excl_model, rows=3)
+        self.excl_view.doubleClicked.connect(lambda _index: self.rule_edit("excl"))
+        body.full(self._table_row(self.excl_view, self._rule_buttons("excl")))
+
+        self.lbl_excl_hint = label("", "hint", wrap=True)
+        body.full(self.lbl_excl_hint)
+        return panel
+
     def _build_rules_block(self, seeded: list[rules.Rule]) -> QWidget:
-        """The rules table, its side buttons, and the two lines beneath it."""
+        """The model-rules table, its side buttons, and the lines beneath it."""
         block = QWidget()
         box = QVBoxLayout(block)
         box.setContentsMargins(0, 4, 0, 0)
@@ -575,65 +693,15 @@ class MainWindow(QMainWindow):
 
         self.rules_model = RulesModel(
             self.theme.p,
-            seeded,
+            [r for r in seeded if r.action != rules.PASSTHROUGH],
             bool(self.settings.data["upscale"].get("grayscale_convert", True)),
             self.model_names(),
             parent=self,
         )
         self.rules_model.edited.connect(self.on_rule_checked)
-        self.rules_view = RulesTable(self.rules_model)
-        self.rules_view.doubleClicked.connect(lambda _index: self.rule_edit())
-
-        side = QWidget()
-        sbox = QVBoxLayout(side)
-        sbox.setContentsMargins(0, 0, 0, 0)
-        sbox.setSpacing(6)
-        actions: tuple[tuple[str, Callable[[], None], str], ...] = (
-            ("Add", self.rule_add, "Add a rule below the selected one."),
-            ("Edit", self.rule_edit, "Edit the selected rule (or double-click it)."),
-            (
-                "Toggle",
-                self.rule_toggle,
-                (
-                    "Switch the selected rule off without deleting it. The checkbox "
-                    "in the first column shows the state, and the space bar does the "
-                    "same thing."
-                ),
-            ),
-            ("Remove", self.rule_remove, "Delete the selected rule."),
-            (
-                "Up",
-                lambda: self.rule_move(-1),
-                (
-                    "Move the rule up (Alt+Up). Order only decides between rules that "
-                    "are equally specific."
-                ),
-            ),
-            ("Down", lambda: self.rule_move(1), "Move the rule down (Alt+Down)."),
-            (
-                "Defaults",
-                self.rules_reset,
-                (
-                    "Rewrite this table as the shipped set: the MangaJaNai height "
-                    "bands for grayscale pages and the IllustrationJaNai denoise "
-                    "models for colour, built from the models you have installed. "
-                    "Only the table is touched, nothing else."
-                ),
-            ),
-        )
-        for text, action, hint in actions:
-            btn = button(text, action, variant="ghost", tip=hint)
-            btn.setMinimumWidth(96)
-            sbox.addWidget(btn)
-        sbox.addStretch(1)
-
-        table_row = QWidget()
-        tbox = QHBoxLayout(table_row)
-        tbox.setContentsMargins(0, 0, 0, 0)
-        tbox.setSpacing(10)
-        tbox.addWidget(self.rules_view, 1)
-        tbox.addWidget(side, 0)
-        box.addWidget(table_row)
+        self.rules_view = RulesTable(self.rules_model, rows=6)
+        self.rules_view.doubleClicked.connect(lambda _index: self.rule_edit("rules"))
+        box.addWidget(self._table_row(self.rules_view, self._rule_buttons("rules")))
 
         self.lbl_rules_hint = label("", "hint", wrap=True)
         box.addWidget(self.lbl_rules_hint)
@@ -739,7 +807,10 @@ class MainWindow(QMainWindow):
         panel = Collapsible(
             "Performance",
             "device, precision, tiling, threads",
-            expanded=bool(self.settings.data["ui"].get("perf_open", False)),
+            # Always closed on startup. It is the panel of last resort, and a
+            # window that opens with it expanded buries the settings that are
+            # actually used on every run.
+            expanded=False,
         )
         self.panel_perf = panel
         body = panel.body
@@ -836,8 +907,10 @@ class MainWindow(QMainWindow):
             tip=(
                 "Holds a tiny context on the GPU while this window is open, so the "
                 "driver keeps the card powered (and a laptop dGPU does not park) and "
-                "the first run starts at full speed. Costs a few MB of VRAM and is "
-                "released automatically while a job runs."
+                "the first run starts at full speed. It holds a CUDA context, which "
+                "costs about 120 MB of VRAM while the app sits idle, and it is "
+                "released automatically while a job runs. Turn it off to leave the "
+                "GPU completely alone."
             ),
         )
         body.control(self.chk_wake)
@@ -945,8 +1018,10 @@ class MainWindow(QMainWindow):
         self._shortcut("Ctrl+L", self.toggle_log)
         self._shortcut("Ctrl+D", self.toggle_theme)
         self._shortcut("F5", self.refresh_probe)
-        self._shortcut("Alt+Up", lambda: self.rule_move(-1))
-        self._shortcut("Alt+Down", lambda: self.rule_move(1))
+        # These follow the focus, so they move a row in whichever of the two
+        # tables the keyboard is actually in.
+        self._shortcut("Alt+Up", lambda: self.rule_move(-1, self._focused_table()))
+        self._shortcut("Alt+Down", lambda: self.rule_move(1, self._focused_table()))
 
     # ------------------------------------------------------------------ #
     # geometry
@@ -966,15 +1041,21 @@ class MainWindow(QMainWindow):
             width, height = 1180, 900
         else:
             width, height = int(match.group(1)), int(match.group(2))
+        trimmed = False
         if area is not None:
-            width = min(width, int(area.width() * 0.88))
-            height = min(height, int(area.height() * 0.90))
+            fit_w = min(width, int(area.width() * 0.88))
+            fit_h = min(height, int(area.height() * 0.90))
+            trimmed = (fit_w, fit_h) != (width, height)
+            width, height = fit_w, fit_h
         self.resize(max(920, width), max(620, height))
-        if match is None or match.group(3) is None:
+        if match is None or match.group(3) is None or trimmed:
+            # Centred on both axes: with no saved position, or a size that had
+            # to be trimmed to fit this desktop, the stored corner belongs to a
+            # window that no longer exists.
             if area is not None:
                 self.move(
                     area.x() + max(0, (area.width() - self.width()) // 2),
-                    area.y() + max(0, (area.height() - self.height()) // 3),
+                    area.y() + max(0, (area.height() - self.height()) // 2),
                 )
             return
         x, y = int(match.group(3)), int(match.group(4))
@@ -1122,10 +1203,30 @@ class MainWindow(QMainWindow):
         return self.page_kind() != "colour"
 
     def on_pagekind_change(self, _text: str = "") -> None:
-        """The page kind decides which half of the table can fire, so recolour it."""
-        self.rules_model.set_gray(self.gray_rules_live())
+        """The page kind decides which rows can fire, and which fields apply."""
+        self.set_gray_rows(self.gray_rules_live())
+        self.sync_detection_fields()
         self.render_rules()
         self.update_summary()
+
+    def set_gray_rows(self, live: bool) -> None:
+        """Both tables grey out their grayscale rows together."""
+        self.rules_model.set_gray(live)
+        self.excl_model.set_gray(live)
+
+    def sync_detection_fields(self) -> None:
+        """Grey out the detection numbers when the run declares its pages.
+
+        They only decide how a page is measured, so once every page is declared
+        grayscale or colour they cannot change anything. A control that looks
+        live but does nothing is worse than a disabled one.
+        """
+        body = getattr(self, "upscale_body", None)
+        if body is None:
+            return  # still building the card
+        live = self.page_kind() == "detect"
+        body.set_row_enabled(self.sp_threshold, live)
+        body.set_row_enabled(self.sp_colour, live)
 
     def on_levels_toggle(self) -> None:
         self.render_rules()
@@ -1241,7 +1342,28 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     @property
     def rules(self) -> list[rules.Rule]:
-        return self.rules_model.rules
+        """Every rule from both tables: exclusions first, then the model rules.
+
+        The interface splits them - model rules in the card, size exclusions in
+        their own panel - but matching, saving and the job payload all want the
+        whole set, and exclusions come first so that reading the saved file top
+        to bottom follows the order a page is decided in.
+        """
+        return [*self.excl_model.rules, *self.rules_model.rules]
+
+    def set_all_rules(self, items: list[rules.Rule]) -> None:
+        """Deal one saved list into the two tables, keeping relative order."""
+        self.rules_model.set_rules([r for r in items if r.action != rules.PASSTHROUGH])
+        self.excl_model.set_rules([r for r in items if r.action == rules.PASSTHROUGH])
+
+    def _table(self, which: str = "rules") -> tuple[RulesModel, RulesTable]:
+        if which == "excl":
+            return self.excl_model, self.excl_view
+        return self.rules_model, self.rules_view
+
+    def _focused_table(self) -> str:
+        """Which table a keyboard shortcut should act on."""
+        return "excl" if self.excl_view.hasFocus() else "rules"
 
     def model_names(self) -> list[str]:
         return [str(m.get("name")) for m in self.models if m.get("name")]
@@ -1266,47 +1388,69 @@ class MainWindow(QMainWindow):
                 self.log(f"rule resolved: {note}", "debug")
             if not current:
                 current = rules.default_working_set(installed)
-        self.rules_model.set_rules(current)
+        self.set_all_rules(current)
         self._rules_seeded = True
         self.save_rules()
 
     def render_rules(self) -> None:
-        """Refresh the line under the table. The model paints the rows."""
-        self.rules_model.set_installed(self.model_names())
+        """Refresh the lines under the two tables. The models paint the rows."""
+        names = self.model_names()
+        self.rules_model.set_installed(names)
+        self.excl_model.set_installed(names)
         kind = self.page_kind()
-        if not self.rules:
+        items = self.rules_model.rules
+        if not items:
             hint = (
                 "The table is empty, so nothing can run. \u201cDefaults\u201d fills it "
                 "with the shipped set, built from the models you have installed."
             )
         else:
-            active = sum(1 for r in self.rules if r.enabled)
-            hint = f"{active} of {len(self.rules)} rules on"
+            active = sum(1 for r in items if r.enabled)
+            hint = f"{active} of {len(items)} rules on"
             if kind == "colour":
                 hint += "  \u00b7  grayscale rules are idle: every page is colour"
             elif kind == "grayscale":
                 hint += "  \u00b7  colour rules are idle: every page is grayscale"
             hint += "  \u00b7  space toggles a row, double-click edits it"
         self.lbl_rules_hint.setText(hint)
+
+        excluded = self.excl_model.rules
+        live = sum(1 for r in excluded if r.enabled)
+        if not excluded:
+            self.lbl_excl_hint.setText(
+                "Nothing is excluded, so every page goes through a model. Add a row "
+                "to let pages of a given size skip the model and only be re-encoded."
+            )
+            self.panel_excl.set_hint("none")
+        else:
+            self.lbl_excl_hint.setText(
+                f"{live} of {len(excluded)} exclusions on  \u00b7  matching pages skip "
+                "the model and are only re-encoded"
+            )
+            self.panel_excl.set_hint(f"{live} on" if live else f"{len(excluded)} off")
         self.refresh_rule_warnings()
 
     def refresh_rule_warnings(self) -> None:
-        """Everything wrong with the table, on one line underneath it."""
+        """Everything wrong with either table, on one line under the rules.
+
+        Each table numbers its own rows, so a warning has to say which table it
+        points at or the number would send you to the wrong row.
+        """
         installed = self.model_names()
         notes: list[str] = []
-        for index, rule in enumerate(self.rules):
-            if not rule.enabled:
-                continue
-            notes.extend(f"row {index + 1}: {note}" for note in rules.problems(rule, installed))
+        for what, items in (
+            ("row", self.rules_model.rules),
+            ("exclusion", self.excl_model.rules),
+        ):
+            for index, rule in enumerate(items):
+                if not rule.enabled:
+                    continue
+                notes.extend(
+                    f"{what} {index + 1}: {note}" for note in rules.problems(rule, installed)
+                )
         notes.extend(self.scale_mismatches())
         self.lbl_rules_warn.setText("\u26a0  " + "; ".join(notes[:4]) if notes else "")
         self.lbl_rules_warn.setVisible(bool(notes))
-
-    def rules_summary(self) -> str:
-        if not self.rules:
-            return "no rules \u2014 the table is empty"
-        active = sum(1 for r in self.rules if r.enabled)
-        return f"{active} of {len(self.rules)} rules on"
 
     def scale_mismatches(self) -> list[str]:
         """Rows whose model name advertises a factor the target will not use."""
@@ -1314,7 +1458,7 @@ class MainWindow(QMainWindow):
             return []
         want = float(self.sp_scale.value())
         out: list[str] = []
-        for index, rule in enumerate(self.rules):
+        for index, rule in enumerate(self.rules_model.rules):
             if not rule.enabled or rule.is_auto:
                 continue
             if rule.scale and abs(rule.scale - want) > 0.01:
@@ -1338,10 +1482,10 @@ class MainWindow(QMainWindow):
         self.save_rules()
         self.update_summary()
 
-    def rules_changed(self, select: int = -1) -> None:
-        self.rules_model.set_rules(list(self.rules))
-        if 0 <= select < len(self.rules):
-            self.rules_view.select_row(select)
+    def rules_changed(self, which: str = "rules", select: int = -1) -> None:
+        model, view = self._table(which)
+        if 0 <= select < model.rowCount():
+            view.select_row(select)
         self.render_rules()
         self.save_rules()
         self.update_summary()
@@ -1354,69 +1498,92 @@ class MainWindow(QMainWindow):
         scale = max(1, round(float(self.sp_scale.value())))
         return rules.gray_model(names, scale, rules.GRAY_TOP_BUCKET) or names[0]
 
-    def rule_add(self) -> None:
+    def rule_add(self, which: str = "rules") -> None:
+        exclusion = which == "excl"
         draft = rules.Rule(
-            kind=rules.GRAYSCALE,
-            scale=float(self.sp_scale.value()),
-            auto_levels=True,
+            kind=rules.ANY if exclusion else rules.GRAYSCALE,
+            scale=0.0 if exclusion else float(self.sp_scale.value()),
+            # A new exclusion opens on the case it exists for: pages far taller
+            # than a page, which is what the old hardcoded switch matched.
+            height=rules.dim_spec(3000, 0) if exclusion else rules.ANY,
+            auto_levels=None if exclusion else True,
             model=self.default_rule_model(),
+            action=rules.PASSTHROUGH if exclusion else rules.UPSCALE,
         )
-        made = RuleDialog.edit(self, "Add rule", draft, self.model_names())
+        title = "Add exclusion" if exclusion else "Add rule"
+        made = RuleDialog.edit(self, title, draft, self.model_names())
         if made is None:
             return
-        index = self.rules_view.current_row()
-        items = list(self.rules)
+        self._insert_rule(which, made)
+
+    def _insert_rule(self, which: str, made: rules.Rule) -> None:
+        """File an edited rule in whichever table its action belongs to."""
+        target = "excl" if made.action == rules.PASSTHROUGH else "rules"
+        model, _view = self._table(target)
+        items = list(model.rules)
+        index = self._table(which)[1].current_row() if target == which else -1
         at = len(items) if index < 0 else index + 1
         items.insert(at, made)
-        self.rules_model.set_rules(items)
-        self.rules_changed(at)
+        model.set_rules(items)
+        self.rules_changed(target, at)
 
-    def rule_edit(self) -> None:
-        index = self.rules_view.current_row()
+    def rule_edit(self, which: str = "rules") -> None:
+        model, view = self._table(which)
+        index = view.current_row()
         if index < 0:
             return
-        made = RuleDialog.edit(self, "Edit rule", self.rules[index], self.model_names())
+        title = "Edit exclusion" if which == "excl" else "Edit rule"
+        made = RuleDialog.edit(self, title, model.rules[index], self.model_names())
         if made is None:
             return
-        items = list(self.rules)
+        items = list(model.rules)
+        if (made.action == rules.PASSTHROUGH) != (which == "excl"):
+            # Its action changed, so the row now belongs in the other table.
+            del items[index]
+            model.set_rules(items)
+            self._insert_rule(which, made)
+            return
         items[index] = made
-        self.rules_model.set_rules(items)
-        self.rules_changed(index)
+        model.set_rules(items)
+        self.rules_changed(which, index)
 
-    def rule_remove(self) -> None:
-        index = self.rules_view.current_row()
+    def rule_remove(self, which: str = "rules") -> None:
+        model, view = self._table(which)
+        index = view.current_row()
         if index < 0:
             return
-        items = list(self.rules)
+        items = list(model.rules)
         del items[index]
-        self.rules_model.set_rules(items)
-        self.rules_changed(min(index, len(items) - 1))
+        model.set_rules(items)
+        self.rules_changed(which, min(index, len(items) - 1))
 
-    def rule_move(self, delta: int) -> None:
-        index = self.rules_view.current_row()
+    def rule_move(self, delta: int, which: str = "rules") -> None:
+        model, view = self._table(which)
+        index = view.current_row()
         if index < 0:
             return
-        items = rules.move(self.rules, index, delta)
-        self.rules_model.set_rules(items)
-        self.rules_changed(max(0, min(index + delta, len(items) - 1)))
+        items = rules.move(model.rules, index, delta)
+        model.set_rules(items)
+        self.rules_changed(which, max(0, min(index + delta, len(items) - 1)))
 
-    def rule_toggle(self) -> None:
-        index = self.rules_view.current_row()
+    def rule_toggle(self, which: str = "rules") -> None:
+        model, view = self._table(which)
+        index = view.current_row()
         if index >= 0:
-            self.rules_model.toggle(index)
+            model.toggle(index)
 
     def rules_reset(self) -> None:
-        if self.rules and not self._confirm(
+        if self.rules_model.rules and not self._confirm(
             "Reset the rules table",
             "Replace every row with the shipped set, built from the models you "
-            "have installed?\n\nOnly this table changes \u2014 the rest of your "
-            "settings are left alone.",
+            "have installed?\n\nOnly this table changes \u2014 your exclusions and "
+            "the rest of your settings are left alone.",
         ):
             return
         self.rules_model.set_rules(rules.default_working_set(self.model_names()))
         self._rules_seeded = True
-        self.rules_changed(0)
-        self.log(f"rules reset to the shipped set ({len(self.rules)} rows)")
+        self.rules_changed("rules", 0)
+        self.log(f"rules reset to the shipped set ({len(self.rules_model.rules)} rows)")
 
     def _confirm(self, title: str, text: str) -> bool:
         answer = QMessageBox.question(
@@ -1509,7 +1676,7 @@ class MainWindow(QMainWindow):
         self.sp_threshold.setValue(int(u.get("grayscale_threshold", 12)))
         self.sp_colour.setValue(float(u.get("grayscale_colour_percent", 0.25)))
         self.sp_pre_h.setValue(int(u.get("pre_downscale_height", 0)))
-        self.rules_model.set_rules([rules.Rule.from_dict(r) for r in (u.get("rules") or [])])
+        self.set_all_rules([rules.Rule.from_dict(r) for r in (u.get("rules") or [])])
         self._rules_seeded = bool(self.rules)
 
         self.seg_container.set_value(str(o.get("container", "files")))
@@ -1538,7 +1705,8 @@ class MainWindow(QMainWindow):
         self.chk_wrap.setChecked(bool(lg.get("wrap", False)))
         self.chk_debug.setChecked(bool(lg.get("show_debug", False)))
 
-        self.rules_model.set_gray(self.gray_rules_live())
+        self.set_gray_rows(self.gray_rules_live())
+        self.sync_detection_fields()
         self.render_format_options()
         self.render_target()
         self.render_rules()
@@ -1616,36 +1784,15 @@ class MainWindow(QMainWindow):
     # summaries
     # ------------------------------------------------------------------ #
     def update_summary(self) -> None:
-        mode = str(self.seg_mode.value())
-        if mode == "scale":
-            target = f"{float(self.sp_scale.value()):g}\u00d7"
-        elif mode == "width":
-            target = f"{self.sp_width.value()} px wide"
-        elif mode == "height":
-            target = f"{self.sp_height.value()} px tall"
-        else:
-            width, height = self.sp_width.value(), self.sp_height.value()
-            target = f"fit {width}\u00d7{height}"
-            found = displays.match(width, height)
+        if str(self.seg_mode.value()) == "fit":
+            # The display preset box has to follow a size typed in by hand.
+            found = displays.match(self.sp_width.value(), self.sp_height.value())
             if displays.id_for_label(self.cb_display.currentText()) != found:
                 set_combo(self.cb_display, displays.label_for_id(found))
-            if found != displays.CUSTOM:
-                target += f" ({self.cb_display.currentText()})"
-        bits = [target, self.rules_summary()]
-        bits.append(
-            {
-                "grayscale": "every page grayscale",
-                "colour": "every page colour",
-            }.get(self.page_kind(), "grayscale detection")
-        )
-        if self.chk_levels.isChecked():
-            bits.append("auto levels")
-        if self.sp_pre_h.value():
-            bits.append(f"pre-downscale {self.sp_pre_h.value()}px")
-        excluded = sum(1 for r in self.rules if r.enabled and r.action == rules.PASSTHROUGH)
-        if excluded:
-            bits.append(f"{excluded} exclusion rule{'s' if excluded > 1 else ''}")
-        self.lbl_upscale_sum.setText(" \u00b7 ".join(bits))
+        # There is deliberately no summary line under this card. The target, the
+        # rule count and the exclusion count each restated a control a few pixels
+        # above them, and both tables now carry their own count.
+        self.sync_detection_fields()
         self.refresh_rule_warnings()
 
         cid = self.container_value()
@@ -2301,6 +2448,7 @@ class MainWindow(QMainWindow):
         mode = self.theme.toggle(self.app)
         self.settings.data["theme"] = mode
         self.rules_model.set_palette(self.theme.p)  # row colours come from it
+        self.excl_model.set_palette(self.theme.p)
         self.log_view.setFont(self.theme.fonts["mono"])
         self.render_format_options()
         self.render_rules()

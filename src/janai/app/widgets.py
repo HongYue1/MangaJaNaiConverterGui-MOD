@@ -259,11 +259,14 @@ class FieldGrid(QWidget):
         self.grid.setColumnStretch(1, 1)
         self.grid.setColumnMinimumWidth(0, 132)
         self._row = 0
+        #: Control -> its label, so a row can be greyed out as one unit.
+        self._labels: dict[int, QLabel] = {}
 
     def reset(self) -> None:
         """Empty the grid so it can be rebuilt from scratch."""
         clear_layout(self.grid)
         self._row = 0
+        self._labels.clear()
 
     def field(self, title: str, hint: str, widget: QWidget, tip: str = "") -> QWidget:
         """Add one labelled row and return the control.
@@ -280,8 +283,20 @@ class FieldGrid(QWidget):
             widget.setToolTip(explain)
         self.grid.addWidget(head, self._row, 0, Qt.AlignmentFlag.AlignVCenter)
         self.grid.addWidget(widget, self._row, 1)
+        self._labels[id(widget)] = head
         self._row += 1
         return widget
+
+    def set_row_enabled(self, widget: QWidget, enabled: bool) -> None:
+        """Grey out a control together with its label.
+
+        A setting that cannot apply should look inert, and a disabled control
+        beside a full-strength label reads as a bug rather than as a state.
+        """
+        widget.setEnabled(bool(enabled))
+        head = self._labels.get(id(widget))
+        if head is not None:
+            head.setEnabled(bool(enabled))
 
     def full(self, widget: QWidget) -> QWidget:
         """Add a row that spans both columns."""
