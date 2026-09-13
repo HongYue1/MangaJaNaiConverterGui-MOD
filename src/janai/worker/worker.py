@@ -514,9 +514,13 @@ class TilePlanner:
     * distrusts the inherited constant until it has measured the model once.
       For FDAT it is optimistic by roughly 9x, so the first page of an unseen
       model is clamped to UNVERIFIED_TILE instead of being sized from a guess.
-      One cautious page is nearly free - a 1920x1080 page is cut into the same
-      3x2 grid by any tile from 672px to 960px - while a miss costs a whole
-      wasted full-page pass.
+      One cautious page is nearly free, because what costs memory is the grid
+      the page is cut into and not the number asked for: a 1920x1080 page is
+      cut into the same 2x2 grid of 960x540 tiles by anything from 960px to
+      1079px, so 965px and 1024px are the very same work. The next coarser
+      grid is 2x1, one 960x1080 tile, which needs about twice the activations
+      and does not fit in 6 GB. A miss, by contrast, costs a whole wasted
+      pass.
     """
 
     ALIGN = 32
@@ -537,6 +541,7 @@ class TilePlanner:
         self.budget_limit = max(0, int(budget_limit_gib or 0)) * 1024**3
         self.elem = 2 if fp16 else 4
         self.last = 0
+        self._said_clamp = False
         self._model_bytes: dict[int, int] = {}
         self._per_px: dict[int, float] = {}
         self._cap: dict[int, int] = {}
@@ -687,6 +692,15 @@ class TilePlanner:
             # An unmeasured model is a guess, and this is the guess that
             # planned 1930px and missed. Clamp the first page, measure it, then
             # trust the measurement for every page after it.
+            if tile > self.UNVERIFIED_TILE and not self._said_clamp:
+                # Say it once, so a single-image job that never gets to use
+                # the measurement does not look like an unexplained ceiling.
+                self._said_clamp = True
+                log(
+                    "first page of an unmeasured model: holding the tile at"
+                    f" {self.UNVERIFIED_TILE}px rather than the estimated"
+                    f" {tile}px until the cost has been measured"
+                )
             tile = min(tile, self.UNVERIFIED_TILE)
         free = self._free_bytes()
         proven = self._good.get(key, 0)
@@ -1961,8 +1975,22 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
                     error=f"cannot read: {type(exc).__name__}: {exc}",
                 )
                 continue
+            # Ask for the model first, because that is what logs the matched
+            # rule, then let an exclusion overrule the answer. The plan used
+            # to name a model the real run would never load, and predict a
+            # size the page was never going to reach.
             pick = cfg["pick_model"](bool(gray), h, w)
-            pw, ph = predict_size(w, h, cfg["t_scale"], cfg["t_w"], cfg["t_h"])
+            excluded = bool(cfg.get("excluded") and cfg["excluded"](bool(gray), h, w))
+            if excluded:
+                pick = None
+                pw, ph = w, h
+                log(
+                    f"{src.name}: {w}x{h} excluded by a rule,"
+                    " would be re-encoded without upscaling",
+                    "warn",
+                )
+            else:
+                pw, ph = predict_size(w, h, cfg["t_scale"], cfg["t_w"], cfg["t_h"])
             entry = ""
             if bundle and dest_bundle is not None:
                 entry = format_name(pattern, src, position, len(units)) + ext
@@ -1990,6 +2018,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
                 score=round(score, 2),
                 colour=round(coloured, 2),
                 model=(pick["name"] if pick else ""),
+                passthrough=excluded,
                 dry=True,
                 error="exists, would skip" if exists else None,
             )
@@ -2186,6 +2215,7 @@ def run_job(job: dict) -> int:
                 "threshold": threshold,
                 "colour_percent": colour_percent,
                 "pick_model": pick_model,
+                "excluded": excluded_by_rule,
                 "t_scale": t_scale,
                 "t_w": t_w,
                 "t_h": t_h,
@@ -2247,6 +2277,7 @@ def run_job(job: dict) -> int:
                     "score": round(score, 2),
                     "colour": round(coloured, 2),
                     "tile": 0,
+                    "passthrough": True,
                 },
             )
         if gray and do_gray:

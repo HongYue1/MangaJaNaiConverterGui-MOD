@@ -98,6 +98,71 @@ def _exact_split(
     raise ValueError(f"Aborting after {MAX_ITER} splits. Unable to upscale image.")
 
 
+_EASED_STEPS = 4
+"""How many gentle grid steps to try before falling back to halving."""
+
+
+def _finer_tile_size(current: Size, halved: Size, w: int, h: int) -> Size:
+    """One grid step below ``current`` instead of half of it.
+
+    What costs memory is the size of the tiles actually being cut, not the
+    number that was asked for. On a 1920x1080 page a 1152px request is cut as
+    one 960x1080 tile; stepping down to 1056px cuts four 960x540 tiles, while
+    halving to 576px cuts eight 480x540 ones -- measured at 13.2s against
+    21.1s for the same page. So step to just below the largest side currently
+    being cut, which adds exactly one row or column to the grid.
+    """
+
+    if current[0] != current[1]:
+        # Non-square requests are rare and the arithmetic below assumes a
+        # single number; halving is already right for them.
+        return halved
+
+    cols = max(1, math.ceil(w / max(1, current[0])))
+    rows = max(1, math.ceil(h / max(1, current[1])))
+    # The sides being cut right now, which is what ran out of memory.
+    limit = max(math.ceil(w / cols), math.ceil(h / rows))
+    candidate = min(current[0], limit) - 1
+    if candidate < 16 or candidate <= max(halved):
+        return halved
+
+    # Prefer a round number, but only while it cuts the very same grid:
+    # rounding across a boundary would refine more than intended.
+    aligned = candidate - (candidate % 32)
+    if (
+        aligned >= 16
+        and math.ceil(w / aligned) == math.ceil(w / candidate)
+        and math.ceil(h / aligned) == math.ceil(h / candidate)
+    ):
+        candidate = aligned
+    return (candidate, candidate)
+
+
+def _step_down(
+    current: Size,
+    split_tile_size: Callable[[Size], Size],
+    eased: int,
+    w: int,
+    h: int,
+) -> tuple[Size, int]:
+    """Choose the next tile size after a pass asked for a split.
+
+    ``split_tile_size`` is consulted first in every case: it is what refuses
+    the attempt outright in "no tiling" and "exact tile size" modes, and its
+    halving is the fallback. A grid step is tried first while the budget
+    lasts, because each retry costs about a second while a needlessly fine
+    grid costs seconds on every page that follows.
+    """
+
+    halved = split_tile_size(current)
+    if eased <= 0:
+        return halved, 0
+    finer = _finer_tile_size(current, halved, w, h)
+    if finer == halved:
+        return halved, 0
+    return finer, eased - 1
+
+
 def _max_split(
     img: np.ndarray,
     upscale: SplitImageOp,
@@ -116,6 +181,7 @@ def _max_split(
     img_region = Region(0, 0, w, h)
 
     max_tile_size = starting_tile_size
+    eased = _EASED_STEPS
     logger.debug(
         f"Auto split image ({w}x{h}px @ {c}) with initial tile size {max_tile_size}."
     )
@@ -127,7 +193,9 @@ def _max_split(
             return upscale_result
 
         # the image was too large
-        max_tile_size = split_tile_size(max_tile_size)
+        max_tile_size, eased = _step_down(
+            max_tile_size, split_tile_size, eased, w, h
+        )
         retile_report["tile"] = max_tile_size[0]
 
         # Say which tile was planned as well as the one being retried: the run
@@ -188,7 +256,9 @@ def _max_split(
                 upscale_result = upscale(padded_tile.read_from(img), padded_tile)
 
                 if isinstance(upscale_result, Split):
-                    max_tile_size = split_tile_size(max_tile_size)
+                    max_tile_size, eased = _step_down(
+                        max_tile_size, split_tile_size, eased, w, h
+                    )
                     retile_report["tile"] = max_tile_size[0]
 
                     new_tile_count_y = math.ceil(h / max_tile_size[1])

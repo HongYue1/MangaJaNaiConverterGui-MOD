@@ -96,6 +96,10 @@ def _fields(ev: dict) -> list[str]:
             out.append("no tiling")
         elif tile == -2:
             out.append("tile max")
+    if ev.get("passthrough"):
+        # A rule excluded this page. Say so on the line itself instead of
+        # leaving a bare size and an empty model to be interpreted.
+        out.append("no upscale \u2014 re-encode only")
     entries = ev.get("entries")
     if entries:
         out.append(f"{int(entries)} pages")

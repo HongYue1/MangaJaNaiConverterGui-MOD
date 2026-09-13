@@ -15,6 +15,7 @@ from typing import Any
 from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtGui import QFont, QMouseEvent
 from PySide6.QtWidgets import (
+    QAbstractScrollArea,
     QAbstractSpinBox,
     QButtonGroup,
     QCheckBox,
@@ -430,9 +431,44 @@ class Collapsible(QFrame):
     def toggle(self) -> None:
         self.set_open(not self._open)
 
+    def _host(self) -> QWidget:
+        """The nearest scroll area above this panel, else the window.
+
+        Folding the panel moves everything below it. Inside a scroll area that
+        is repainted by blitting, which can leave the pixels of the *next*
+        card visible in the space this one just vacated -- a flash of the
+        wrong table. Freezing that widget is what stops it.
+        """
+        node: QWidget | None = self.parentWidget()
+        while node is not None:
+            if isinstance(node, QAbstractScrollArea):
+                return node
+            node = node.parentWidget()
+        return self.window()
+
     def _render(self) -> None:
         self.chevron.setText("\u25be" if self._open else "\u25b8")
-        self._wrapper.setVisible(self._open)
+        host = self._host()
+        drawing = host.updatesEnabled()
+        host.setUpdatesEnabled(False)
+        try:
+            self._wrapper.setVisible(self._open)
+            self.updateGeometry()
+            # Qt defers layout to the event loop, and the flash lived in that
+            # gap. Activate every layout from here up to the host now, so the
+            # host repaints once, already at its final size.
+            node: QWidget | None = self
+            while node is not None:
+                layout = node.layout()
+                if layout is not None:
+                    layout.invalidate()
+                    layout.activate()
+                if node is host:
+                    break
+                node = node.parentWidget()
+        finally:
+            host.setUpdatesEnabled(drawing)
+        host.update()
 
     def set_open(self, open_: bool) -> None:
         self._open = bool(open_)

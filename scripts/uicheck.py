@@ -434,7 +434,21 @@ def check_panels(window: MainWindow, app: QApplication) -> None:
     used = sum(header.sectionSize(c) for c in range(window.excl_model.columnCount()))
     room = window.excl_view.viewport().width()
     check("its columns fit the viewport", used <= room + 2, f"{used}px in {room}px")
+    # The flash: folding used to leave the old pixels on screen until Qt got
+    # round to the layout, so the upscale table showed for a moment in the
+    # space the exclusions table had just left. Assert the panel is already
+    # at its folded size *before* the event loop is pumped, and that the
+    # scroll area was handed back in a drawable state.
+    tall = window.panel_excl.height()
     window.panel_excl.set_open(False)
+    folded = window.panel_excl.sizeHint().height()
+    check(
+        "folding resizes the panel before the next repaint",
+        folded < tall,
+        f"{tall}px open, {folded}px hinted folded",
+    )
+    check("its table is hidden at once", not window.excl_view.isVisible())
+    check("the scroll area is left drawable", window.scroll.updatesEnabled())
     pump(app)
     check("it folds away again", not window.panel_excl.is_open())
 
