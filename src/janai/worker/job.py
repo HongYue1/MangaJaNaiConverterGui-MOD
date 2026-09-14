@@ -433,6 +433,7 @@ def run_job(job: dict) -> int:
         tmp = dest.with_suffix(".cbz.part")
         written = 0
         failed_entries = 0
+        seen: set[str] = set()
         try:
             with ZipFile(tmp, "w", ZIP_STORED) as zf:
                 for k, name in enumerate(names, 1):
@@ -446,7 +447,17 @@ def run_job(job: dict) -> int:
                             imageio.read_image_bytes(raw, name), name
                         )
                         data = encode_now(image)
-                        zf.writestr(str(Path(name).with_suffix(FORMATS[fid].ext).as_posix()), data)
+                        # Re-encoding collapses distinct source names onto one
+                        # output name - a.jpg and a.png both become a.png - and
+                        # a zip stores two entries under the identical name
+                        # without complaint, so readers show one page twice or
+                        # drop one and nothing in the log says which. Same
+                        # de-dup the loose-file bundle path already applies.
+                        entry = str(Path(name).with_suffix(ext).as_posix())
+                        while entry.lower() in seen:
+                            entry = f"{entry[: -len(ext)]}_{k}{ext}"
+                        seen.add(entry.lower())
+                        zf.writestr(entry, data)
                         written += 1
                     except Cancelled:
                         raise
