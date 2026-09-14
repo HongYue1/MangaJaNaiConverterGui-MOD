@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtWidgets import QHBoxLayout, QProgressBar, QVBoxLayout, QWidget
 
@@ -377,7 +377,7 @@ class RunPanelMixin(_Base):
             geometry=self._geometry_text(),
         )
 
-    def build_job(self, dry: bool = False) -> dict | None:
+    def build_job(self, dry: bool = False) -> dict[str, Any] | None:
         """The job payload for the worker, or None with the reason on screen."""
         self.sync_settings()
         d = self.settings.data
@@ -400,7 +400,11 @@ class RunPanelMixin(_Base):
             )
             return None
         self.hide_banner()
-        job = {
+        # Annotated because every value in the literal happens to be a dict, so
+        # inference would pin this to dict[str, dict[...]] and reject the flat
+        # `dry_run` flag below. The payload is JSON for another process, so
+        # heterogeneous values are the point, not an accident.
+        job: dict[str, Any] = {
             "input": {
                 "path": str(src),
                 "mode": "single" if src.is_file() else "bulk",

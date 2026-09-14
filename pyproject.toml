@@ -219,11 +219,12 @@ extra_checks = true
 # and the panel bodies are genuinely checked instead of silently Any. Cause 3
 # being fixed as well, rules_panel and rules_table need no override at all.
 
-# Residue to triage: run_panel.py:403 assigns a bool where a dict[str, Any] is
-# declared, and window.py:125 narrows a base-class `Path` to `Path | None`.
-[[tool.mypy.overrides]]
-module = ["janai.app.run_panel", "janai.app.window"]
-disable_error_code = ["assignment"]
+# Its residue is FIXED too, and in the code rather than here: build_job now
+# declares the job payload as dict[str, Any], because every value in the
+# literal happens to be a dict and inference would otherwise pin it to
+# dict[str, dict[...]] and reject the flat `dry_run` flag. The window.py
+# finding this block also named no longer exists - measured with the block
+# stripped, not assumed - so neither module needs an override.
 
 # Cause 2 is FIXED. runtime.py's lazy handles now declare the type they hold
 # once a loader binds them, so the 75 findings that one deliberate design
