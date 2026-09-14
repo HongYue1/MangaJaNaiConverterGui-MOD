@@ -28,6 +28,7 @@ from janai.worker.planning import (
     format_name,
     gather_units,
     natural_key,
+    path_key,
     resolve_out,
     unique_path,
 )
@@ -508,7 +509,11 @@ def run_job(job: dict) -> int:
     def run_images(items: list[dict], into: dict | None) -> None:
         """Upscale a run of images, either to loose files or into one archive."""
         count = len(items)
+        # `seen` claims entry names inside a bundle; `taken` claims paths on
+        # disk. Both exist because re-encoding is not injective, and the two
+        # namespaces de-dupe differently.
         seen: set[str] = set()
+        taken: set[str] = set()
         position = 0
         for unit, payload in prefetch(items, io_workers, reader):
             position += 1
@@ -538,7 +543,13 @@ def run_job(job: dict) -> int:
             dest: Path | None = None
             if into is None:
                 dest = resolve_out(unit, out_dir, pattern, ext, keep_structure, index, total)
-                if dest.exists() and not overwrite:
+                # a.jpg and a.png both resolve to a.png, and a {parent} pattern
+                # collapses a whole folder onto one name. A name this run has
+                # already handed out must NOT take the skip branch: it belongs
+                # to a sibling page whose write may still be queued, so exists()
+                # cannot tell it apart from output left by an earlier run.
+                claimed = path_key(dest) in taken
+                if not claimed and dest.exists() and not overwrite:
                     counters.bump("skipped")
                     emit(
                         "file",
@@ -549,8 +560,9 @@ def run_job(job: dict) -> int:
                         error="exists, skipped",
                     )
                     continue
-                if dest.resolve() == src.resolve():
-                    dest = unique_path(dest)
+                if claimed or dest.resolve() == src.resolve():
+                    dest = unique_path(dest, taken)
+                taken.add(path_key(dest))
             started = time.perf_counter()
             try:
                 image, gray, model_name, info = process_array(payload, src.name)
@@ -761,6 +773,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
             emit("bundle", out=str(dest_bundle), entries=len(units), planned=True, dry=True)
 
         seen: set[str] = set()
+        taken: set[str] = set()
         for position, unit in enumerate(units, 1):
             if CTRL.cancelled:
                 cancelled = True
@@ -817,7 +830,13 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
                 exists = False
             else:
                 dest = resolve_out(unit, out_dir, pattern, ext, cfg["keep_structure"], index, total)
-                exists = dest.exists() and not overwrite
+                # Mirror run_images' reservation, or the plan promises one file
+                # per colliding name while the run writes a de-duped second one.
+                claimed = path_key(dest) in taken
+                if claimed:
+                    dest = unique_path(dest, taken)
+                taken.add(path_key(dest))
+                exists = not claimed and dest.exists() and not overwrite
             counters.bump("skipped" if exists else "processed")
             emit(
                 "file",

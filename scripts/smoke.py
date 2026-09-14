@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from janai.app import runlog
 from janai.core import displays, formats, paths, presets, rules
+from janai.worker import planning
 
 FAILED: list[str] = []
 
@@ -106,6 +107,56 @@ def path_resolution() -> None:
         assert hasattr(resolved, name), f"resolve() has no {name}"
     text = paths.report(resolved)
     assert isinstance(text, str) and text, "paths.report() produced nothing"
+
+
+def output_naming() -> None:
+    """Two sources must never resolve onto one output path.
+
+    Re-encoding is not injective: a.jpg and a.png both become a.png. The run
+    reserves every path it hands out, and `unique_path` has to honour those
+    reservations even for names that do not exist on disk yet, because the
+    write is queued rather than immediate - the live proof is
+    ``scripts/outname_check.py``, which needs a GPU; these are the same
+    guarantees at the function level.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        first = out / "a.png"
+        assert planning.unique_path(first) == first, "an unused name was renamed"
+
+        taken = {planning.path_key(first)}
+        second = planning.unique_path(first, taken)
+        assert second != first, "a reserved name was handed out a second time"
+        assert not second.exists(), "unique_path returned a path that already exists"
+
+        taken.add(planning.path_key(second))
+        third = planning.unique_path(first, taken)
+        assert third not in (first, second), "a third collision reused an earlier name"
+
+        # Windows treats A.png and a.png as one file, so the reservation is
+        # case-folded; raw string comparison would lose a page on the platform
+        # this app actually ships on.
+        upper = out / "A.png"
+        assert planning.path_key(upper) == planning.path_key(first), (
+            "path_key is case-sensitive, so A.png and a.png could collide on Windows"
+        )
+        assert planning.unique_path(upper, taken) != upper, (
+            "a reservation made under a.png did not cover A.png"
+        )
+
+        # An existing file still wins, so output from an earlier run is never
+        # handed out as if it were free.
+        first.write_bytes(b"x")
+        assert planning.unique_path(first) != first, "an existing file was handed out"
+
+    # The collapse starts in the pattern: the default keeps only the stem, and
+    # {parent} maps a whole folder onto one name. Both are deliberate, which is
+    # why de-dup belongs at the path and not in the pattern.
+    jpg, png = Path("/src/ch/a.jpg"), Path("/src/ch/a.png")
+    for pattern in ("{name}", "{parent}"):
+        one = planning.format_name(pattern, jpg, 1, 9)
+        two = planning.format_name(pattern, png, 2, 9)
+        assert one == two, f"{pattern} no longer collides, so the reservation proves nothing"
 
 
 def rule_engine() -> None:
@@ -213,6 +264,7 @@ def main() -> int:
     check("display presets", display_presets)
     check("log formatting", log_formatting)
     check("path resolution", path_resolution)
+    check("output naming", output_naming)
     check("rule engine", rule_engine)
     check("presets", preset_round_trip)
     if FAILED:

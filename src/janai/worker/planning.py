@@ -20,6 +20,7 @@ stack.
 from __future__ import annotations
 
 import re
+from collections.abc import Container
 from pathlib import Path
 from typing import Any
 
@@ -121,13 +122,30 @@ def resolve_out(
     return out_dir / sub / (format_name(pattern, src, index, total) + ext)
 
 
-def unique_path(path: Path) -> Path:
-    if not path.exists():
+def path_key(path: Path) -> str:
+    """Identity of an output path for de-dup purposes.
+
+    Case-folded because Windows treats A.png and a.png as the same file, so
+    comparing raw strings would let one page quietly overwrite another on the
+    platform this app actually ships on.
+    """
+    return str(path).casefold()
+
+
+def unique_path(path: Path, taken: Container[str] = frozenset()) -> Path:
+    """A path that neither exists on disk nor has been claimed by this run.
+
+    `taken` holds the `path_key` values already handed out by the current job.
+    It is required rather than decorative: writes are queued, so `exists()`
+    cannot see a sibling page whose write is still sitting in the write pool,
+    and two sources that resolve to one name would collapse into one file.
+    """
+    if not path.exists() and path_key(path) not in taken:
         return path
     stem, suffix = path.stem, path.suffix
     for n in range(1, MAX_DEDUPE_ATTEMPTS):
         cand = path.with_name(f"{stem} ({n}){suffix}")
-        if not cand.exists():
+        if not cand.exists() and path_key(cand) not in taken:
             return cand
     return path
 
