@@ -41,6 +41,7 @@ from queue import Empty, Queue
 from typing import Any
 from zipfile import ZIP_STORED, ZipFile
 
+from janai.core.fspath import io_path
 from janai.worker.control import CTRL, Cancelled
 from janai.worker.events import log
 
@@ -270,11 +271,15 @@ class BundleWriter:
 
     def open(self, key: str, dest: Path) -> None:
         self.close()
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        # `dest` and `tmp` are kept plain because the `bundle` event reports
+        # them; only the handles used for the syscalls carry the long-path
+        # prefix. See janai.core.fspath for why that separation matters.
+        io_path(dest).parent.mkdir(parents=True, exist_ok=True)
         self.key, self.dest = key, dest
         self.tmp = dest.with_suffix(".cbz.part")
-        self.tmp.unlink(missing_ok=True)
-        self.zf = ZipFile(self.tmp, "w", ZIP_STORED)
+        tmp_io = io_path(self.tmp)
+        tmp_io.unlink(missing_ok=True)
+        self.zf = ZipFile(tmp_io, "w", ZIP_STORED)
         self.entries = 0
         self.failed = 0
         self.started = time.perf_counter()
@@ -338,9 +343,9 @@ class BundleWriter:
         if tmp is None or dest is None:
             return
         if not keep or entries == 0:
-            tmp.unlink(missing_ok=True)
+            io_path(tmp).unlink(missing_ok=True)
             return
-        tmp.replace(dest)
+        io_path(tmp).replace(io_path(dest))
         self.on_done(key or "", dest, entries, failed, elapsed)
 
     def shutdown(self) -> None:

@@ -16,6 +16,7 @@ from zipfile import ZIP_STORED, ZipFile
 
 from janai.core import rules as _rules
 from janai.core.formats import CONTAINERS, FORMATS, merged
+from janai.core.fspath import io_path, path_too_long
 from janai.worker import devices, imageio, runtime, tiling
 from janai.worker.control import CTRL, Cancelled
 from janai.worker.environment import MODELS_DIR
@@ -249,7 +250,7 @@ def run_job(job: dict) -> int:
             },
         )
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    io_path(out_dir).mkdir(parents=True, exist_ok=True)
     ctx, device, fp16 = devices.make_context(perf)
     stored_profile = perf.get("profile")
     planner = tiling.TilePlanner(
@@ -355,9 +356,18 @@ def run_job(job: dict) -> int:
         started: float,
     ):
         try:
+            # A name longer than the file system allows is not a MAX_PATH
+            # problem and no prefix lifts it, so say which name and how long
+            # rather than letting a bare "[Errno 22] Invalid argument" be the
+            # whole explanation the user gets from the handler below.
+            too_long = path_too_long(dest)
+            if too_long:
+                raise OSError(too_long)
             data = encode_now(image)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
+            # `dest` stays plain: it is what the `file` event below reports.
+            target = io_path(dest)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
             counters.bump("processed")
             emit(
                 "file",
@@ -415,13 +425,14 @@ def run_job(job: dict) -> int:
         )
 
     def on_bundle_done(key: str, dest: Path, entries: int, failed: int, elapsed: float) -> None:
+        written_to = io_path(dest)
         emit(
             "bundle",
             key=key,
             out=str(dest),
             entries=entries,
             failed=failed,
-            bytes=(dest.stat().st_size if dest.exists() else 0),
+            bytes=(written_to.stat().st_size if written_to.exists() else 0),
             ms=int(elapsed * 1000),
         )
 
@@ -430,13 +441,20 @@ def run_job(job: dict) -> int:
     def handle_archive(index: int, unit: dict) -> None:
         src: Path = unit["path"]
         dest = resolve_out(unit, out_dir, pattern, ".cbz", keep_structure, index, total)
-        if dest.exists() and not overwrite:
+        if io_path(dest).exists() and not overwrite:
             counters.bump("skipped")
             emit(
                 "file", i=index, total=total, path=str(src), out=str(dest), error="exists, skipped"
             )
             return
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        too_long = path_too_long(dest)
+        if too_long:
+            # Fail this chapter, not the run, and name the culprit -- the same
+            # shape as the unsupported-archive branch just below.
+            counters.bump("failed")
+            emit("file", i=index, total=total, path=str(src), error=f"OSError: {too_long}")
+            return
+        io_path(dest).parent.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
         opener = open_archive(src)
         if opener is None:
@@ -445,6 +463,10 @@ def run_job(job: dict) -> int:
             return
         names, reader = opener
         tmp = dest.with_suffix(".cbz.part")
+        # `dest` and `tmp` stay plain: they are what the `file` event and the
+        # log carry. Only these two handles cross into the file system, so only
+        # they may wear the extended-length prefix.
+        tmp_io, dest_io = io_path(tmp), io_path(dest)
         written = 0
         failed_entries = 0
         seen: set[str] = set()
@@ -461,7 +483,7 @@ def run_job(job: dict) -> int:
             log(traceback.format_exc(limit=4), "debug")
 
         try:
-            with ZipFile(tmp, "w", ZIP_STORED) as zf:
+            with ZipFile(tmp_io, "w", ZIP_STORED) as zf:
                 # Encoding is not cheap beside the upscale it follows -- ~9% of a
                 # page for PNG, ~72% for AVIF -- and it used to run inline, so
                 # the GPU idled through all of it. The packer overlaps it with
@@ -542,7 +564,7 @@ def run_job(job: dict) -> int:
                     if failed_entries
                     else "no pages in archive"
                 )
-            tmp.replace(dest)
+            tmp_io.replace(dest_io)
             counters.bump("processed")
             emit(
                 "file",
@@ -551,15 +573,15 @@ def run_job(job: dict) -> int:
                 path=str(src),
                 out=str(dest),
                 ms=int((time.perf_counter() - started) * 1000),
-                bytes=dest.stat().st_size,
+                bytes=dest_io.stat().st_size,
                 entries=written,
                 failed=failed_entries,
             )
         except Cancelled:
-            tmp.unlink(missing_ok=True)
+            tmp_io.unlink(missing_ok=True)
             raise
         except Exception as exc:
-            tmp.unlink(missing_ok=True)
+            tmp_io.unlink(missing_ok=True)
             counters.bump("failed")
             emit("file", i=index, total=total, path=str(src), error=f"{type(exc).__name__}: {exc}")
 
@@ -610,8 +632,10 @@ def run_job(job: dict) -> int:
                 # already handed out must NOT take the skip branch: it belongs
                 # to a sibling page whose write may still be queued, so exists()
                 # cannot tell it apart from output left by an earlier run.
+                # path_key stays on the PLAIN path: a reservation keyed on a
+                # prefixed string would never match the same name again.
                 claimed = path_key(dest) in taken
-                if not claimed and dest.exists() and not overwrite:
+                if not claimed and io_path(dest).exists() and not overwrite:
                     counters.bump("skipped")
                     emit(
                         "file",
