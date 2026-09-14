@@ -1,6 +1,6 @@
 """The concurrency primitives the pipeline stages are built from.
 
-Three rules hold this together and each one paid for itself in a bug:
+These rules hold this together and each one paid for itself in a bug:
 
 * **Every queue is bounded.** ``WritePool``'s slot semaphore, ``prefetch``'s
   queue and ``BundleWriter``'s pack slots all cap how far a fast stage may run
@@ -14,9 +14,15 @@ Three rules hold this together and each one paid for itself in a bug:
   consumer can never wait on a producer that died, and cancelling tears the pool
   down without waiting for queued reads. A consumer that leaves early also
   drains the queue on its way out: the pump can be parked inside ``put``, where
-  setting ``stop`` cannot reach it. ``WritePool.submit`` waits for a write slot
-  in bounded steps for the same reason: a slot is only freed by an in-flight
-  encode, so an unbounded wait would make Cancel arrive a page late.
+  setting ``stop`` cannot reach it. ``WritePool.submit`` and ``BundleWriter.add``
+  wait for their slot in bounded steps for the same reason: a slot is only freed
+  by an in-flight encode, so an unbounded wait would make Cancel arrive a page
+  late.
+* **A slot taken is a slot returned.** Both pools take a slot *before* handing
+  the task to their executor, and the matching release lives in that task's
+  ``finally`` -- so a submit that raises has to release the slot itself. A slot
+  lost that way is retired permanently, and enough of them leave an acquire
+  that can never succeed: a hang with no abort path.
 * **Shared tallies are locked.** ``Counters`` guards the job's page totals,
   because the write pool, the pack thread and the main loop all bump them and
   ``d[key] += 1`` is a load, an add and a store rather than one step.
@@ -43,9 +49,9 @@ WRITE_SLOTS_PER_WORKER = 2
 disk, few enough that finished pages cannot pile up in memory."""
 
 SLOT_WAIT_SECONDS = 0.05
-"""How long ``submit`` waits for a write slot before re-checking the abort flag.
-Matches the pause poll: short enough that Cancel is not made to wait out an
-encode, long enough not to spin a core."""
+"""How long ``submit`` and ``add`` wait for a slot before re-checking the abort
+flag. Matches the pause poll: short enough that Cancel is not made to wait out
+an encode, long enough not to spin a core."""
 
 PACK_SLOTS = 4
 """Pages allowed to queue for the single packing thread, for the same reason."""
@@ -113,7 +119,11 @@ class WritePool:
             finally:
                 self.slots.release()
 
-        fut = self.pool.submit(task)
+        try:
+            fut = self.pool.submit(task)
+        except BaseException:
+            self.slots.release()  # the task never ran, so its finally never will
+            raise
         with self.lock:
             self.pending.add(fut)
         fut.add_done_callback(self._finished)
@@ -256,9 +266,21 @@ class BundleWriter:
         self.started = time.perf_counter()
 
     def add(self, name: str, image, meta: dict) -> None:
+        """Queue a page for packing, waiting for a slot but never past a cancel.
+
+        The same bounded wait as ``WritePool.submit``, for the same reason: only
+        an in-flight encode frees a pack slot, so an unbounded wait would make
+        Cancel arrive a page late. Aborting here costs nothing the user can see,
+        because ``run_job`` closes the bundle with ``keep=not CTRL.cancelled``:
+        the .part of a cancelled job is deleted, so any page packed after the
+        cancel was pure waste. It raises rather than dropping the page silently
+        so the producer unwinds through the one abort path, as at every gate.
+        """
         if self.zf is None:
             return
-        self.slots.acquire()
+        while not self.slots.acquire(timeout=SLOT_WAIT_SECONDS):
+            if CTRL.cancelled:
+                raise Cancelled
         zf = self.zf
 
         def task() -> None:
@@ -273,7 +295,11 @@ class BundleWriter:
             finally:
                 self.slots.release()
 
-        self.futures.append(self.pool.submit(task))
+        try:
+            self.futures.append(self.pool.submit(task))
+        except BaseException:
+            self.slots.release()  # the task never ran, so its finally never will
+            raise
 
     def drain(self) -> None:
         for fut in self.futures:
