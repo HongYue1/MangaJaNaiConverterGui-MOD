@@ -41,6 +41,7 @@ from janai.worker.planning import (
     resolve_out,
     unique_path,
 )
+from janai.worker.reporting import JobReporter
 from janai.worker.selection import PagePolicy
 from janai.worker.transforms import (
     GRAY_SAMPLE,
@@ -264,98 +265,14 @@ def run_job(job: dict) -> int:
         t_h=t_h,
     )
 
-    def write_result(
-        index: int,
-        src: Path,
-        dest: Path,
-        image,
-        gray: bool,
-        model_name: str,
-        info: dict,
-        started: float,
-    ):
-        try:
-            # A name longer than the file system allows is not a MAX_PATH
-            # problem and no prefix lifts it, so say which name and how long
-            # rather than letting a bare "[Errno 22] Invalid argument" be the
-            # whole explanation the user gets from the handler below.
-            too_long = path_too_long(dest)
-            if too_long:
-                raise OSError(too_long)
-            data = encoder.encode(image)
-            # `dest` stays plain: it is what the `file` event below reports.
-            target = io_path(dest)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
-            counters.bump("processed")
-            emit(
-                "file",
-                i=index,
-                total=total,
-                path=str(src),
-                out=str(dest),
-                ms=int((time.perf_counter() - started) * 1000),
-                bytes=len(data),
-                gray=bool(gray),
-                model=model_name,
-                **info,
-            )
-        except Exception as exc:
-            counters.bump("failed")
-            emit(
-                "file",
-                i=index,
-                total=total,
-                path=str(src),
-                out=str(dest),
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            # The event carries only "OSError: ...", and encode/write failures
-            # land in library frames, so the message alone rarely says where.
-            # Same limit as the read/upscale path so both read alike.
-            log(traceback.format_exc(limit=4), "debug")
-
-    def on_bundle_page(meta: dict, name: str, size: int) -> None:
-        counters.bump("processed")
-        emit(
-            "file",
-            i=meta.get("i"),
-            total=total,
-            path=meta.get("src"),
-            out=meta.get("bundle"),
-            entry=name,
-            bytes=size,
-            ms=int((time.perf_counter() - float(meta.get("started") or 0)) * 1000),
-            gray=bool(meta.get("gray")),
-            model=meta.get("model"),
-            **(meta.get("info") or {}),
-        )
-
-    def on_bundle_fail(meta: dict, name: str, error: str) -> None:
-        counters.bump("failed")
-        emit(
-            "file",
-            i=meta.get("i"),
-            total=total,
-            path=meta.get("src"),
-            out=meta.get("bundle"),
-            entry=name,
-            error=error,
-        )
-
-    def on_bundle_done(key: str, dest: Path, entries: int, failed: int, elapsed: float) -> None:
-        written_to = io_path(dest)
-        emit(
-            "bundle",
-            key=key,
-            out=str(dest),
-            entries=entries,
-            failed=failed,
-            bytes=(written_to.stat().st_size if written_to.exists() else 0),
-            ms=int(elapsed * 1000),
-        )
-
-    bundle = BundleWriter(encoder.encode, on_bundle_page, on_bundle_fail, on_bundle_done)
+    # Reporting is one object so this job's slice of the wire format lives in
+    # one module: every method only moves a counter and emits one event. It is
+    # given `counters` by reference on purpose -- that locked tally is the
+    # shared state, and `write_page` runs on a write-pool thread.
+    reporter = JobReporter(counters=counters, total=total, encoder=encoder)
+    bundle = BundleWriter(
+        encoder.encode, reporter.bundle_page, reporter.bundle_failed, reporter.bundle_done
+    )
 
     def handle_archive(index: int, unit: dict) -> None:
         src: Path = unit["path"]
@@ -606,7 +523,7 @@ def run_job(job: dict) -> int:
                 continue
             if into is None and dest is not None:
                 writer.submit(
-                    write_result, index, src, dest, image, gray, model_name, info, started
+                    reporter.write_page, index, src, dest, image, gray, model_name, info, started
                 )
                 continue
             if into is None:
