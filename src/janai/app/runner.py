@@ -372,7 +372,7 @@ class Runner:
 
     # ------------------------------------------------------------------ #
     def drain(self, handler: Callable[[dict], None], limit: int = 200) -> None:
-        """Dispatch pending events; call from the Tk event loop."""
+        """Dispatch pending events; call from the Qt event loop."""
         for _ in range(limit):
             try:
                 event = self.events.get_nowait()

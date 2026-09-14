@@ -101,7 +101,7 @@ ignore = [
   # a dry run and the --probe path must never pay for them.
   "PLC0415",
   # The GUI and the worker both catch broad exceptions deliberately: a failed
-  # page must not kill a 200-page chapter, and a Tk callback must not take the
+  # page must not kill a 200-page chapter, and a Qt slot must not take the
   # window down. Those sites are individually intentional.
   "BLE001",
   # Re-binding a loop variable while normalising a line/path is idiomatic here.

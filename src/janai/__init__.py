@@ -3,8 +3,8 @@
 Three packages, deliberately separated:
 
 ``janai.app``
-    The Tk interface. Standard library only - it never imports torch, numpy or
-    pyvips, which is what keeps the window responsive and the startup instant.
+    The Qt (PySide6) interface. It never imports torch, numpy or pyvips, which
+    is what keeps the window responsive and the startup instant.
 
 ``janai.core``
     Everything both processes need to agree on: where files live, the output
