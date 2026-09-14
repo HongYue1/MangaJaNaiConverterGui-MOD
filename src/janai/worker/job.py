@@ -109,9 +109,16 @@ def run_job(job: dict) -> int:
 
     units = gather_units(inp)
     total = len(units)
-    out_dir = Path(str(outp.get("dir") or "")).expanduser()
-    if not out_dir:
+    # Guard the raw string, never the Path: Path("") normalises to Path("."),
+    # which is truthy, so `if not out_dir` could never fire. A job that arrived
+    # without output.dir therefore wrote every page into the worker's current
+    # directory -- the app folder, when the GUI launches it -- and still
+    # reported success. The Path is still built from the unstripped value, so
+    # every destination that worked before is byte-for-byte unchanged.
+    out_dir_raw = str(outp.get("dir") or "")
+    if not out_dir_raw.strip():
         raise ValueError("output.dir is required")
+    out_dir = Path(out_dir_raw).expanduser()
 
     models = list_models(models_dir)
     mode = str(ups.get("mode") or "scale")
