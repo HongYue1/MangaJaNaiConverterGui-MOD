@@ -12,7 +12,9 @@ Three rules hold this together and each one paid for itself in a bug:
 * **Nothing blocks without an abort path.** ``prefetch`` re-checks ``CTRL``
   between items, its pump puts the terminating ``None`` from a ``finally`` so a
   consumer can never wait on a producer that died, and cancelling tears the pool
-  down without waiting for queued reads.
+  down without waiting for queued reads. A consumer that leaves early also
+  drains the queue on its way out: the pump can be parked inside ``put``, where
+  setting ``stop`` cannot reach it.
 
 The drain paths log and continue instead of raising: one failed page must not
 abandon the other 199.
@@ -24,7 +26,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import Any
 from zipfile import ZIP_STORED, ZipFile
 
@@ -84,6 +86,33 @@ class WritePool:
         self.pool.shutdown(wait=True)
 
 
+PUMP_RELEASE_SECONDS = 2.0
+"""How long teardown may spend freeing a pump parked in ``queue.put``. Bounded
+so an abort can never hang on the very thread it is trying to release."""
+
+PUMP_RELEASE_POLL_SECONDS = 0.05
+"""How often that drain re-checks, matching the pause poll: fast enough to feel
+instant, slow enough not to spin a core."""
+
+
+def _release_pump(pending: Queue) -> None:
+    """Drain until the pump's sentinel arrives, so the pump thread can exit.
+
+    ``stop`` is only tested between items, so setting it cannot wake a thread
+    already blocked inside ``put``. Freeing a slot lets that put complete; the
+    pump then sees ``stop``, breaks, and emits its sentinel from its ``finally``.
+    Without this, a read-ahead abandoned by a cancel leaks the thread and every
+    decoded page it is still holding -- the largest objects in the process.
+    """
+    deadline = time.monotonic() + PUMP_RELEASE_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            if pending.get(timeout=PUMP_RELEASE_POLL_SECONDS) is None:
+                return
+        except Empty:
+            continue
+
+
 def prefetch(units: list[dict], workers: int, reader):
     """Yield (unit, array_or_exception) in order, decoding ahead of the pipeline."""
     workers = max(1, int(workers or 1))
@@ -113,10 +142,12 @@ def prefetch(units: list[dict], workers: int, reader):
             queue.put(None)
 
     threading.Thread(target=pump, name="prefetch", daemon=True).start()
+    ended = False  # the sentinel proves the pump already reached its finally
     try:
         while True:
             item = queue.get()
             if item is None:
+                ended = True
                 return
             unit, fut = item
             if CTRL.cancelled:
@@ -130,6 +161,8 @@ def prefetch(units: list[dict], workers: int, reader):
     finally:
         stop.set()
         pool.shutdown(wait=False, cancel_futures=True)
+        if not ended:
+            _release_pump(queue)
 
 
 class BundleWriter:
