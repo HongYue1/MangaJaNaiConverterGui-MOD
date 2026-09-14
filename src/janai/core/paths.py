@@ -33,6 +33,7 @@ import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 CONFIG_NAME = "janai.config.json"
 MODEL_EXTS = {".pth", ".safetensors", ".pt", ".ckpt"}
@@ -73,7 +74,7 @@ def config_file(root: Path | None = None) -> Path:
     return (root or app_root()) / CONFIG_NAME
 
 
-def read_config(root: Path | None = None) -> dict:
+def read_config(root: Path | None = None) -> dict[str, Any]:
     """The saved configuration, or an empty dict when there is none.
 
     setup.ps1 writes this file. It only needs entries for locations that sit
@@ -172,8 +173,8 @@ class Paths:
     resources_dir: Path | None = None
     extras_dir: Path | None = None
     tools_dir: Path | None = None
-    origins: dict = field(default_factory=dict)
-    config: dict = field(default_factory=dict)
+    origins: dict[str, str] = field(default_factory=dict)
+    config: dict[str, Any] = field(default_factory=dict)
 
     @property
     def backend(self) -> Path:
@@ -193,8 +194,8 @@ class Paths:
                 return cand
         return None
 
-    def as_dict(self) -> dict:
-        out: dict = {"root": str(self.root)}
+    def as_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"root": str(self.root)}
         for name in LOCATIONS:
             value = getattr(self, name)
             out[name] = str(value) if value else ""

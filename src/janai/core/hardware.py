@@ -23,18 +23,18 @@ from typing import Any
 PROFILE_VERSION = 1
 
 
-def _devices(probe: Any) -> list[dict]:
+def _devices(probe: Any) -> list[dict[str, Any]]:
     if not isinstance(probe, dict):
         return []
     return [d for d in (probe.get("devices") or []) if isinstance(d, dict)]
 
 
-def accelerators(probe: Any) -> list[dict]:
+def accelerators(probe: Any) -> list[dict[str, Any]]:
     """The compute devices that are not the CPU, in the order probed."""
     return [d for d in _devices(probe) if str(d.get("value") or "") != "cpu"]
 
 
-def device_name(device: dict) -> str:
+def device_name(device: dict[str, Any]) -> str:
     """The card's name without the index the session gave it.
 
     Labels arrive as "NVIDIA GeForce RTX 3060 (cuda:0)". A card that merely
@@ -73,7 +73,7 @@ def describe(probe: Any) -> str:
     return f"{device_name(gpus[0])}{extra}"
 
 
-def profile_models(profile: Any) -> dict:
+def profile_models(profile: Any) -> dict[str, Any]:
     """The per-model measurements in a stored profile, or an empty dict."""
     if not isinstance(profile, dict):
         return {}
@@ -100,7 +100,7 @@ def profile_is_current(profile: Any, probe: Any) -> bool:
     return str(profile.get("fingerprint") or "") == key
 
 
-def profile_for_run(profile: Any, probe: Any, fp16: bool) -> dict:
+def profile_for_run(profile: Any, probe: Any, fp16: bool) -> dict[str, Any]:
     """The measurements a run may use, or an empty dict.
 
     FP16 and FP32 have different per-pixel costs - the element size is the

@@ -72,7 +72,7 @@ MAX_DEDUPE_ATTEMPTS = 10000
 looping forever on a pathological directory."""
 
 
-def natural_key(name: str):
+def natural_key(name: str) -> list[int | str]:
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
 
 
@@ -121,12 +121,12 @@ def decode_entry_name(name: str, *, utf8_flag: bool) -> str:
         return name
 
 
-def gather_units(inp: dict) -> list[dict]:
+def gather_units(inp: dict[str, Any]) -> list[dict[str, Any]]:
     raw = Path(str(inp.get("path") or "")).expanduser()
     mode = str(inp.get("mode") or ("single" if raw.is_file() else "bulk"))
     include_archives = bool(inp.get("include_archives", True))
     recursive = bool(inp.get("recursive", True))
-    units: list[dict] = []
+    units: list[dict[str, Any]] = []
 
     def add(p: Path, base: Path) -> None:
         ext = p.suffix.lower()
@@ -166,7 +166,13 @@ def format_name(pattern: str, src: Path, index: int, total: int) -> str:
 
 
 def resolve_out(
-    unit: dict, out_dir: Path, pattern: str, ext: str, keep_structure: bool, index: int, total: int
+    unit: dict[str, Any],
+    out_dir: Path,
+    pattern: str,
+    ext: str,
+    keep_structure: bool,
+    index: int,
+    total: int,
 ) -> Path:
     src: Path = unit["path"]
     base: Path = unit["base"]
@@ -211,15 +217,17 @@ def safe_name(name: Any) -> str:
     return RESERVED_CHARS.sub("_", str(name)).strip() or "output"
 
 
-def relative_dir(unit: dict) -> Path:
+def relative_dir(unit: dict[str, Any]) -> Path:
     """Where this file sits inside the input folder."""
+    src: Path = unit["path"]
+    base: Path = unit["base"]
     try:
-        return unit["path"].parent.relative_to(unit["base"])
+        return src.parent.relative_to(base)
     except ValueError:
         return Path()
 
 
-def chapter_dest(unit: dict, out_dir: Path, keep_structure: bool) -> Path:
+def chapter_dest(unit: dict[str, Any], out_dir: Path, keep_structure: bool) -> Path:
     """The .cbz that this file's own folder becomes."""
     rel = relative_dir(unit)
     name = rel.name or Path(str(unit["base"])).name or unit["path"].stem
@@ -228,8 +236,8 @@ def chapter_dest(unit: dict, out_dir: Path, keep_structure: bool) -> Path:
 
 
 def build_tasks(
-    units: list[dict], out_dir: Path, keep_structure: bool, container_id: str
-) -> list[dict]:
+    units: list[dict[str, Any]], out_dir: Path, keep_structure: bool, container_id: str
+) -> list[dict[str, Any]]:
     """Group the units into the things this run will actually produce.
 
     Loose images stay in one run of consecutive units so the decoder can read
@@ -238,8 +246,8 @@ def build_tasks(
     into one archive per chapter.
     """
     pack = packs_archive(container_id)
-    tasks: list[dict] = []
-    groups: dict[str, dict] = {}
+    tasks: list[dict[str, Any]] = []
+    groups: dict[str, dict[str, Any]] = {}
     for index, unit in enumerate(units, 1):
         unit["index"] = index
         if unit["kind"] == "archive":

@@ -75,7 +75,7 @@ def counter(index: Any, total: Any) -> str:
     return f"{i:>{width}}/{n}"
 
 
-def _fields(ev: dict) -> list[str]:
+def _fields(ev: dict[str, Any]) -> list[str]:
     """The trailing, optional columns of a per-file line."""
     out: list[str] = []
     w, h = ev.get("w"), ev.get("h")
@@ -111,7 +111,7 @@ def _fields(ev: dict) -> list[str]:
     return out
 
 
-def format_file(ev: dict) -> tuple[str, str]:
+def format_file(ev: dict[str, Any]) -> tuple[str, str]:
     """(line, level) for a `file` event."""
     name = Path(str(ev.get("path") or "")).name or str(ev.get("out") or "")
     count = counter(ev.get("i"), ev.get("total"))
@@ -134,7 +134,7 @@ def format_file(ev: dict) -> tuple[str, str]:
     return "  ".join(p for p in parts if p).rstrip(), level
 
 
-def format_bundle(ev: dict) -> tuple[str, str]:
+def format_bundle(ev: dict[str, Any]) -> tuple[str, str]:
     """(line, level) for a `bundle` event: one archive finished or planned."""
     name = Path(str(ev.get("out") or "")).name
     planned = bool(ev.get("planned"))
@@ -151,7 +151,7 @@ def format_bundle(ev: dict) -> tuple[str, str]:
     return line.rstrip(), ("dry" if planned else "ok")
 
 
-def format_start(ev: dict) -> list[tuple[str, str]]:
+def format_start(ev: dict[str, Any]) -> list[tuple[str, str]]:
     """Header lines for a `start` event."""
     dry = bool(ev.get("dry"))
     bits = [
@@ -171,7 +171,7 @@ def format_start(ev: dict) -> list[tuple[str, str]]:
     return lines
 
 
-def format_done(ev: dict) -> tuple[str, str]:
+def format_done(ev: dict[str, Any]) -> tuple[str, str]:
     processed = int(ev.get("processed") or 0)
     failed = int(ev.get("failed") or 0)
     skipped = int(ev.get("skipped") or 0)

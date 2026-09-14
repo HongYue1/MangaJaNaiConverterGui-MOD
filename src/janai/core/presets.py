@@ -25,6 +25,7 @@ import re
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 FORMAT = "janai.preset"
 VERSION = 1
@@ -49,9 +50,9 @@ class PresetError(Exception):
 # --------------------------------------------------------------------------- #
 # building and applying
 # --------------------------------------------------------------------------- #
-def snapshot(data: dict, sections: Sequence[str] = SECTIONS) -> dict:
+def snapshot(data: dict[str, Any], sections: Sequence[str] = SECTIONS) -> dict[str, Any]:
     """Copy the portable half of a settings dict."""
-    out: dict = {}
+    out: dict[str, Any] = {}
     for name in sections:
         section = data.get(name)
         if not isinstance(section, dict):
@@ -61,7 +62,7 @@ def snapshot(data: dict, sections: Sequence[str] = SECTIONS) -> dict:
     return out
 
 
-def build(name: str, data: dict, note: str = "", app_version: str = "") -> dict:
+def build(name: str, data: dict[str, Any], note: str = "", app_version: str = "") -> dict[str, Any]:
     """Wrap a settings snapshot in the preset envelope."""
     return {
         "format": FORMAT,
@@ -74,7 +75,9 @@ def build(name: str, data: dict, note: str = "", app_version: str = "") -> dict:
     }
 
 
-def apply(data: dict, preset: dict, sections: Sequence[str] = SECTIONS) -> list[str]:
+def apply(
+    data: dict[str, Any], preset: dict[str, Any], sections: Sequence[str] = SECTIONS
+) -> list[str]:
     """Merge a preset into a settings dict in place; returns what changed.
 
     Merging is per key, so a preset written by an older build cannot delete
@@ -107,7 +110,7 @@ def apply(data: dict, preset: dict, sections: Sequence[str] = SECTIONS) -> list[
 # --------------------------------------------------------------------------- #
 # files
 # --------------------------------------------------------------------------- #
-def validate(raw: object) -> dict:
+def validate(raw: object) -> dict[str, Any]:
     """Check a parsed file really is a preset, and return it."""
     if not isinstance(raw, dict):
         raise PresetError("that file does not contain a preset")
@@ -121,7 +124,7 @@ def validate(raw: object) -> dict:
     return raw
 
 
-def read(path: str | Path) -> dict:
+def read(path: str | Path) -> dict[str, Any]:
     """Load and validate a preset file."""
     target = Path(path)
     try:
@@ -133,7 +136,7 @@ def read(path: str | Path) -> dict:
     return validate(raw)
 
 
-def write(path: str | Path, preset: dict) -> Path:
+def write(path: str | Path, preset: dict[str, Any]) -> Path:
     """Write a preset, creating the folder and replacing atomically."""
     target = Path(path)
     if not target.name.endswith(SUFFIX) and target.suffix.lower() != ".json":
@@ -177,7 +180,7 @@ def filename(name: str) -> str:
     return clean[:60] + SUFFIX
 
 
-def summary(preset: dict) -> str:
+def summary(preset: dict[str, Any]) -> str:
     """One line describing what a preset will do, for a confirmation."""
     settings = preset.get("settings") or {}
     upscale = settings.get("upscale") or {}

@@ -39,6 +39,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 # --------------------------------------------------------------------------- #
 # vocabulary
@@ -194,8 +195,8 @@ class Rule:
     note: str = field(default="", compare=False)
 
     # -- serialisation ----------------------------------------------------- #
-    def to_dict(self) -> dict:
-        data: dict = {
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
             "kind": self.kind,
             "width": self.width,
             "height": self.height,
@@ -371,7 +372,7 @@ class RuleSet:
             return cls(())
         return cls(Rule.from_dict(item) for item in data)
 
-    def to_dicts(self) -> list[dict]:
+    def to_dicts(self) -> list[dict[str, Any]]:
         return [r.to_dict() for r in self.rules]
 
     def __len__(self) -> int:
@@ -522,15 +523,18 @@ def default_working_set(
     names = [str(n) for n in installed]
     out: list[Rule] = []
     for scale in scales:
-        rows: list[list] = []
+        rows: list[tuple[int, int, str]] = []
         for low, high, bucket in bands():
             pick = gray_model(names, scale, bucket)
             if not pick:
                 continue
             if rows and rows[-1][2] == pick:
-                rows[-1][1] = high  # same file, so widen the previous band
+                # Same file, so widen the previous band. A tuple rather than a
+                # mutable row because the three columns have three types, and
+                # `list[int | str]` would defeat `dim_spec` and `model=` below.
+                rows[-1] = (rows[-1][0], high, pick)
             else:
-                rows.append([low, high, pick])
+                rows.append((low, high, pick))
         for low, high, pick in rows:
             out.append(
                 Rule(
@@ -587,5 +591,5 @@ def materialise(
     return out, notes
 
 
-def default_dicts(installed: Sequence[str] = ()) -> list[dict]:
+def default_dicts(installed: Sequence[str] = ()) -> list[dict[str, Any]]:
     return [r.to_dict() for r in default_working_set(installed)]

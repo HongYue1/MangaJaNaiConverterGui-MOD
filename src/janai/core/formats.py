@@ -24,8 +24,10 @@ class Opt:
     choices: tuple[tuple[str, Any], ...] = ()
     hint: str = ""
     advanced: bool = False
-    only_if: tuple[str, Any] | None = None
-    not_if: tuple[str, Any] | None = None
+    # `object`, not `Any`: a condition value is only ever compared, never used,
+    # and one `Any` operand is enough to make `==` leak Any out of `_matches`.
+    only_if: tuple[str, object] | None = None
+    not_if: tuple[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -462,9 +464,12 @@ def all_defaults() -> dict[str, dict[str, Any]]:
     return {fid: defaults(fid) for fid in FORMATS}
 
 
-def _matches(cond: tuple[str, Any], values: dict[str, Any]) -> bool:
+def _matches(cond: tuple[str, object], values: dict[str, Any]) -> bool:
     key, want = cond
-    cur = values.get(key)
+    # Both operands must be `object`, never `Any`: these are opaque option
+    # values compared only by `==`/`in`, and a single `Any` operand makes `==`
+    # return Any, which then leaks out of this `-> bool` function.
+    cur: object = values.get(key)
     if isinstance(want, (tuple, list, set)):
         return cur in want
     return cur == want
