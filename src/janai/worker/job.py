@@ -21,7 +21,7 @@ from janai.worker.control import CTRL, Cancelled
 from janai.worker.environment import MODELS_DIR
 from janai.worker.events import emit, log
 from janai.worker.models import ModelCache, choose_model, list_models, upscale_array
-from janai.worker.pipeline import BundleWriter, Counters, WritePool, prefetch
+from janai.worker.pipeline import BundleWriter, Counters, PagePacker, WritePool, prefetch
 from janai.worker.planning import (
     UTF8_NAME_FLAG,
     build_tasks,
@@ -448,52 +448,88 @@ def run_job(job: dict) -> int:
         written = 0
         failed_entries = 0
         seen: set[str] = set()
+
+        def on_page_fail(entry: str, exc: BaseException) -> None:
+            """Report a page the packer could not encode. Runs on the pack thread.
+
+            The same two tallies the decode half below keeps, for the same
+            reason. Both are safe off-thread: ``counters`` is locked and
+            ``emit`` holds the stdout lock.
+            """
+            counters.bump("pages_failed")
+            log(f"{src.name}:{entry}: {exc}", "warn")
+            log(traceback.format_exc(limit=4), "debug")
+
         try:
             with ZipFile(tmp, "w", ZIP_STORED) as zf:
-                for k, name in enumerate(names, 1):
-                    if CTRL.cancelled:
-                        raise Cancelled
-                    CTRL.gate()
-                    emit("progress", i=index, total=total, path=str(src), sub_i=k, sub_n=len(names))
-                    try:
-                        raw = reader(name)
-                        image, _gray, _model, _info = process_array(
-                            imageio.read_image_bytes(raw, name), name
+                # Encoding is not cheap beside the upscale it follows -- ~9% of a
+                # page for PNG, ~72% for AVIF -- and it used to run inline, so
+                # the GPU idled through all of it. The packer overlaps it with
+                # the next page's upscale, with one worker so pages still land
+                # in the order they were read.
+                packer = PagePacker(zf, encode_now, on_page_fail)
+                try:
+                    for k, name in enumerate(names, 1):
+                        if CTRL.cancelled:
+                            raise Cancelled
+                        CTRL.gate()
+                        emit(
+                            "progress",
+                            i=index,
+                            total=total,
+                            path=str(src),
+                            sub_i=k,
+                            sub_n=len(names),
                         )
-                        data = encode_now(image)
-                        # Re-encoding collapses distinct source names onto one
-                        # output name - a.jpg and a.png both become a.png - and
-                        # a zip stores two entries under the identical name
-                        # without complaint, so readers show one page twice or
-                        # drop one and nothing in the log says which. Same
-                        # de-dup the loose-file bundle path already applies.
-                        entry = str(Path(name).with_suffix(ext).as_posix())
-                        while entry.lower() in seen:
-                            entry = f"{entry[: -len(ext)]}_{k}{ext}"
-                        seen.add(entry.lower())
-                        zf.writestr(entry, data)
-                        written += 1
-                    except Cancelled:
-                        raise
-                    except Exception as exc:
-                        # A page that fails here is dropped and the CBZ is
-                        # silently short: the entry count was the only trace, and
-                        # a short chapter looks like a short chapter. Count it so
-                        # the summary line can say so.
-                        #
-                        # Two tallies on purpose: this archive's own count feeds
-                        # its `file` line, and the job-level `pages_failed` puts
-                        # the loss in the `done` summary, so the run as a whole
-                        # admits it. NEITHER is counters["failed"], which alone
-                        # sets done.ok and the exit code -- a chapter that lost
-                        # one unreadable page still converted, so the process
-                        # still exits 0. That split is the chosen policy, not an
-                        # oversight. Losing *every* page is a different case,
-                        # and is caught below.
-                        failed_entries += 1
-                        counters.bump("pages_failed")
-                        log(f"{src.name}:{name}: {exc}", "warn")
-                        log(traceback.format_exc(limit=4), "debug")
+                        try:
+                            raw = reader(name)
+                            image, _gray, _model, _info = process_array(
+                                imageio.read_image_bytes(raw, name), name
+                            )
+                            # Re-encoding collapses distinct source names onto
+                            # one output name - a.jpg and a.png both become
+                            # a.png - and a zip stores two entries under the
+                            # identical name without complaint, so readers show
+                            # one page twice or drop one and nothing in the log
+                            # says which. Same de-dup the loose-file bundle path
+                            # already applies. Named here, on the producer
+                            # thread, so the suffix follows page order rather
+                            # than whichever encode happened to finish first.
+                            entry = str(Path(name).with_suffix(ext).as_posix())
+                            while entry.lower() in seen:
+                                entry = f"{entry[: -len(ext)]}_{k}{ext}"
+                            seen.add(entry.lower())
+                            packer.add(entry, image)
+                        except Cancelled:
+                            raise
+                        except Exception as exc:
+                            # A page that fails here is dropped and the CBZ is
+                            # silently short: the entry count was the only
+                            # trace, and a short chapter looks like a short
+                            # chapter. Count it so the summary line can say so.
+                            #
+                            # Two tallies on purpose: this archive's own count
+                            # feeds its `file` line, and the job-level
+                            # `pages_failed` puts the loss in the `done`
+                            # summary, so the run as a whole admits it. NEITHER
+                            # is counters["failed"], which alone sets done.ok
+                            # and the exit code -- a chapter that lost one
+                            # unreadable page still converted, so the process
+                            # still exits 0. That split is the chosen policy,
+                            # not an oversight. Losing *every* page is a
+                            # different case, and is caught below.
+                            failed_entries += 1
+                            counters.bump("pages_failed")
+                            log(f"{src.name}:{name}: {exc}", "warn")
+                            log(traceback.format_exc(limit=4), "debug")
+                finally:
+                    # The zip must not close under an in-flight writestr, and
+                    # the packer's tallies are only readable once every task has
+                    # joined. A cancelled run discards the .part, so its queued
+                    # pages are dropped rather than encoded for nothing.
+                    packer.close(drain=not CTRL.cancelled)
+                    written = packer.written
+                    failed_entries += packer.failed
             if written == 0:
                 # Publishing now would put an EMPTY .cbz where a chapter
                 # belongs - and with overwrite on, over a good one - while the

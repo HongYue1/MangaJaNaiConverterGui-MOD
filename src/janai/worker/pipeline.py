@@ -6,9 +6,9 @@ These rules hold this together and each one paid for itself in a bug:
   queue and ``BundleWriter``'s pack slots all cap how far a fast stage may run
   ahead of a slow one. Decoding a 200-page chapter is far cheaper than upscaling
   it, so an unbounded read-ahead holds every decoded page in memory at once.
-* **Writes stay ordered.** ``BundleWriter`` packs with exactly one worker
-  thread. Page order inside a .cbz is what the reader sees, so this pool must
-  not be widened for throughput.
+* **Writes stay ordered.** ``BundleWriter`` and ``PagePacker`` each pack with
+  exactly one worker thread. Page order inside a .cbz is what the reader sees,
+  so neither pool may be widened for throughput.
 * **Nothing blocks without an abort path.** ``prefetch`` re-checks ``CTRL``
   between items, its pump puts the terminating ``None`` from a ``finally`` so a
   consumer can never wait on a producer that died, and cancelling tears the pool
@@ -345,3 +345,86 @@ class BundleWriter:
 
     def shutdown(self) -> None:
         self.pool.shutdown(wait=True)
+
+
+class PagePacker:
+    """Encodes and packs the pages of ONE already-open archive, off the GPU thread.
+
+    The CBZ *input* path used to encode inline, so the GPU sat idle for the whole
+    encode of every page. Measured on this path: encoding is ~9% of a page for
+    PNG and ~72% for AVIF, because the upscale costs the same whatever the
+    encoder, and an A/B over the same six pages ran 12.95s as loose files
+    against 13.88s inside a .cbz. This is the trade ``BundleWriter`` already
+    makes for the loose-file path. It is a separate class rather than a reuse
+    because ``BundleWriter`` owns the archive it publishes, while this one
+    borrows a zip its caller opened and leaves publishing, the unit tallies and
+    the single ``file`` event to that caller.
+
+    One worker, for ``BundleWriter``'s reason: it makes the queue FIFO, so page
+    order survives by construction rather than by care. That is also what makes
+    the plain ``int`` tallies safe -- only the pack thread writes them, and the
+    caller may only read them once ``close`` has joined every task.
+    """
+
+    def __init__(self, zf: Any, encode_fn, on_fail) -> None:
+        self.zf = zf
+        self.encode = encode_fn
+        self.on_fail = on_fail
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pack")
+        self.slots = threading.Semaphore(PACK_SLOTS)
+        self.written = 0
+        self.failed = 0
+        self.futures: list = []
+
+    def add(self, name: str, image) -> None:
+        """Queue one page, waiting for a slot but never waiting past a cancel.
+
+        The bounded wait of ``WritePool.submit``, for its reason: only an
+        in-flight encode frees a slot, so an unbounded wait would make Cancel
+        arrive a page late. A queued page also pins its decoded image in memory,
+        which is why the bound is small.
+        """
+        while not self.slots.acquire(timeout=SLOT_WAIT_SECONDS):
+            if CTRL.cancelled:
+                raise Cancelled
+
+        def task() -> None:
+            try:
+                self.zf.writestr(name, self.encode(image))
+                self.written += 1
+            except Exception as exc:
+                self.failed += 1
+                self.on_fail(name, exc)
+            finally:
+                self.slots.release()
+
+        try:
+            self.futures.append(self.pool.submit(task))
+        except BaseException:
+            self.slots.release()  # the task never ran, so its finally never will
+            raise
+
+    def drain(self) -> None:
+        for fut in self.futures:
+            try:
+                fut.result()
+            except Exception as exc:
+                log(f"pack failed: {exc}", "error")
+        self.futures.clear()
+
+    def close(self, drain: bool = True) -> None:
+        """Join the pack thread, so the caller may close its zip and read the tallies.
+
+        ``drain=False`` is the cancel path: queued pages are dropped instead of
+        encoded, because the caller discards the .part anyway. The pool is still
+        waited on, because the page already being written has to finish before
+        the zip can close -- ``cancel_futures`` drops the queue, not the task
+        that is running.
+        """
+        try:
+            if drain:
+                self.drain()
+            else:
+                self.futures.clear()
+        finally:
+            self.pool.shutdown(wait=True, cancel_futures=not drain)
