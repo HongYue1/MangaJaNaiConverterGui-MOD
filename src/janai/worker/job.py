@@ -665,8 +665,21 @@ def probe_image(path: Path, threshold: float, colour_percent: float):
             gray, score, coloured = gray_stats(sample[:, :, :3], threshold, colour_percent)
         else:
             gray = True
-    except Exception:
-        pass
+    except Exception as exc:
+        # Stays broad, but must not stay silent. The header already parsed, so
+        # re-raising would report a page the run might well convert as
+        # unreadable. But an unmeasured verdict leaves gray None, which the
+        # caller emits as bool(None) - "colour" - with score 0.0, byte-identical
+        # to a genuine grayscale page: the preview then names the colour model
+        # and nothing says the sample never happened.
+        # Nothing inside the try gates, so no Cancelled can be swallowed here.
+        # Keep it that way if this block grows.
+        detail = " ".join(str(exc).split())
+        log(
+            f"{path.name}: colour sample failed ({type(exc).__name__}: {detail});"
+            " previewing it as colour, which the real run may disagree with",
+            "warn",
+        )
     return w, h, gray, score, coloured
 
 
