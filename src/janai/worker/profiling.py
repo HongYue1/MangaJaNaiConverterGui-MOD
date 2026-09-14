@@ -186,10 +186,7 @@ def _profile_one(ctx, planner, model: Any, name: str, offset: int, total: int) -
                 pass
         result = None
         page = None
-        try:
-            runtime.torch.cuda.empty_cache()
-        except Exception:
-            pass
+        devices.release_cache(device)
         steps.append(entry)
         emit(
             "profile_progress",

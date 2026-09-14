@@ -601,16 +601,15 @@ def run_job(job: dict) -> int:
         writer.close()
         if CTRL.cancelled:
             cancelled = True
-        try:
-            for fn in list(getattr(ctx, "chain_cleanup_fns", ())):
+        # One try per hook: a single failing hook used to abandon every later
+        # one, so a leaked model handle or open file could hide behind the
+        # first error - and the error itself was swallowed as well.
+        for fn in list(getattr(ctx, "chain_cleanup_fns", ())):
+            try:
                 fn()
-        except Exception:
-            pass
-        try:
-            if device != "cpu" and runtime.torch is not None:
-                runtime.torch.cuda.empty_cache()
-        except Exception:
-            pass
+            except Exception as exc:
+                log(f"cleanup hook failed: {type(exc).__name__}: {exc}", "warn")
+        devices.release_cache(device)
 
     emit(
         "done",

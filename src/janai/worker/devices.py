@@ -184,3 +184,27 @@ def make_context(perf: dict):
     if CTRL.cancelled:
         CTRL.cancel()
     return ExecutorNodeContext(progress, settings, storage), device, fp16
+
+
+def release_cache(device: str) -> None:
+    """Hand `device`'s cached blocks back to its driver, and say so on failure.
+
+    Callers used to reach for ``torch.cuda`` whatever the device was, so on an
+    XPU the release raised and was swallowed and the memory stayed cached for
+    the life of the process. Resolving the namespace from the device string
+    keeps that rule in one place, next to the code that chose the device.
+
+    Failures are logged rather than ignored because VRAM that was never handed
+    back reappears later as an out-of-memory error with no apparent cause.
+    """
+    if device == "cpu" or runtime.torch is None:
+        return
+    backend = getattr(runtime.torch, device.split(":", 1)[0], None)
+    empty = getattr(backend, "empty_cache", None)
+    if not callable(empty):
+        log(f"no cache to release on {device}", "debug")
+        return
+    try:
+        empty()
+    except Exception as exc:
+        log(f"could not release the {device} cache: {type(exc).__name__}: {exc}", "warn")
