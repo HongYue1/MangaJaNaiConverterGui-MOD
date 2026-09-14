@@ -232,13 +232,11 @@ disable_error_code = ["attr-defined", "has-type"]
 module = ["janai.app.run_panel"]
 disable_error_code = ["attr-defined", "has-type", "assignment"]
 
-# Cause 1 plus cause 3 - `rules.Rule` used in annotations below a method named
-# `rules`, which shadows the module for annotation lookup (6 findings). Real
-# defect; harmless today only because `from __future__ import annotations`
-# leaves annotations unevaluated, so `typing.get_type_hints()` would raise.
+# Cause 1 only now - cause 3 is FIXED. Both files import `Rule` by name, so the
+# member named `rules` can no longer shadow the module in an annotation.
 [[tool.mypy.overrides]]
 module = ["janai.app.rules_panel", "janai.app.rules_table"]
-disable_error_code = ["attr-defined", "has-type", "name-defined"]
+disable_error_code = ["attr-defined", "has-type"]
 
 # Residue to triage - window.py:125 narrows a base-class `Path` to `Path | None`.
 [[tool.mypy.overrides]]

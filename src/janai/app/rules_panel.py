@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 from janai.app.rules_table import EXCLUSION_HEADERS, RuleDialog, RulesModel, RulesTable
 from janai.app.widgets import Collapsible, button, label, row
 from janai.core import rules
+from janai.core.rules import Rule
 
 
 class RulesPanelMixin:
@@ -95,7 +96,7 @@ class RulesPanelMixin:
         tbox.addWidget(side, 0)
         return holder
 
-    def _build_exclusions_block(self, seeded: list[rules.Rule]) -> QWidget:
+    def _build_exclusions_block(self, seeded: list[Rule]) -> QWidget:
         """Size exclusions, in their own panel, closed until they are wanted.
 
         They answer a different question from the model rules - which pages
@@ -134,7 +135,7 @@ class RulesPanelMixin:
         body.full(self.lbl_excl_hint)
         return panel
 
-    def _build_rules_block(self, seeded: list[rules.Rule]) -> QWidget:
+    def _build_rules_block(self, seeded: list[Rule]) -> QWidget:
         """The model-rules table, its side buttons, and the lines beneath it."""
         block = QWidget()
         box = QVBoxLayout(block)
@@ -190,7 +191,7 @@ class RulesPanelMixin:
     # the rule set
     # ------------------------------------------------------------------ #
     @property
-    def rules(self) -> list[rules.Rule]:
+    def rules(self) -> list[Rule]:
         """Every rule from both tables: exclusions first, then the model rules.
 
         The interface splits them - model rules in the card, size exclusions in
@@ -200,7 +201,7 @@ class RulesPanelMixin:
         """
         return [*self.excl_model.rules, *self.rules_model.rules]
 
-    def set_all_rules(self, items: list[rules.Rule]) -> None:
+    def set_all_rules(self, items: list[Rule]) -> None:
         """Deal one saved list into the two tables, keeping relative order."""
         self.rules_model.set_rules([r for r in items if r.action != rules.PASSTHROUGH])
         self.excl_model.set_rules([r for r in items if r.action == rules.PASSTHROUGH])
@@ -355,7 +356,7 @@ class RulesPanelMixin:
 
     def rule_add(self, which: str = "rules") -> None:
         exclusion = which == "excl"
-        draft = rules.Rule(
+        draft = Rule(
             kind=rules.ANY if exclusion else rules.GRAYSCALE,
             scale=0.0 if exclusion else float(self.sp_scale.value()),
             # A new exclusion opens on the case it exists for: pages far taller
@@ -371,7 +372,7 @@ class RulesPanelMixin:
             return
         self._insert_rule(which, made)
 
-    def _insert_rule(self, which: str, made: rules.Rule) -> None:
+    def _insert_rule(self, which: str, made: Rule) -> None:
         """File an edited rule in whichever table its action belongs to."""
         target = "excl" if made.action == rules.PASSTHROUGH else "rules"
         model, _view = self._table(target)

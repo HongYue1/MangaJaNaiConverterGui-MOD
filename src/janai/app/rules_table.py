@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from janai.app.theme import Palette
 from janai.app.widgets import FieldGrid, checkbox, combo, label, line_edit
 from janai.core import rules
+from janai.core.rules import Rule
 
 #: Column order. The first one is the on/off checkbox and has no heading.
 HEADERS: tuple[str, ...] = ("", "When", "Page size", "Model", "Auto levels")
@@ -97,7 +98,7 @@ class RulesModel(QAbstractTableModel):
     def __init__(
         self,
         palette: Palette,
-        items: Sequence[rules.Rule] = (),
+        items: Sequence[Rule] = (),
         gray_on: bool = True,
         installed: Sequence[str] = (),
         parent: QObject | None = None,
@@ -105,17 +106,17 @@ class RulesModel(QAbstractTableModel):
     ) -> None:
         super().__init__(parent)
         self._palette = palette
-        self._rules: list[rules.Rule] = list(items)
+        self._rules: list[Rule] = list(items)
         self._gray_on = bool(gray_on)
         self._installed: list[str] = list(installed)
         self._headers: tuple[str, ...] = tuple(headers)
 
     # ---- python side -------------------------------------------------- #
     @property
-    def rules(self) -> list[rules.Rule]:
+    def rules(self) -> list[Rule]:
         return self._rules
 
-    def set_rules(self, items: Sequence[rules.Rule]) -> None:
+    def set_rules(self, items: Sequence[Rule]) -> None:
         self.beginResetModel()
         self._rules = list(items)
         self.endResetModel()
@@ -140,12 +141,12 @@ class RulesModel(QAbstractTableModel):
         bottom = self.index(len(self._rules) - 1, len(self._headers) - 1)
         self.dataChanged.emit(top, bottom)
 
-    def rule_at(self, row: int) -> rules.Rule | None:
+    def rule_at(self, row: int) -> Rule | None:
         if 0 <= row < len(self._rules):
             return self._rules[row]
         return None
 
-    def idle(self, rule: rules.Rule) -> bool:
+    def idle(self, rule: Rule) -> bool:
         """True when the rule can never fire as things stand."""
         return rule.kind == rules.GRAYSCALE and not self._gray_on
 
@@ -219,7 +220,7 @@ class RulesModel(QAbstractTableModel):
 
         return None
 
-    def _tooltip(self, rule: rules.Rule) -> str:
+    def _tooltip(self, rule: Rule) -> str:
         lines = [rule.describe()]
         if not rule.enabled:
             lines.append("This rule is off and is skipped.")
@@ -349,7 +350,7 @@ class RuleDialog(QDialog):
         self,
         parent: QWidget | None,
         title: str,
-        draft: rules.Rule,
+        draft: Rule,
         models: Sequence[str],
     ) -> None:
         super().__init__(parent)
@@ -480,10 +481,10 @@ class RuleDialog(QDialog):
         box.addWidget(buttons)
         self.setMinimumWidth(560)
 
-    def rule(self) -> rules.Rule:
+    def rule(self) -> Rule:
         """The edited rule, normalised by :meth:`Rule.from_dict`."""
         levels = dict(LEVELS)
-        return rules.Rule.from_dict(
+        return Rule.from_dict(
             {
                 "kind": self.cb_kind.currentText(),
                 "scale": parse_scale(self.cb_scale.currentText()),
@@ -501,9 +502,9 @@ class RuleDialog(QDialog):
     def edit(
         parent: QWidget | None,
         title: str,
-        draft: rules.Rule,
+        draft: Rule,
         models: Sequence[str],
-    ) -> rules.Rule | None:
+    ) -> Rule | None:
         """Show the editor; return the new rule, or None if it was cancelled."""
         dialog = RuleDialog(parent, title, draft, models)
         if dialog.exec() == QDialog.DialogCode.Accepted:
