@@ -180,12 +180,14 @@ strict_equality = true
 # the whole app rests on live here, these files are clean today, so they are
 # gated harder to keep them that way.
 #
-# disallow_any_generics, disallow_untyped_defs / disallow_incomplete_defs and
-# warn_return_any are deliberately NOT on yet: measured 2026-09-14, those four
-# account for every one of the 57 findings a full --strict run reports here
-# (44 type-arg, 11 no-untyped-def, 2 no-any-return). They are switched on by
-# the Phase 3 typing sweep, not before, so this tier stays green and therefore
-# meaningful.
+# disallow_any_generics, disallow_untyped_defs, disallow_incomplete_defs and
+# warn_return_any are ON as of the Phase 3 typing sweep: `4140997` typed the
+# pipeline primitives, `01cc7b4` the other seven files. They were deferred
+# while they still reported 57 findings here (44 type-arg, 11 no-untyped-def,
+# 2 no-any-return); that residue is now measured at zero, so keeping them on
+# costs nothing and they are the only thing stopping a bare `dict`, an
+# unannotated def or a leaked `Any` from re-entering a contract module.
+# Do not switch one off to make an edit pass - annotate the edit.
 # --------------------------------------------------------------------------- #
 [[tool.mypy.overrides]]
 module = [
@@ -202,6 +204,10 @@ disallow_subclassing_any = true
 no_implicit_reexport = true
 warn_unused_ignores = true
 extra_checks = true
+disallow_any_generics = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_return_any = true
 
 # --------------------------------------------------------------------------- #
 # Tier 2 - four catalogued causes, measured 2026-09-14: 329 findings in 19 of
