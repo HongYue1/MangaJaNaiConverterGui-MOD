@@ -415,8 +415,12 @@ yourself; nothing else will.
   modules import `sanic.log`.** It is not a web server here.
 - **ruff excludes `backend/`, `logs/` and `.tmp/`** (`pyproject.toml`); vendored
   code is not held to this project's style. Line length is **100**.
-- **Stale artefact:** `src/janai/app/__pycache__/dnd.cpython-313.pyc` has no
-  corresponding `dnd.py`. Ignore it; it is a leftover.
+- **Orphan bytecode is rot, not cache.** A `__pycache__/*.pyc` whose `.py` is
+  gone cannot be imported — a sourceless import must sit in the source location,
+  not in `__pycache__` — but it keeps `grep` reporting modules that no longer
+  exist. Two survived the Tk→Qt rewrite and the `window.py` split, and this
+  document used to name one of the two. `smoke.py` now fails on any of them:
+  delete the file, not the check.
 
 ## Working protocol for agents
 

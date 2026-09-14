@@ -226,6 +226,31 @@ def extension_sets() -> None:
     assert not globs, f"input_panel.py hard-codes page suffixes again: {globs}"
 
 
+def orphan_bytecode() -> None:
+    """A `__pycache__` entry whose source is gone is rot, not a cache.
+
+    Deleting `app/dnd.py` (the Tk drag-and-drop shim Qt's `DropZone` replaced)
+    and the pre-split `app/ui.py` left 165 KB of bytecode behind, and AGENTS.md
+    ended up documenting one of the two as a known leftover - a document wrong
+    about its own tree (F34). Python cannot import these, because a sourceless
+    import has to sit in the source location rather than in `__pycache__`, so
+    the cost is not behaviour: it is that `grep` keeps reporting modules which
+    no longer exist, and a reader trusts it.
+
+    CI checks out a clean tree and finds nothing here. That is the point - this
+    guards working copies, which is where the rot actually accumulates.
+    """
+    orphans: list[str] = []
+    for root in (ROOT / "src", ROOT / "scripts"):
+        for cache in sorted(root.rglob("__pycache__")):
+            for pyc in sorted(cache.glob("*.pyc")):
+                # foo.cpython-313.pyc belongs to foo.py one directory up.
+                stem = pyc.name.split(".", 1)[0]
+                if not (cache.parent / f"{stem}.py").exists():
+                    orphans.append(pyc.relative_to(ROOT).as_posix())
+    assert not orphans, f"bytecode whose source is gone (delete the files): {orphans}"
+
+
 def page_entries() -> None:
     """An archive entry is a page only if it is really an image.
 
@@ -391,6 +416,7 @@ def main() -> int:
     check("path resolution", path_resolution)
     check("output naming", output_naming)
     check("extension sets", extension_sets)
+    check("orphan bytecode", orphan_bytecode)
     check("page entries", page_entries)
     check("entry name decoding", entry_name_decoding)
     check("rule engine", rule_engine)
