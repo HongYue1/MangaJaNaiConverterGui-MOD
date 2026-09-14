@@ -213,34 +213,16 @@ extra_checks = true
 # merges overlapping override sections, and the result is not worth predicting.
 # --------------------------------------------------------------------------- #
 
-# Cause 1 - the Qt mixin split from Phase 1 (229 findings). Every panel is a
-# mixin that legitimately reads attributes owned by the composed Window, which
-# mypy cannot see until a Protocol declares that surface. Deleted by the commit
-# that adds it.
-[[tool.mypy.overrides]]
-module = [
-  "janai.app.perf_panel",
-  "janai.app.output_panel",
-  "janai.app.input_panel",
-  "janai.app.log_panel",
-]
-disable_error_code = ["attr-defined", "has-type"]
+# Cause 1 is FIXED. `janai.app.surface` declares what the composed MainWindow
+# provides to its panels, and every mixin inherits that Protocol for the type
+# checker only, so the 229 findings this one deliberate design produced are gone
+# and the panel bodies are genuinely checked instead of silently Any. Cause 3
+# being fixed as well, rules_panel and rules_table need no override at all.
 
-# Same cause, plus one genuine residue to triage: run_panel.py:403 assigns a
-# bool where a dict[str, Any] is declared.
+# Residue to triage: run_panel.py:403 assigns a bool where a dict[str, Any] is
+# declared, and window.py:125 narrows a base-class `Path` to `Path | None`.
 [[tool.mypy.overrides]]
-module = ["janai.app.run_panel"]
-disable_error_code = ["attr-defined", "has-type", "assignment"]
-
-# Cause 1 only now - cause 3 is FIXED. Both files import `Rule` by name, so the
-# member named `rules` can no longer shadow the module in an annotation.
-[[tool.mypy.overrides]]
-module = ["janai.app.rules_panel", "janai.app.rules_table"]
-disable_error_code = ["attr-defined", "has-type"]
-
-# Residue to triage - window.py:125 narrows a base-class `Path` to `Path | None`.
-[[tool.mypy.overrides]]
-module = ["janai.app.window"]
+module = ["janai.app.run_panel", "janai.app.window"]
 disable_error_code = ["assignment"]
 
 # Cause 2 is FIXED. runtime.py's lazy handles now declare the type they hold

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QVBoxLayout, QWidget
@@ -23,12 +24,20 @@ from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QVBoxLayout, QWidget
 from janai.app.runner import open_in_explorer
 from janai.app.widgets import LogView, button, checkbox, label
 
+if TYPE_CHECKING:
+    from janai.app.surface import WindowSurface as _Base
+else:  # type-only: at runtime the base is object, so the MRO is untouched
+    _Base = object
+
 #: Levels the panel can colour; anything else is rendered as "info".
 LOG_TAGS = ("info", "debug", "warn", "error", "ok", "skip", "dry")
 
 
-class LogPanelMixin:
+class LogPanelMixin(_Base):
     """Run-log panel: the widgets, the log sink, and the copy/save actions."""
+
+    # Window state this panel mutates; see input_panel for why it is re-declared.
+    _log_visible: bool
 
     def _log_dir(self) -> Path:
         # Called from MainWindow.__init__ to place RunLog, i.e. before any of

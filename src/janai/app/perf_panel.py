@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from janai.app.fields import TILE_CHOICES, tile_label
 from janai.app.runlog import fmt_bytes, fmt_secs
@@ -41,13 +41,29 @@ from janai.app.widgets import (
 from janai.core import hardware, rules
 from janai.core.formats import FORMAT_IDS, FORMATS
 
+if TYPE_CHECKING:
+    from janai.app.surface import WindowSurface as _Base
+else:  # type-only: at runtime the base is object, so the MRO is untouched
+    _Base = object
+
 #: An empty device string means "let the worker pick the best one".
 AUTO_DEVICE = "Auto (best available)"
 DEVICE_RE = re.compile(r"^(cpu|cuda|xpu|mps|dml|privateuseone)(:\d+)?$")
 
 
-class PerfPanelMixin:
+class PerfPanelMixin(_Base):
     """The Performance card, the device picker, the probe and the profile."""
+
+    # Window state this panel mutates; see input_panel for why it is re-declared.
+    probe: dict
+    caps: dict
+    models: list
+    devices: list
+    profile: dict
+    started_at: float
+    _profiling: bool
+    _profile_offered: bool
+    _saved_device: str
 
     # ------------------------------------------------------------------ #
     # construction

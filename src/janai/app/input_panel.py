@@ -19,10 +19,16 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import QFileDialog
 
 from janai.app.widgets import Card, DropZone, button, checkbox, row
+
+if TYPE_CHECKING:
+    from janai.app.surface import WindowSurface as _Base
+else:  # type-only: at runtime the base is object, so the MRO is untouched
+    _Base = object
 
 #: What the pre-run scan counts as a page. The worker decides for real.
 IMAGE_EXTS = {
@@ -50,8 +56,15 @@ FILE_FILTER = (
 )
 
 
-class InputPanelMixin:
+class InputPanelMixin(_Base):
     """The Input card plus the pickers, drop handling and the async scan."""
+
+    # Window state this panel mutates. Re-declared even though the surface
+    # already declares it: a mixin that assigns an attribute gets its own
+    # inferred slot for it, and without a type here every read placed above the
+    # assignment is untypable.
+    _in_path: str
+    scan_text: str
 
     def _build_input(self) -> None:
         card = Card("Input", "A folder, an archive, or single images. Drop them here.")

@@ -10,6 +10,7 @@ both.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
@@ -18,8 +19,13 @@ from janai.app.widgets import Collapsible, button, label, row
 from janai.core import rules
 from janai.core.rules import Rule
 
+if TYPE_CHECKING:
+    from janai.app.surface import WindowSurface as _Base
+else:  # type-only: at runtime the base is object, so the MRO is untouched
+    _Base = object
 
-class RulesPanelMixin:
+
+class RulesPanelMixin(_Base):
     """The two rule tables and every edit made to them.
 
     Mixed into :class:`janai.app.window.MainWindow`, so ``self`` is the window.
@@ -27,6 +33,9 @@ class RulesPanelMixin:
     upscale card, and ``_confirm`` stays on the window because the full reset
     shares it.
     """
+
+    # Window state this panel mutates; see input_panel for why it is re-declared.
+    _rules_seeded: bool
 
     # ------------------------------------------------------------------ #
     # construction

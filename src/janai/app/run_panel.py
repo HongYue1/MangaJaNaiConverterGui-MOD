@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import QHBoxLayout, QProgressBar, QVBoxLayout, QWidget
 
@@ -34,9 +35,29 @@ from janai.app.widgets import button, label
 from janai.core import displays
 from janai.core.formats import CONTAINERS, FORMATS
 
+if TYPE_CHECKING:
+    from janai.app.surface import WindowSurface as _Base
+else:  # type-only: at runtime the base is object, so the MRO is untouched
+    _Base = object
 
-class RunPanelMixin:
+
+class RunPanelMixin(_Base):
     """The run lifecycle: the footer, the worker's events, and the run log."""
+
+    # Window state this panel mutates; see input_panel for why it is re-declared.
+    # These counters are what render_status reports, and it is their only reader
+    # that writes the status label.
+    total: int
+    completed: int
+    failed: int
+    skipped: int
+    started_index: int
+    started_at: float
+    progress_sub: str
+    scan_text: str
+    dry: bool
+    last_out_dir: Path | None
+    _profiling: bool
 
     # ------------------------------------------------------------------ #
     # construction

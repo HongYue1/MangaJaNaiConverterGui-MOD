@@ -19,7 +19,7 @@ Mixed into :class:`janai.app.window.MainWindow`, so ``self`` is the window.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QFileDialog, QWidget
@@ -40,8 +40,13 @@ from janai.app.widgets import (
 )
 from janai.core.formats import CONTAINER_IDS, CONTAINERS, FORMAT_IDS, FORMATS, Opt, is_active
 
+if TYPE_CHECKING:
+    from janai.app.surface import WindowSurface as _Base
+else:  # type-only: at runtime the base is object, so the MRO is untouched
+    _Base = object
 
-class OutputPanelMixin:
+
+class OutputPanelMixin(_Base):
     """The Output card, its dynamic encoder grid, and the destination logic."""
 
     def _build_output(self) -> None:
