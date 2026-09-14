@@ -75,9 +75,11 @@ jobs:
       # archive_check.py, dryprobe_check.py and outname_check.py are
       # deliberately absent: they spawn a real worker, so they need the
       # upscaling stack and a GPU. So is close_check.py, which measures process
-      # teardown timing. Those stay local gates; do not "complete the set"
-      # here. The output-name reservation outname_check.py proves end to end is
-      # covered in CI by smoke.py's "output naming" check.
+      # teardown timing, and archname_check.py, which decodes nothing but
+      # imports janai.worker.job and therefore the imaging stack. Those stay
+      # local gates; do not "complete the set" here. What outname_check.py and
+      # archname_check.py prove end to end is covered in CI by smoke.py's
+      # "output naming" and "page entries" checks.
       - name: Gate the pipeline primitives, the control reader and the done payload
         shell: bash
         run: |

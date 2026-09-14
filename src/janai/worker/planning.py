@@ -49,6 +49,13 @@ so a chapter's cover.txt or ComicInfo.xml is never fed to the model."""
 ARCHIVE_EXTS = {".zip", ".cbz", ".rar", ".cbr"}
 """Extensions treated as a container of pages rather than a page."""
 
+MACOS_METADATA_DIR = "__MACOSX"
+"""Folder macOS adds when it writes a zip; everything under it is metadata."""
+
+APPLE_DOUBLE_PREFIX = "._"
+"""Prefix of an AppleDouble sidecar. It carries the page's own extension but
+holds a resource fork, so an extension test alone cannot tell them apart."""
+
 RESERVED_CHARS = re.compile(r'[<>:"/\\|?*]')
 """Characters Windows rejects in a file name; replaced with an underscore."""
 
@@ -62,6 +69,31 @@ looping forever on a pathological directory."""
 
 def natural_key(name: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def is_page_entry(name: str) -> bool:
+    """Whether an archive entry is a page rather than something alongside one.
+
+    An extension test alone is not enough: a zip written on macOS carries an
+    AppleDouble sidecar per file, with the page's own extension, so the
+    decoder is handed resource forks. A healthy chapter then reports failed
+    pages, and the per-chapter progress total counts entries that were never
+    images.
+
+    Only the exact AppleDouble shapes are rejected - a name that merely
+    contains "._", or a folder that merely starts with "__MACOSX", is a real
+    page and must survive.
+    """
+    if name.endswith("/"):
+        return False
+    # Zip stores posix separators; some writers emit backslashes anyway.
+    parts = name.replace("\\", "/").split("/")
+    if MACOS_METADATA_DIR in parts:
+        return False
+    base = parts[-1]
+    if base.startswith(APPLE_DOUBLE_PREFIX):
+        return False
+    return Path(base).suffix.lower() in IMAGE_EXTS
 
 
 def gather_units(inp: dict) -> list[dict]:

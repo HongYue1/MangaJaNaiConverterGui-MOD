@@ -159,6 +159,34 @@ def output_naming() -> None:
         assert one == two, f"{pattern} no longer collides, so the reservation proves nothing"
 
 
+def page_entries() -> None:
+    """An archive entry is a page only if it is really an image.
+
+    A zip written on macOS carries an AppleDouble sidecar per file, with the
+    page's own extension. Treating those as pages makes a healthy chapter
+    report failed pages and inflates its progress total. The live proof is
+    ``scripts/archname_check.py``, which needs the imaging stack; these are the
+    same guarantees at the function level.
+    """
+    for name in ("page-001.jpg", "sub/page-002.png", ".hidden/cover.png"):
+        assert planning.is_page_entry(name), f"{name} should count as a page"
+
+    for name in (
+        "__MACOSX/._page-001.jpg",
+        "__MACOSX/sub/._page-002.jpg",
+        "sub/._page-002.jpg",
+        "._cover.png",
+        "ComicInfo.xml",
+        "pages/",
+    ):
+        assert not planning.is_page_entry(name), f"{name} should not count as a page"
+
+    # Over-filtering would silently drop real pages, which is worse than the
+    # junk it is meant to remove.
+    for name in ("page._final.jpg", "__MACOSX_fanbook/page-001.jpg"):
+        assert planning.is_page_entry(name), f"{name} was over-filtered"
+
+
 def rule_engine() -> None:
     installed = INSTALLED
     working = rules.default_working_set(installed)
@@ -265,6 +293,7 @@ def main() -> int:
     check("log formatting", log_formatting)
     check("path resolution", path_resolution)
     check("output naming", output_naming)
+    check("page entries", page_entries)
     check("rule engine", rule_engine)
     check("presets", preset_round_trip)
     if FAILED:

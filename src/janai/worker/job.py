@@ -23,10 +23,10 @@ from janai.worker.events import emit, log
 from janai.worker.models import ModelCache, choose_model, list_models, upscale_array
 from janai.worker.pipeline import BundleWriter, Counters, WritePool, prefetch
 from janai.worker.planning import (
-    IMAGE_EXTS,
     build_tasks,
     format_name,
     gather_units,
+    is_page_entry,
     natural_key,
     path_key,
     resolve_out,
@@ -876,28 +876,14 @@ def open_archive(path: Path):
     ext = path.suffix.lower()
     if ext in (".zip", ".cbz"):
         zf = ZipFile(path)
-        names = sorted(
-            (
-                n
-                for n in zf.namelist()
-                if not n.endswith("/") and Path(n).suffix.lower() in IMAGE_EXTS
-            ),
-            key=natural_key,
-        )
+        names = sorted((n for n in zf.namelist() if is_page_entry(n)), key=natural_key)
         return names, zf.read
     if ext in (".rar", ".cbr"):
         try:
             import rarfile
 
             rf = rarfile.RarFile(str(path))
-            names = sorted(
-                (
-                    n
-                    for n in rf.namelist()
-                    if not n.endswith("/") and Path(n).suffix.lower() in IMAGE_EXTS
-                ),
-                key=natural_key,
-            )
+            names = sorted((n for n in rf.namelist() if is_page_entry(n)), key=natural_key)
             return names, rf.read
         except Exception as exc:
             log(f"cannot open {path.name}: {exc} (RAR needs unrar/7z on PATH)", "warn")
