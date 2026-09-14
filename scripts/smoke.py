@@ -407,6 +407,54 @@ def preset_round_trip() -> None:
             raise AssertionError("a junk file was accepted as a preset")
 
 
+def _assert_free_vram_clamp(text: str) -> None:
+    """Every accelerator branch of the estimator must clamp its budget to free VRAM.
+
+    Split out from the file read so a negative control can hand this the
+    pre-fix bytes straight from git and prove the guard still bites.
+    """
+    # Comments name mem_get_info() too - including the one explaining this very
+    # clamp - so count call sites in code only, never in prose. An earlier
+    # version counted raw string occurrences and miscounted its own comment.
+    sites: list[int] = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if "mem_get_info(" in line.split("#", 1)[0]:
+            sites.append(number)
+    assert sites, "no mem_get_info() call site found; has the estimator moved?"
+    assert "_free, total = mem_info" not in text, (
+        "a mem_get_info() branch discards `free` and budgets from the card total"
+    )
+    clamped = text.count("total = min(total, free)")
+    assert clamped == len(sites), (
+        f"mem_get_info() is called at lines {sites} but only {clamped} branch(es) "
+        "clamp the budget to free VRAM"
+    )
+
+
+def vram_budget_clamp() -> None:
+    """The vendored tile estimator must budget from FREE VRAM, not card size.
+
+    ``mem_get_info()`` returns ``(free, total)``. Discarding ``free`` budgets a
+    share of the whole device even when most of it is already held, and this
+    estimator is only reached when no proven tile exists - precisely when VRAM
+    is scarce. Measured on a 6 GB card: at >=75% held, budgeting from total
+    chose tile 512 where only 256 fits. Counting the call sites means a new
+    accelerator branch cannot be added without the clamp.
+    """
+    src = (
+        ROOT
+        / "backend"
+        / "src"
+        / "packages"
+        / "chaiNNer_pytorch"
+        / "pytorch"
+        / "processing"
+        / "upscale_image.py"
+    )
+    assert src.is_file(), f"the vendored tile estimator is missing: {src}"
+    _assert_free_vram_clamp(src.read_text(encoding="utf-8"))
+
+
 def main() -> int:
     print(f"smoke test in {ROOT}")
     check("output formats", output_formats)
@@ -417,6 +465,7 @@ def main() -> int:
     check("output naming", output_naming)
     check("extension sets", extension_sets)
     check("orphan bytecode", orphan_bytecode)
+    check("vram budget clamp", vram_budget_clamp)
     check("page entries", page_entries)
     check("entry name decoding", entry_name_decoding)
     check("rule engine", rule_engine)

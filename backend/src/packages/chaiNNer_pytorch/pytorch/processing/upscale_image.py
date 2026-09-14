@@ -72,7 +72,15 @@ def upscale(
                     model_bytes = model_bytes // 2
                 try:
                     mem_info: tuple[int, int] = torch.cuda.mem_get_info(device)  # type: ignore
-                    _free, total = mem_info
+                    free, total = mem_info
+                    # Budget from what is actually available, not from the
+                    # card's capacity. mem_get_info() returns (free, total);
+                    # discarding free sized tiles against the whole device even
+                    # when most of it was already held, and this estimator only
+                    # runs when no proven tile exists - exactly when VRAM is
+                    # scarce. Measured on a 6GB card: at >=75% held it chose
+                    # tile 512 where only 256 fits.
+                    total = min(total, free)
                     # only use 75% of the total memory
                     total = int(total * 0.75)
                     if options.budget_limit > 0:
@@ -97,7 +105,12 @@ def upscale(
                 try:
                     if hasattr(torch.xpu, 'mem_get_info'):
                         mem_info = torch.xpu.mem_get_info(device)
-                        _free, total = mem_info
+                        free, total = mem_info
+                        # Same clamp, same reason as the CUDA branch above.
+                        # There is no XPU device here to measure on, but min()
+                        # can only lower the budget, never raise it, so fixing
+                        # the twin defect is strictly safer than leaving it.
+                        total = min(total, free)
                         total = int(total * 0.75)
                         if options.budget_limit > 0:
                             total = min(options.budget_limit * 1024**3, total)
