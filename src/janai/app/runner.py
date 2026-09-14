@@ -334,6 +334,42 @@ class Runner:
             except Exception:
                 pass
 
+    # Shutdown has to finish synchronously. Closing the last window ends the Qt
+    # event loop, so a kill deferred with QTimer (which is what closeEvent used
+    # to do) never runs: measured offscreen, the timer never fired and the
+    # worker outlived the GUI still holding the GPU.
+    SHUTDOWN_GRACE_SECONDS = 3.0  # cancel is honoured per page, so allow one
+    KILL_REAP_SECONDS = 2.0  # after kill() only OS teardown is left
+
+    def shutdown(self, grace: float = SHUTDOWN_GRACE_SECONDS) -> None:
+        """Stop the worker before this process exits, cooperatively if it can be.
+
+        Sends ``cancel`` and waits, so a worker that reaches a gate exits having
+        closed its bundle and cleaned up its temp files. Kills it once the grace
+        expires, because a worker inside an uninterruptible libvips write or
+        torch forward would otherwise be orphaned with VRAM still allocated and
+        no UI left to stop it.
+        """
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return
+        self.cancel()
+        if self._reap(proc, grace):
+            return
+        self.kill()
+        self._reap(proc, self.KILL_REAP_SECONDS)
+
+    @staticmethod
+    def _reap(proc: subprocess.Popen, timeout: float) -> bool:
+        """True once the process is gone. Safe to race ``_read_stdout``'s wait()."""
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return False
+        except Exception:
+            return proc.poll() is not None
+        return True
+
     # ------------------------------------------------------------------ #
     def drain(self, handler: Callable[[dict], None], limit: int = 200) -> None:
         """Dispatch pending events; call from the Tk event loop."""

@@ -807,7 +807,5 @@ class MainWindow(
         self._timer.stop()
         self.end_run_log()
         self.runner.hold_stop()
-        if self.runner.running:
-            self.runner.cancel()
-            QTimer.singleShot(400, self.runner.kill)
+        self.runner.shutdown()  # synchronous: accepting the close ends the event loop
         event.accept()
