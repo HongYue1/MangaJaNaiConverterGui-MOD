@@ -367,6 +367,10 @@ def run_job(job: dict) -> int:
                 out=str(dest),
                 error=f"{type(exc).__name__}: {exc}",
             )
+            # The event carries only "OSError: ...", and encode/write failures
+            # land in library frames, so the message alone rarely says where.
+            # Same limit as the read/upscale path so both read alike.
+            log(traceback.format_exc(limit=4), "debug")
 
     def on_bundle_page(meta: dict, name: str, size: int) -> None:
         counters["processed"] += 1
@@ -428,6 +432,7 @@ def run_job(job: dict) -> int:
         names, reader = opener
         tmp = dest.with_suffix(".cbz.part")
         written = 0
+        failed_entries = 0
         try:
             with ZipFile(tmp, "w", ZIP_STORED) as zf:
                 for k, name in enumerate(names, 1):
@@ -446,7 +451,18 @@ def run_job(job: dict) -> int:
                     except Cancelled:
                         raise
                     except Exception as exc:
+                        # A page that fails here is dropped and the CBZ is
+                        # silently short: the entry count was the only trace, and
+                        # a short chapter looks like a short chapter. Count it so
+                        # the summary line can say so.
+                        #
+                        # Deliberately NOT counters["failed"]: that would flip
+                        # done.ok and the process exit code for a chapter with one
+                        # unreadable page, which is a policy change rather than a
+                        # reporting fix.
+                        failed_entries += 1
                         log(f"{src.name}:{name}: {exc}", "warn")
+                        log(traceback.format_exc(limit=4), "debug")
             tmp.replace(dest)
             counters["processed"] += 1
             emit(
@@ -458,6 +474,7 @@ def run_job(job: dict) -> int:
                 ms=int((time.perf_counter() - started) * 1000),
                 bytes=dest.stat().st_size,
                 entries=written,
+                failed=failed_entries,
             )
         except Cancelled:
             tmp.unlink(missing_ok=True)

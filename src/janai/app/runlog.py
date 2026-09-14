@@ -103,6 +103,11 @@ def _fields(ev: dict) -> list[str]:
     entries = ev.get("entries")
     if entries:
         out.append(f"{int(entries)} pages")
+    if ev.get("failed"):
+        # An archive whose pages partly failed rendered as a clean "N pages"
+        # line, so a short chapter just looked like a short chapter. Same
+        # wording as format_bundle, so both archive paths read alike.
+        out.append(f"{int(ev['failed'])} failed")
     return out
 
 
