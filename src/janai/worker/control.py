@@ -24,6 +24,8 @@ import sys
 import threading
 import time
 
+from janai.worker.events import log
+
 PAUSE_POLL_SECONDS = 0.05
 """How often a paused stage re-checks the flags. Short enough that resume and
 cancel feel instant, long enough not to spin a core while paused."""
@@ -41,6 +43,18 @@ class Control:
         threading.Thread(target=self._pump, name="stdin", daemon=True).start()
 
     def _pump(self) -> None:
+        """Read control words until the interface closes the pipe.
+
+        A dead reader is reported rather than swallowed: losing this thread
+        means Cancel and Pause quietly stop working for the rest of the job,
+        with nothing in the run log to say why. Retrying is not an option --
+        a text stream that raised mid-line reports EOF on every later read --
+        so the only useful response is to say the abort path is gone.
+
+        The decode error that could reach here is already prevented upstream:
+        ``worker.main()`` reconfigures stdin with ``errors="replace"`` before
+        the job starts. This handler is what happens if that ever fails.
+        """
         try:
             for raw in sys.stdin:
                 cmd = raw.strip().lower()
@@ -52,8 +66,12 @@ class Control:
                     self.pause()
                 elif cmd == "resume":
                     self.resume()
-        except Exception:
-            pass
+        except Exception as exc:
+            log(
+                "control reader stopped; cancel and pause are no longer available "
+                f"({type(exc).__name__}: {exc})",
+                "error",
+            )
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -71,11 +89,15 @@ class Control:
 
     def _call(self, name: str) -> None:
         fn = getattr(self.progress, name, None)
-        if callable(fn):
-            try:
-                fn()
-            except Exception:
-                pass
+        if not callable(fn):
+            return
+        try:
+            fn()
+        except Exception as exc:
+            # The local flags are already set, so the job still aborts at its
+            # own gates; this only means the backend token never heard about
+            # it, which is worth seeing when an abort looks slow.
+            log(f"progress token {name}() failed: {type(exc).__name__}: {exc}", "warn")
 
     @property
     def cancelled(self) -> bool:
