@@ -15,6 +15,9 @@ Three rules hold this together and each one paid for itself in a bug:
   down without waiting for queued reads. A consumer that leaves early also
   drains the queue on its way out: the pump can be parked inside ``put``, where
   setting ``stop`` cannot reach it.
+* **Shared tallies are locked.** ``Counters`` guards the job's page totals,
+  because the write pool, the pack thread and the main loop all bump them and
+  ``d[key] += 1`` is a load, an add and a store rather than one step.
 
 The drain paths log and continue instead of raising: one failed page must not
 abandon the other 199.
@@ -39,6 +42,39 @@ disk, few enough that finished pages cannot pile up in memory."""
 
 PACK_SLOTS = 4
 """Pages allowed to queue for the single packing thread, for the same reason."""
+
+
+class Counters:
+    """The job's page tallies, written by several threads at once.
+
+    ``processed`` and ``failed`` are bumped by the write pool, by
+    ``BundleWriter``'s pack thread and by the main loop. ``d[key] += 1`` is a
+    load, an add and a store, so two threads can read the same value and store
+    the same result, silently dropping a page from the total. These numbers are
+    the run summary the user reads, and ``failed == 0`` decides the process exit
+    code, so they are worth a lock: it costs well under a microsecond per page
+    against milliseconds of encoding.
+    """
+
+    __slots__ = ("_counts", "_lock")
+
+    def __init__(self) -> None:
+        self._counts: dict[str, int] = {"processed": 0, "failed": 0, "skipped": 0}
+        self._lock = threading.Lock()
+
+    def bump(self, key: str, n: int = 1) -> None:
+        """Add ``n`` to ``key`` as one atomic step."""
+        with self._lock:
+            self._counts[key] = self._counts.get(key, 0) + n
+
+    def __getitem__(self, key: str) -> int:
+        with self._lock:
+            return self._counts[key]
+
+    def snapshot(self) -> dict[str, int]:
+        """A consistent copy, for building the ``done`` payload."""
+        with self._lock:
+            return dict(self._counts)
 
 
 class WritePool:

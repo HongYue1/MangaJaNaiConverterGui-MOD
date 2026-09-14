@@ -21,7 +21,7 @@ from janai.worker.control import CTRL, Cancelled
 from janai.worker.environment import MODELS_DIR
 from janai.worker.events import emit, log
 from janai.worker.models import ModelCache, choose_model, list_models, upscale_array
-from janai.worker.pipeline import BundleWriter, WritePool, prefetch
+from janai.worker.pipeline import BundleWriter, Counters, WritePool, prefetch
 from janai.worker.planning import (
     IMAGE_EXTS,
     build_tasks,
@@ -268,7 +268,7 @@ def run_job(job: dict) -> int:
         log(f"no models found in {models_dir}; images will only be resized", "warn")
 
     writer = WritePool(io_workers)
-    counters = {"processed": 0, "failed": 0, "skipped": 0}
+    counters = Counters()
     clock = time.perf_counter()
 
     def process_array(image, src_name: str):
@@ -344,7 +344,7 @@ def run_job(job: dict) -> int:
             data = encode_now(image)
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
-            counters["processed"] += 1
+            counters.bump("processed")
             emit(
                 "file",
                 i=index,
@@ -358,7 +358,7 @@ def run_job(job: dict) -> int:
                 **info,
             )
         except Exception as exc:
-            counters["failed"] += 1
+            counters.bump("failed")
             emit(
                 "file",
                 i=index,
@@ -373,7 +373,7 @@ def run_job(job: dict) -> int:
             log(traceback.format_exc(limit=4), "debug")
 
     def on_bundle_page(meta: dict, name: str, size: int) -> None:
-        counters["processed"] += 1
+        counters.bump("processed")
         emit(
             "file",
             i=meta.get("i"),
@@ -389,7 +389,7 @@ def run_job(job: dict) -> int:
         )
 
     def on_bundle_fail(meta: dict, name: str, error: str) -> None:
-        counters["failed"] += 1
+        counters.bump("failed")
         emit(
             "file",
             i=meta.get("i"),
@@ -417,7 +417,7 @@ def run_job(job: dict) -> int:
         src: Path = unit["path"]
         dest = resolve_out(unit, out_dir, pattern, ".cbz", keep_structure, index, total)
         if dest.exists() and not overwrite:
-            counters["skipped"] += 1
+            counters.bump("skipped")
             emit(
                 "file", i=index, total=total, path=str(src), out=str(dest), error="exists, skipped"
             )
@@ -426,7 +426,7 @@ def run_job(job: dict) -> int:
         started = time.perf_counter()
         opener = open_archive(src)
         if opener is None:
-            counters["failed"] += 1
+            counters.bump("failed")
             emit("file", i=index, total=total, path=str(src), error="unsupported archive")
             return
         names, reader = opener
@@ -475,7 +475,7 @@ def run_job(job: dict) -> int:
                         log(f"{src.name}:{name}: {exc}", "warn")
                         log(traceback.format_exc(limit=4), "debug")
             tmp.replace(dest)
-            counters["processed"] += 1
+            counters.bump("processed")
             emit(
                 "file",
                 i=index,
@@ -492,7 +492,7 @@ def run_job(job: dict) -> int:
             raise
         except Exception as exc:
             tmp.unlink(missing_ok=True)
-            counters["failed"] += 1
+            counters.bump("failed")
             emit("file", i=index, total=total, path=str(src), error=f"{type(exc).__name__}: {exc}")
 
     def reader(unit: dict):
@@ -521,7 +521,7 @@ def run_job(job: dict) -> int:
                 sub_n=count if into else 0,
             )
             if isinstance(payload, Exception):
-                counters["failed"] += 1
+                counters.bump("failed")
                 emit(
                     "file",
                     i=index,
@@ -534,7 +534,7 @@ def run_job(job: dict) -> int:
             if into is None:
                 dest = resolve_out(unit, out_dir, pattern, ext, keep_structure, index, total)
                 if dest.exists() and not overwrite:
-                    counters["skipped"] += 1
+                    counters.bump("skipped")
                     emit(
                         "file",
                         i=index,
@@ -552,7 +552,7 @@ def run_job(job: dict) -> int:
             except Exception as exc:
                 if CTRL.cancelled:
                     raise Cancelled from exc
-                counters["failed"] += 1
+                counters.bump("failed")
                 emit(
                     "file",
                     i=index,
@@ -602,7 +602,7 @@ def run_job(job: dict) -> int:
             dest_bundle: Path = task["dest"]
             units_here: list[dict] = task["units"]
             if dest_bundle.exists() and not overwrite:
-                counters["skipped"] += len(units_here)
+                counters.bump("skipped", len(units_here))
                 emit(
                     "file",
                     i=int(units_here[0].get("index") or 0),
@@ -644,7 +644,7 @@ def run_job(job: dict) -> int:
         ok=counters["failed"] == 0 and not cancelled,
         cancelled=cancelled,
         elapsed=round(time.perf_counter() - clock, 2),
-        **counters,
+        **counters.snapshot(),
     )
     return 0 if counters["failed"] == 0 else 1
 
@@ -689,7 +689,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
     ext: str = cfg["ext"]
     pattern: str = cfg["pattern"]
     overwrite: bool = cfg["overwrite"]
-    counters = {"processed": 0, "failed": 0, "skipped": 0}
+    counters = Counters()
     clock = time.perf_counter()
     cancelled = False
 
@@ -723,7 +723,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
             except Exception as exc:
                 log(f"{src.name}: {exc}", "warn")
             exists = dest.exists() and not overwrite
-            counters["skipped" if exists else "processed"] += 1
+            counters.bump("skipped" if exists else "processed")
             emit(
                 "file",
                 i=index,
@@ -740,7 +740,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
         units: list[dict] = task["units"]
         dest_bundle: Path | None = task.get("dest")
         if bundle and dest_bundle is not None and dest_bundle.exists() and not overwrite:
-            counters["skipped"] += len(units)
+            counters.bump("skipped", len(units))
             emit(
                 "file",
                 i=int(units[0].get("index") or 0),
@@ -776,7 +776,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
                     src, cfg["threshold"], cfg["colour_percent"]
                 )
             except Exception as exc:
-                counters["failed"] += 1
+                counters.bump("failed")
                 emit(
                     "file",
                     i=index,
@@ -813,7 +813,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
             else:
                 dest = resolve_out(unit, out_dir, pattern, ext, cfg["keep_structure"], index, total)
                 exists = dest.exists() and not overwrite
-            counters["skipped" if exists else "processed"] += 1
+            counters.bump("skipped" if exists else "processed")
             emit(
                 "file",
                 i=index,
@@ -842,7 +842,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
         cancelled=cancelled,
         elapsed=round(time.perf_counter() - clock, 2),
         dry=True,
-        **counters,
+        **counters.snapshot(),
     )
     return 0 if counters["failed"] == 0 else 1
 
