@@ -46,6 +46,17 @@ from janai.worker.transforms import (
 )
 
 
+class NoPagesError(Exception):
+    """An archive finished with nothing worth publishing.
+
+    Raised rather than handled inline so the abandoned ``.part`` is discarded,
+    the unit is counted failed and the ``file`` event is emitted by the *one*
+    existing failure path in ``handle_archive``. Duplicating that cleanup risks
+    a second ``file`` event for the same archive, and the interface counts one
+    unit of work per ``file`` event.
+    """
+
+
 def run_job(job: dict) -> int:
     inp = job.get("input", {}) or {}
     outp = job.get("output", {}) or {}
@@ -477,11 +488,24 @@ def run_job(job: dict) -> int:
                         # sets done.ok and the exit code -- a chapter that lost
                         # one unreadable page still converted, so the process
                         # still exits 0. That split is the chosen policy, not an
-                        # oversight.
+                        # oversight. Losing *every* page is a different case,
+                        # and is caught below.
                         failed_entries += 1
                         counters.bump("pages_failed")
                         log(f"{src.name}:{name}: {exc}", "warn")
                         log(traceback.format_exc(limit=4), "debug")
+            if written == 0:
+                # Publishing now would put an EMPTY .cbz where a chapter
+                # belongs - and with overwrite on, over a good one - while the
+                # run still reported success. Nothing was converted, so this is
+                # a failed unit: the far end of the policy above. Same answer
+                # when the archive held no page to begin with, because an empty
+                # output is never the right one.
+                raise NoPagesError(
+                    f"{failed_entries} of {len(names)} pages failed"
+                    if failed_entries
+                    else "no pages in archive"
+                )
             tmp.replace(dest)
             counters.bump("processed")
             emit(

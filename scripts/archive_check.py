@@ -1,11 +1,13 @@
-"""Live proof for the archive-input path (F9, F10, F13).
+"""Live proof for the archive-input path (F9, F10, F13, F23).
 
 `selftest.py` covers loose files and CBZ *output*; nothing exercises
-`handle_archive`, the CBZ *input* path. These two fixtures cover what that code
+`handle_archive`, the CBZ *input* path. These fixtures cover what that code
 is actually responsible for:
 
   Corrupt.cbz    two readable pages and one entry that is not an image
   Collision.cbz  a.jpg and a.png, which re-encode onto the SAME output name
+  AllBad.cbz     every entry is a page name whose bytes cannot be decoded
+  NoPages.cbz    a valid zip holding no page at all, only a metadata sidecar
 
 Asserted, in the terms the GUI sees:
   * a bad page does not fail the chapter - exit 0, done.ok true, processed=1
@@ -16,6 +18,15 @@ Asserted, in the terms the GUI sees:
     stays true and the process still exits 0 - the chosen policy for a page a
     chapter could not keep
   * colliding names produce two distinct entries, not one name written twice
+  * an archive that could keep NO page publishes nothing at all, counts as a
+    failed unit and exits 1 - the far end of the same policy: losing some pages
+    is a warning, losing every page is a failure, and an empty .cbz must never
+    replace a good one. The same guard, for the same reason, when the archive
+    simply held no page: an empty output is never the right answer.
+
+AllBad.cbz runs as a SECOND worker invocation over its own tree, deliberately:
+it must exit 1, while everything above is the F10 policy and has to keep
+passing untouched in the same file.
 
 Run: backend/python/python.exe scripts/archive_check.py
 """
@@ -36,6 +47,12 @@ sys.path.insert(0, str(ROOT / "src"))
 from janai.app.runlog import format_done, format_file
 
 BAD_ENTRY = "page-002.png"
+# Page *names*, so `is_page_entry` counts them as pages and the run really does
+# try them; the bytes are what makes every single one fail.
+ALL_BAD_ENTRIES = ("page-001.png", "page-002.png")
+# Not a page name at all, so `is_page_entry` filters it out and the archive is
+# left with nothing to convert - the other way to end up writing no pages.
+NO_PAGE_ENTRY = "ComicInfo.xml"
 
 failures: list[str] = []
 
@@ -100,23 +117,11 @@ def names_in(path: Path) -> list[str]:
         return zf.namelist()
 
 
-def main() -> int:
-    png, jpg = pages()
-    tmp = Path(tempfile.mkdtemp(prefix="janai-archive-"))
-    src, out = tmp / "library", tmp / "out"
-    src.mkdir()
-
-    with ZipFile(src / "Corrupt.cbz", "w") as zf:
-        zf.writestr("page-001.png", png)
-        zf.writestr(BAD_ENTRY, b"this is not a png at all")
-        zf.writestr("page-003.png", png)
-    with ZipFile(src / "Collision.cbz", "w") as zf:
-        zf.writestr("a.jpg", jpg)
-        zf.writestr("a.png", png)
-
-    job_path = tmp / "job.json"
+def run_worker(
+    src: Path, out: Path, job_path: Path
+) -> tuple[subprocess.CompletedProcess[str], list[dict]]:
+    """Run the real worker over `src` and return its process plus parsed events."""
     job_path.write_text(json.dumps(build_job(src, out)), encoding="utf-8")
-
     proc = subprocess.run(
         [sys.executable, str(WORKER), "--job", str(job_path)],
         check=False,
@@ -133,6 +138,24 @@ def main() -> int:
                 events.append(json.loads(line))
             except json.JSONDecodeError:
                 pass
+    return proc, events
+
+
+def main() -> int:
+    png, jpg = pages()
+    tmp = Path(tempfile.mkdtemp(prefix="janai-archive-"))
+    src, out = tmp / "library", tmp / "out"
+    src.mkdir()
+
+    with ZipFile(src / "Corrupt.cbz", "w") as zf:
+        zf.writestr("page-001.png", png)
+        zf.writestr(BAD_ENTRY, b"this is not a png at all")
+        zf.writestr("page-003.png", png)
+    with ZipFile(src / "Collision.cbz", "w") as zf:
+        zf.writestr("a.jpg", jpg)
+        zf.writestr("a.png", png)
+
+    proc, events = run_worker(src, out, tmp / "job.json")
 
     files = [e for e in events if e.get("type") == "file"]
     logs = [e for e in events if e.get("type") == "log"]
@@ -202,6 +225,46 @@ def main() -> int:
         check(f"{stem}.cbz has no duplicate entry names", len(got) == len(set(got)), str(got))
 
     check("no .part file left behind", not list(out.rglob("*.part")))
+
+    # --- archives that could keep no page at all (F23) ---
+    bad_src, bad_out = tmp / "allbad", tmp / "allbad-out"
+    bad_src.mkdir()
+    with ZipFile(bad_src / "AllBad.cbz", "w") as zf:
+        for entry in ALL_BAD_ENTRIES:
+            zf.writestr(entry, b"this is not a png at all")
+    with ZipFile(bad_src / "NoPages.cbz", "w") as zf:
+        zf.writestr(NO_PAGE_ENTRY, b"<ComicInfo />")
+
+    bad_proc, bad_events = run_worker(bad_src, bad_out, tmp / "allbad-job.json")
+    bad_done = next((e for e in bad_events if e.get("type") == "done"), {})
+    bad_files = [e for e in bad_events if e.get("type") == "file"]
+    bad_produced = sorted(p.name for p in bad_out.rglob("*.cbz"))
+
+    print(f"\n  [allbad] exit={bad_proc.returncode}  file={len(bad_files)}")
+
+    check(
+        "neither archive that kept no page is published at all",
+        bad_produced == [],
+        str(bad_produced),
+    )
+    check(
+        "both count as failed units, not processed ones",
+        int(bad_done.get("failed") or 0) == 2 and int(bad_done.get("processed") or 0) == 0,
+        json.dumps({k: bad_done.get(k) for k in ("processed", "failed", "pages_failed")}),
+    )
+    check(
+        "every lost page is still reported, and an absent page is not invented",
+        int(bad_done.get("pages_failed") or 0) == len(ALL_BAD_ENTRIES),
+        repr(bad_done.get("pages_failed")),
+    )
+    check("done.ok is false for that run", not bad_done.get("ok"), json.dumps(bad_done))
+    check("and the worker exits 1", bad_proc.returncode == 1, str(bad_proc.returncode))
+    check(
+        "one file event each, both carrying an error rather than reading as a conversion",
+        len(bad_files) == 2 and all(e.get("error") for e in bad_files),
+        json.dumps(bad_files),
+    )
+    check("no abandoned .part is left behind", not list(bad_out.rglob("*.part")))
 
     print("\n  " + ("ALL PASS" if not failures else f"FAILED: {', '.join(failures)}"))
     return 1 if failures else 0
