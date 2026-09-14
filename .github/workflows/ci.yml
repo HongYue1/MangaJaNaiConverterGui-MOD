@@ -59,6 +59,30 @@ jobs:
       - name: Check the tile planner
         run: python scripts/plannercheck.py
 
+      # Bounded queues, ordered writes, locked tallies and the cancel paths
+      # only misbehave under concurrency, and every one of these gates
+      # reproduced a real defect before its fix. They import nothing heavier
+      # than janai.worker.pipeline and janai.worker.control, which are
+      # stdlib-only, so they need no GPU and no torch, numpy or pyvips.
+      #
+      # bash rather than the Windows default shell, for two reasons: a
+      # multi-line pwsh block reports only the last command's exit code, so a
+      # failing gate in the middle would pass silently, and the last gate has
+      # to pipe a raw undecodable byte.
+      #
+      # archive_check.py and dryprobe_check.py are deliberately absent: they
+      # spawn a real worker, so they need the upscaling stack and a GPU. So is
+      # close_check.py, which measures process teardown timing. Those stay
+      # local gates; do not "complete the set" here.
+      - name: Gate the pipeline primitives and the control reader
+        shell: bash
+        run: |
+          python scripts/prefetch_check.py
+          python scripts/counters_check.py
+          python scripts/writepool_check.py
+          python scripts/bundle_check.py
+          printf '\x81\ncancel\n' | python scripts/stdin_check.py --reconfigure
+
       # Qt links against X11 and EGL even when it renders offscreen, and the
       # Linux runner does not ship those libraries.
       - name: Install the system libraries Qt links against
