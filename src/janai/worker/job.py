@@ -7,27 +7,29 @@ entry names inside a bundle and on predicted sizes. When they drift the user is
 shown a plan the run will not honour, which is worse than no plan at all.
 
 Both paths read their sources through :mod:`janai.worker.archives`, which sits
-below this module precisely because the run and the prediction share it.
+below this module precisely because the run and the prediction share it. The
+real run's per-unit work -- one archive, or one run of loose images -- lives in
+:mod:`janai.worker.orchestrate`; what stays here is the setup that decides what
+a job means and the loop that dispatches its tasks.
 """
 
 import time
-import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from zipfile import ZIP_STORED, ZipFile
 
 from janai.core import rules as _rules
 from janai.core.formats import CONTAINERS, FORMATS, merged
-from janai.core.fspath import io_path, path_too_long
+from janai.core.fspath import io_path
 from janai.worker import devices, imageio, runtime, tiling
-from janai.worker.archives import ArchiveReader, open_archive
+from janai.worker.archives import open_archive
 from janai.worker.control import CTRL, Cancelled
 from janai.worker.environment import MODELS_DIR
 from janai.worker.events import emit, log
 from janai.worker.models import ModelCache, list_models
+from janai.worker.orchestrate import UnitRunner
 from janai.worker.page import PageEncoder, PageWorker
-from janai.worker.pipeline import BundleWriter, Counters, PagePacker, WritePool, prefetch
+from janai.worker.pipeline import BundleWriter, Counters, WritePool
 from janai.worker.planning import (
     build_tasks,
     format_name,
@@ -43,17 +45,6 @@ from janai.worker.transforms import (
     gray_stats,
     predict_size,
 )
-
-
-class NoPagesError(Exception):
-    """An archive finished with nothing worth publishing.
-
-    Raised rather than handled inline so the abandoned ``.part`` is discarded,
-    the unit is counted failed and the ``file`` event is emitted by the *one*
-    existing failure path in ``handle_archive``. Duplicating that cleanup risks
-    a second ``file`` event for the same archive, and the interface counts one
-    unit of work per ``file`` event.
-    """
 
 
 def run_job(job: dict) -> int:
@@ -269,280 +260,26 @@ def run_job(job: dict) -> int:
         encoder.encode, reporter.bundle_page, reporter.bundle_failed, reporter.bundle_done
     )
 
-    def handle_archive(index: int, unit: dict) -> None:
-        src: Path = unit["path"]
-        dest = resolve_out(unit, out_dir, pattern, ".cbz", keep_structure, index, total)
-        if io_path(dest).exists() and not overwrite:
-            counters.bump("skipped")
-            emit(
-                "file", i=index, total=total, path=str(src), out=str(dest), error="exists, skipped"
-            )
-            return
-        too_long = path_too_long(dest)
-        if too_long:
-            # Fail this chapter, not the run, and name the culprit -- the same
-            # shape as the unsupported-archive branch just below.
-            counters.bump("failed")
-            emit("file", i=index, total=total, path=str(src), error=f"OSError: {too_long}")
-            return
-        io_path(dest).parent.mkdir(parents=True, exist_ok=True)
-        started = time.perf_counter()
-        # Scoped to exactly the span that reads from it: `pack_archive` pulls
-        # every page through `reader` and nothing touches the source after it
-        # returns, so the handle is released the moment packing is done.
-        with open_archive(src) as opened:
-            if opened is None:
-                counters.bump("failed")
-                emit("file", i=index, total=total, path=str(src), error="unsupported archive")
-                return
-            names, reader = opened
-            pack_archive(index, src, dest, names, reader, started)
-
-    def pack_archive(
-        index: int,
-        src: Path,
-        dest: Path,
-        names: list[str],
-        reader: ArchiveReader,
-        started: float,
-    ) -> None:
-        """Encode every page of one already-open archive into its output CBZ.
-
-        Split from `handle_archive` so the source can be held by a `with` for
-        precisely as long as it is read: this half is the only code that calls
-        `reader`. The failure accounting lives here because the `.part` file it
-        has to clean up is created here too.
-        """
-        tmp = dest.with_suffix(".cbz.part")
-        # `dest` and `tmp` stay plain: they are what the `file` event and the
-        # log carry. Only these two handles cross into the file system, so only
-        # they may wear the extended-length prefix.
-        tmp_io, dest_io = io_path(tmp), io_path(dest)
-        written = 0
-        failed_entries = 0
-        seen: set[str] = set()
-
-        def on_page_fail(entry: str, exc: BaseException) -> None:
-            """Report a page the packer could not encode. Runs on the pack thread.
-
-            The same two tallies the decode half below keeps, for the same
-            reason. Both are safe off-thread: ``counters`` is locked and
-            ``emit`` holds the stdout lock.
-            """
-            counters.bump("pages_failed")
-            log(f"{src.name}:{entry}: {exc}", "warn")
-            log(traceback.format_exc(limit=4), "debug")
-
-        try:
-            with ZipFile(tmp_io, "w", ZIP_STORED) as zf:
-                # Encoding is not cheap beside the upscale it follows -- ~9% of a
-                # page for PNG, ~72% for AVIF -- and it used to run inline, so
-                # the GPU idled through all of it. The packer overlaps it with
-                # the next page's upscale, with one worker so pages still land
-                # in the order they were read.
-                packer = PagePacker(zf, encoder.encode, on_page_fail)
-                try:
-                    for k, name in enumerate(names, 1):
-                        if CTRL.cancelled:
-                            raise Cancelled
-                        CTRL.gate()
-                        emit(
-                            "progress",
-                            i=index,
-                            total=total,
-                            path=str(src),
-                            sub_i=k,
-                            sub_n=len(names),
-                        )
-                        try:
-                            raw = reader(name)
-                            image, _gray, _model, _info = pager.run(
-                                imageio.read_image_bytes(raw, name), name
-                            )
-                            # Re-encoding collapses distinct source names onto
-                            # one output name - a.jpg and a.png both become
-                            # a.png - and a zip stores two entries under the
-                            # identical name without complaint, so readers show
-                            # one page twice or drop one and nothing in the log
-                            # says which. Same de-dup the loose-file bundle path
-                            # already applies. Named here, on the producer
-                            # thread, so the suffix follows page order rather
-                            # than whichever encode happened to finish first.
-                            entry = str(Path(name).with_suffix(ext).as_posix())
-                            while entry.lower() in seen:
-                                entry = f"{entry[: -len(ext)]}_{k}{ext}"
-                            seen.add(entry.lower())
-                            packer.add(entry, image)
-                        except Cancelled:
-                            raise
-                        except Exception as exc:
-                            # A page that fails here is dropped and the CBZ is
-                            # silently short: the entry count was the only
-                            # trace, and a short chapter looks like a short
-                            # chapter. Count it so the summary line can say so.
-                            #
-                            # Two tallies on purpose: this archive's own count
-                            # feeds its `file` line, and the job-level
-                            # `pages_failed` puts the loss in the `done`
-                            # summary, so the run as a whole admits it. NEITHER
-                            # is counters["failed"], which alone sets done.ok
-                            # and the exit code -- a chapter that lost one
-                            # unreadable page still converted, so the process
-                            # still exits 0. That split is the chosen policy,
-                            # not an oversight. Losing *every* page is a
-                            # different case, and is caught below.
-                            failed_entries += 1
-                            counters.bump("pages_failed")
-                            log(f"{src.name}:{name}: {exc}", "warn")
-                            log(traceback.format_exc(limit=4), "debug")
-                finally:
-                    # The zip must not close under an in-flight writestr, and
-                    # the packer's tallies are only readable once every task has
-                    # joined. A cancelled run discards the .part, so its queued
-                    # pages are dropped rather than encoded for nothing.
-                    packer.close(drain=not CTRL.cancelled)
-                    written = packer.written
-                    failed_entries += packer.failed
-            if written == 0:
-                # Publishing now would put an EMPTY .cbz where a chapter
-                # belongs - and with overwrite on, over a good one - while the
-                # run still reported success. Nothing was converted, so this is
-                # a failed unit: the far end of the policy above. Same answer
-                # when the archive held no page to begin with, because an empty
-                # output is never the right one.
-                raise NoPagesError(
-                    f"{failed_entries} of {len(names)} pages failed"
-                    if failed_entries
-                    else "no pages in archive"
-                )
-            tmp_io.replace(dest_io)
-            counters.bump("processed")
-            emit(
-                "file",
-                i=index,
-                total=total,
-                path=str(src),
-                out=str(dest),
-                ms=int((time.perf_counter() - started) * 1000),
-                bytes=dest_io.stat().st_size,
-                entries=written,
-                failed=failed_entries,
-            )
-        except Cancelled:
-            tmp_io.unlink(missing_ok=True)
-            raise
-        except Exception as exc:
-            tmp_io.unlink(missing_ok=True)
-            counters.bump("failed")
-            emit("file", i=index, total=total, path=str(src), error=f"{type(exc).__name__}: {exc}")
-
-    def reader(unit: dict):
-        if unit["kind"] == "image":
-            return imageio.read_image(unit["path"])
-        return None
-
-    def run_images(items: list[dict], into: dict | None) -> None:
-        """Upscale a run of images, either to loose files or into one archive."""
-        count = len(items)
-        # `seen` claims entry names inside a bundle; `taken` claims paths on
-        # disk. Both exist because re-encoding is not injective, and the two
-        # namespaces de-dupe differently.
-        seen: set[str] = set()
-        taken: set[str] = set()
-        position = 0
-        for unit, payload in prefetch(items, io_workers, reader):
-            position += 1
-            if CTRL.cancelled:
-                raise Cancelled
-            CTRL.gate()
-            index = int(unit.get("index") or position)
-            src: Path = unit["path"]
-            emit(
-                "progress",
-                i=index,
-                total=total,
-                path=str(src),
-                sub_i=position if into else 0,
-                sub_n=count if into else 0,
-            )
-            if isinstance(payload, Exception):
-                counters.bump("failed")
-                emit(
-                    "file",
-                    i=index,
-                    total=total,
-                    path=str(src),
-                    error=f"read failed: {type(payload).__name__}: {payload}",
-                )
-                continue
-            dest: Path | None = None
-            if into is None:
-                dest = resolve_out(unit, out_dir, pattern, ext, keep_structure, index, total)
-                # a.jpg and a.png both resolve to a.png, and a {parent} pattern
-                # collapses a whole folder onto one name. A name this run has
-                # already handed out must NOT take the skip branch: it belongs
-                # to a sibling page whose write may still be queued, so exists()
-                # cannot tell it apart from output left by an earlier run.
-                # path_key stays on the PLAIN path: a reservation keyed on a
-                # prefixed string would never match the same name again.
-                claimed = path_key(dest) in taken
-                if not claimed and io_path(dest).exists() and not overwrite:
-                    counters.bump("skipped")
-                    emit(
-                        "file",
-                        i=index,
-                        total=total,
-                        path=str(src),
-                        out=str(dest),
-                        error="exists, skipped",
-                    )
-                    continue
-                if claimed or dest.resolve() == src.resolve():
-                    dest = unique_path(dest, taken)
-                taken.add(path_key(dest))
-            started = time.perf_counter()
-            try:
-                image, gray, model_name, info = pager.run(payload, src.name)
-            except Exception as exc:
-                if CTRL.cancelled:
-                    raise Cancelled from exc
-                counters.bump("failed")
-                emit(
-                    "file",
-                    i=index,
-                    total=total,
-                    path=str(src),
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-                log(traceback.format_exc(limit=4), "debug")
-                continue
-            if into is None and dest is not None:
-                writer.submit(
-                    reporter.write_page, index, src, dest, image, gray, model_name, info, started
-                )
-                continue
-            if into is None:
-                # A page with neither a bundle nor a destination has nowhere to
-                # go. This used to surface two lines below as "NoneType is not
-                # subscriptable", which named the wrong cause entirely.
-                raise RuntimeError(f"no output destination for {src}")
-            entry = format_name(pattern, src, position, count) + ext
-            while entry.lower() in seen:
-                entry = f"{entry[: -len(ext)]}_{position}{ext}"
-            seen.add(entry.lower())
-            bundle.add(
-                entry,
-                image,
-                {
-                    "i": index,
-                    "src": str(src),
-                    "gray": gray,
-                    "model": model_name,
-                    "info": info,
-                    "started": started,
-                    "bundle": str(into["dest"]),
-                },
-            )
+    # One object for everything that happens to a single planned unit, so the
+    # loop below is dispatch and nothing else. The collaborators go in by
+    # reference -- `counters` above all, which is locked and is this run's only
+    # tally -- and the settings by value, because none of them may change once
+    # the job has started.
+    runner = UnitRunner(
+        pager=pager,
+        encoder=encoder,
+        reporter=reporter,
+        writer=writer,
+        bundle=bundle,
+        counters=counters,
+        out_dir=out_dir,
+        pattern=pattern,
+        ext=ext,
+        keep_structure=keep_structure,
+        overwrite=overwrite,
+        total=total,
+        io_workers=io_workers,
+    )
 
     cancelled = False
     try:
@@ -553,10 +290,10 @@ def run_job(job: dict) -> int:
             if task["kind"] == "archive":
                 unit = task["unit"]
                 emit("progress", i=int(unit.get("index") or 0), total=total, path=str(unit["path"]))
-                handle_archive(int(unit.get("index") or 0), unit)
+                runner.handle_archive(int(unit.get("index") or 0), unit)
                 continue
             if task["kind"] == "images":
-                run_images(task["units"], None)
+                runner.run_images(task["units"], None)
                 continue
             dest_bundle: Path = task["dest"]
             units_here: list[dict] = task["units"]
@@ -573,7 +310,7 @@ def run_job(job: dict) -> int:
                 )
                 continue
             bundle.open(task["key"], dest_bundle)
-            run_images(units_here, task)
+            runner.run_images(units_here, task)
             bundle.close()
     except Cancelled:
         cancelled = True
