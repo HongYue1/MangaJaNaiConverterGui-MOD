@@ -33,9 +33,18 @@ else:  # type-only: at runtime the base is object, so the MRO is untouched
     _Base = object
 
 FILE_FILTER = (
-    "Images and archives (*.png *.jpg *.jpeg *.jfif *.webp *.avif *.jxl *.bmp "
-    "*.tif *.tiff *.gif *.heic *.heif *.cbz *.zip *.cbr *.rar);;All files (*)"
+    "Images and archives ("
+    + " ".join(f"*{ext}" for ext in sorted(IMAGE_EXTS | ARCHIVE_EXTS))
+    + ");;All files (*)"
 )
+"""What the Open dialog offers, derived from the shared sets rather than
+written out (F33).
+
+Hand-written it had already drifted: it listed neither .ppm nor .pgm, so pages
+the scan counted and the worker converted could not be chosen in the dialog at
+all. Sorted, so the text is stable rather than following set iteration order.
+The all-files entry stays, because someone's pages may carry no suffix we know.
+"""
 
 
 class InputPanelMixin(_Base):

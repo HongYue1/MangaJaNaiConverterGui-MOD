@@ -45,10 +45,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from janai.app.input_panel import FILE_FILTER
 from janai.app.rules_table import RulesTable
 from janai.app.theme import BASE_SIZES, Theme
 from janai.app.widgets import Card, Collapsible, DropZone, LogView
 from janai.app.window import MainWindow
+from janai.core.filetypes import ARCHIVE_EXTS, IMAGE_EXTS
 
 FAILURES: list[str] = []
 
@@ -615,6 +617,26 @@ def check_profile(window: MainWindow, app: QApplication) -> None:
     pump(app)
 
 
+def check_file_filter() -> None:
+    """The Open dialog must offer exactly what the scan counts (F33).
+
+    The filter string is what the file picker will show; the pre-run scan and
+    the worker both read the shared suffix sets. While the string was
+    hand-written it drifted - it omitted .ppm and .pgm, so a page the worker
+    converts happily could not be picked in the dialog at all.
+
+    This asserts the *derivation*, not the literal text, so adding a format to
+    janai.core.filetypes needs no edit here - which is the whole point.
+    """
+    inside = FILE_FILTER.split("(", 1)[1].split(")", 1)[0]
+    offered = set(inside.split())
+    want = {f"*{ext}" for ext in IMAGE_EXTS | ARCHIVE_EXTS}
+    check("the dialog offers every known suffix", offered == want, str(sorted(want - offered)))
+    check("the dialog offers nothing unknown", not offered - want, str(sorted(offered - want)))
+    # Losing this would strand anyone whose pages carry an unusual extension.
+    check("the all-files escape hatch survives", FILE_FILTER.endswith(";;All files (*)"))
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
 
@@ -657,6 +679,7 @@ def main() -> int:
         check_page_kind(window, app)
         check_row_numbers(window)
         check_geometry_clamp(window, app)
+        check_file_filter()
         check_profile(window, app)
 
         window.close()

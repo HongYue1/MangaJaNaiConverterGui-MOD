@@ -213,6 +213,18 @@ def extension_sets() -> None:
             f"{path.relative_to(ROOT)} no longer reads the shared set"
         )
 
+    # The Qt open-dialog filter was a third hand-written copy of this same
+    # knowledge, and it had already drifted (F33). A literal glob list cannot
+    # be held in step by identity, so the shape itself is forbidden here. That
+    # the derived string matches the sets is proved in uicheck.py, which may
+    # import Qt; this check must stay dependency-free.
+    panel = (pkg / "app" / "input_panel.py").read_text(encoding="utf-8")
+    assert re.search(r"^FILE_FILTER\s*=", panel, re.MULTILINE), (
+        "input_panel.py no longer defines FILE_FILTER, so this scan proves nothing"
+    )
+    globs = sorted(set(re.findall(r"\*\.[A-Za-z0-9]+", panel)))
+    assert not globs, f"input_panel.py hard-codes page suffixes again: {globs}"
+
 
 def page_entries() -> None:
     """An archive entry is a page only if it is really an image.
