@@ -467,11 +467,16 @@ def run_job(job: dict) -> int:
                         # a short chapter looks like a short chapter. Count it so
                         # the summary line can say so.
                         #
-                        # Deliberately NOT counters["failed"]: that would flip
-                        # done.ok and the process exit code for a chapter with one
-                        # unreadable page, which is a policy change rather than a
-                        # reporting fix.
+                        # Two tallies on purpose: this archive's own count feeds
+                        # its `file` line, and the job-level `pages_failed` puts
+                        # the loss in the `done` summary, so the run as a whole
+                        # admits it. NEITHER is counters["failed"], which alone
+                        # sets done.ok and the exit code -- a chapter that lost
+                        # one unreadable page still converted, so the process
+                        # still exits 0. That split is the chosen policy, not an
+                        # oversight.
                         failed_entries += 1
+                        counters.bump("pages_failed")
                         log(f"{src.name}:{name}: {exc}", "warn")
                         log(traceback.format_exc(limit=4), "debug")
             tmp.replace(dest)

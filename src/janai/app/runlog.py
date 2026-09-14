@@ -175,11 +175,17 @@ def format_done(ev: dict) -> tuple[str, str]:
     processed = int(ev.get("processed") or 0)
     failed = int(ev.get("failed") or 0)
     skipped = int(ev.get("skipped") or 0)
+    pages_failed = int(ev.get("pages_failed") or 0)
     bits = [f"{processed} done"]
     if skipped:
         bits.append(f"{skipped} skipped")
     if failed:
         bits.append(f"{failed} failed")
+    if pages_failed:
+        # Pages lost inside archives. The chapters themselves converted, so the
+        # summary is the only place the run as a whole admits anything went
+        # missing; without this a shortened chapter just looks short.
+        bits.append(f"{pages_failed} page{'' if pages_failed == 1 else 's'} failed")
     bits.append(fmt_secs(float(ev.get("elapsed") or 0)))
     head = (
         "cancelled"
@@ -187,6 +193,11 @@ def format_done(ev: dict) -> tuple[str, str]:
         else ("dry run finished" if ev.get("dry") else "finished")
     )
     level = "error" if failed or not ev.get("ok") else ("dry" if ev.get("dry") else "ok")
+    if pages_failed and level == "ok":
+        # Only a clean "ok" is upgraded, so a dry run stays dry and an error
+        # stays an error. A green summary must not be the last word on a page
+        # the user will never see again.
+        level = "warn"
     if ev.get("cancelled"):
         level = "warn"
     text = f"{head}: " + "  \u00b7  ".join(bits)

@@ -1,4 +1,4 @@
-"""Live proof for the archive-input path (F9, F10-visibility, F13).
+"""Live proof for the archive-input path (F9, F10, F13).
 
 `selftest.py` covers loose files and CBZ *output*; nothing exercises
 `handle_archive`, the CBZ *input* path. These two fixtures cover what that code
@@ -12,6 +12,9 @@ Asserted, in the terms the GUI sees:
   * exactly ONE `file` event per archive. run_panel counts one unit per file
     event, so a per-page event would inflate the progress bar and counter.
   * the losing chapter reports failed=1 and renders "1 failed"
+  * the job summary reports pages_failed=1 and reads as a warning, while done.ok
+    stays true and the process still exits 0 - the chosen policy for a page a
+    chapter could not keep
   * colliding names produce two distinct entries, not one name written twice
 
 Run: backend/python/python.exe scripts/archive_check.py
@@ -30,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "src" / "janai" / "worker" / "worker.py"
 sys.path.insert(0, str(ROOT / "src"))
 
-from janai.app.runlog import format_file
+from janai.app.runlog import format_done, format_file
 
 BAD_ENTRY = "page-002.png"
 
@@ -161,6 +164,16 @@ def main() -> int:
     line, level = format_file(bad) if bad else ("", "")
     check("the run log line says '1 failed'", "1 failed" in line, line.strip())
     check("that line is still an ok line, not an error", level == "ok", level)
+
+    # --- the same loss, carried up into the job summary (F10) ---
+    check(
+        "the done payload reports the lost page",
+        int(done.get("pages_failed") or 0) == 1,
+        repr(done.get("pages_failed")),
+    )
+    done_line, done_level = format_done(done) if done else ("", "")
+    check("the summary line names it", "1 page failed" in done_line, done_line.strip())
+    check("the summary is a warning, not a clean green line", done_level == "warn", done_level)
 
     # --- the chapter whose names collide (F13) ---
     good = event_for("Collision.cbz")

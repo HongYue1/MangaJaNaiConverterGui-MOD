@@ -113,8 +113,12 @@ def main() -> int:
 
     snap = single.snapshot()
     keys = sorted(snap)
+    # Locked on purpose, and it may only ever grow: snapshot() *is* the done
+    # payload the GUI parses, so a key disappearing here is a silently broken
+    # status line rather than an error anyone would see. pages_failed joined the
+    # set when per-page archive losses started being reported.
     check(
-        keys == ["failed", "processed", "skipped"],
+        keys == ["failed", "pages_failed", "processed", "skipped"],
         f"[locked] snapshot() carries the keys the done event needs ({keys})",
     )
 

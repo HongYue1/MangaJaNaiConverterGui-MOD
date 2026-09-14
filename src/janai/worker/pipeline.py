@@ -67,12 +67,26 @@ class Counters:
     the run summary the user reads, and ``failed == 0`` decides the process exit
     code, so they are worth a lock: it costs well under a microsecond per page
     against milliseconds of encoding.
+
+    ``pages_failed`` counts pages *inside* an archive that could not be decoded
+    or encoded. It is kept out of ``failed`` deliberately: ``failed`` alone sets
+    ``done.ok`` and the exit code, and a chapter that lost one unreadable page
+    still converted. Folding these into ``failed`` would report every such run
+    as a failed job.
     """
 
     __slots__ = ("_counts", "_lock")
 
     def __init__(self) -> None:
-        self._counts: dict[str, int] = {"processed": 0, "failed": 0, "skipped": 0}
+        # Seeded rather than created on first bump: ``snapshot`` *is* the
+        # ``done`` payload, so the GUI must be able to tell "nothing was lost"
+        # from "this worker is too old to say".
+        self._counts: dict[str, int] = {
+            "processed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "pages_failed": 0,
+        }
         self._lock = threading.Lock()
 
     def bump(self, key: str, n: int = 1) -> None:
