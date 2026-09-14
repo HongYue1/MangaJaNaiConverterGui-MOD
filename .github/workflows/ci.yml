@@ -62,8 +62,10 @@ jobs:
       # Bounded queues, ordered writes, locked tallies and the cancel paths
       # only misbehave under concurrency, and every one of these gates
       # reproduced a real defect before its fix. They import nothing heavier
-      # than janai.worker.pipeline and janai.worker.control, which are
-      # stdlib-only, so they need no GPU and no torch, numpy or pyvips.
+      # than janai.worker.pipeline, janai.worker.control and janai.app.runlog,
+      # all of which are stdlib-only, so they need no GPU and no torch, numpy
+      # or pyvips - and no PySide6 either, which is why they can run here,
+      # above the step that installs it.
       #
       # bash rather than the Windows default shell, for two reasons: a
       # multi-line pwsh block reports only the last command's exit code, so a
@@ -74,13 +76,14 @@ jobs:
       # spawn a real worker, so they need the upscaling stack and a GPU. So is
       # close_check.py, which measures process teardown timing. Those stay
       # local gates; do not "complete the set" here.
-      - name: Gate the pipeline primitives and the control reader
+      - name: Gate the pipeline primitives, the control reader and the done payload
         shell: bash
         run: |
           python scripts/prefetch_check.py
           python scripts/counters_check.py
           python scripts/writepool_check.py
           python scripts/bundle_check.py
+          python scripts/donepages_check.py
           printf '\x81\ncancel\n' | python scripts/stdin_check.py --reconfigure
 
       # Qt links against X11 and EGL even when it renders offscreen, and the
