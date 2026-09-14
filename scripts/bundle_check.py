@@ -27,7 +27,9 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any, NoReturn
 from zipfile import ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -61,23 +63,26 @@ def free_slots(sem: threading.Semaphore, cap: int) -> int:
     return taken
 
 
-class RefusingPool:
+class RefusingPool(ThreadPoolExecutor):
     """A pool whose submit always fails, i.e. thread-start failure or MemoryError.
 
     RuntimeError-after-shutdown is NOT reachable in the live worker (close() and
     shutdown() run only in run_job's finally, after the last add), so this
     stands in for the triggers that are.
+
+    It subclasses the executor it replaces because it is assigned to attributes
+    that hold one. max_workers=1 starts no thread: a worker thread is only
+    spawned by a submit that reaches the base class, and this one never does,
+    so the inherited shutdown() is a no-op with no threads to join.
     """
 
     def __init__(self) -> None:
+        super().__init__(max_workers=1)
         self.calls = 0
 
-    def submit(self, *_args, **_kwargs):
+    def submit(self, *args: Any, **kwargs: Any) -> NoReturn:
         self.calls += 1
         raise RuntimeError("submit refused")
-
-    def shutdown(self, wait: bool = True) -> None:
-        return None
 
 
 def make_writer(encode, done: list) -> BundleWriter:

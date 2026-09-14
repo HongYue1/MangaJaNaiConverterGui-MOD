@@ -169,10 +169,12 @@ def main() -> int:
     two = run_page(planner, model, retries=2, peak_mib=3513)
     three = int(planner.choose(model, Page()))
     notes()
+    # `is not None`, not truthiness: the cap is an `int | None`, and bool()
+    # neither narrows it for a checker nor tells "no cap" from a 0px one.
     cap = planner._cap.get(id(model))
     check(f"pages 1-2 ran at {one}px and {two}px", one == 1312 and two > one)
-    check(f"capped to {cap}px", bool(cap) and cap < two)
-    check("and the cap reaches a genuinely cheaper cut", bool(cap) and cost(cap) < cost(two))
+    check(f"capped to {cap}px", cap is not None and cap < two)
+    check("and the cap reaches a genuinely cheaper cut", cap is not None and cost(cap) < cost(two))
     check(f"page 3 runs at {three}px", three == cap)
 
     print("\nC: a peak against the ceiling still caps on page one")
@@ -181,7 +183,7 @@ def main() -> int:
     notes()
     cap = planner._cap.get(id(model))
     check(f"page 1 ran at {tight}px", tight == 1312)
-    check(f"real capacity pressure caps, to {cap}px", bool(cap) and cost(cap) < cost(tight))
+    check(f"real capacity pressure caps, to {cap}px", cap is not None and cost(cap) < cost(tight))
 
     print("\nD: a clean page clears the slate")
     planner, model = new_planner()

@@ -22,6 +22,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -533,13 +534,15 @@ def check_profile(window: MainWindow, app: QApplication) -> None:
     check("nothing measured is handed to a run", window.profile_for_run() == {})
 
     gpu = {"value": "cuda:0", "label": "Test GPU 9000 (cuda:0)", "vram": 6 * 1024**3}
-    here = {
+    # Annotated because these fixtures are handed to real janai types: left
+    # bare, their heterogeneous values join to `object` and every use widens.
+    here: dict[str, Any] = {
         "devices": [{"value": "cpu", "label": "CPU"}, gpu],
         "torch": "2.6.0",
         "cuda": "12.4",
     }
     elsewhere = dict(here, devices=[dict(gpu, label="Other GPU (cuda:0)")])
-    mine = {
+    mine: dict[str, Any] = {
         "version": hardware.PROFILE_VERSION,
         "fingerprint": hardware.fingerprint(here),
         "fp16": True,
@@ -580,11 +583,8 @@ def check_profile(window: MainWindow, app: QApplication) -> None:
     window.chk_fp16.setChecked(False)
     check("the other precision is refused", window.profile_for_run() == {})
     window.chk_fp16.setChecked(True)
-    check(
-        "an older profile version is refused",
-        window.__setattr__("profile", dict(mine, version=hardware.PROFILE_VERSION + 1)) is None
-        and window.profile_for_run() == {},
-    )
+    window.profile = dict(mine, version=hardware.PROFILE_VERSION + 1)
+    check("an older profile version is refused", window.profile_for_run() == {})
 
     window.profile = {}
     window.on_profile({"type": "profile", "ok": True, "elapsed": 42.0, "profile": mine})

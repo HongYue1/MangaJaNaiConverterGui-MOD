@@ -249,13 +249,12 @@ extra_checks = true
 # than no gate. Do not restore a union-attr override here: it would also hide
 # every other union-attr mistake in those three modules.
 
-# Cause 4 - gate-script residue (7 findings). These appeared only once
-# `mypy_path = "src"` let the checker see the real janai types instead of Any,
-# which is the whole reason the gates are in scope: plannercheck feeds an
-# `int | None` to a parameter declared `int`, uicheck consumes the return value
-# of `__setattr__` and widens a list to Sequence, and bundle_check binds its
-# RefusingPool double to a name inferred as ThreadPoolExecutor. Gate-only code,
-# no shipped behaviour, triaged with the rest of the residue.
-[[tool.mypy.overrides]]
-module = ["plannercheck", "uicheck", "bundle_check"]
-disable_error_code = ["operator", "arg-type", "func-returns-value", "assignment"]
+# Cause 4 - the gate-script residue is FIXED, in the gates rather than here,
+# and every finding was real rather than a typeshed gap: plannercheck guarded
+# an `int | None` cap with `bool(cap)`, which does not narrow for a checker
+# (and also rejects a 0px cap); uicheck consumed `__setattr__`'s always-None
+# return instead of assigning, and let unannotated fixtures widen to
+# `dict[str, object]` before handing them to real janai types; bundle_check
+# bound a duck-typed double to attributes that hold a ThreadPoolExecutor, so it
+# now subclasses the executor it stands in for. No suppression survives in this
+# file - every override that was once here has been paid off in code.
