@@ -30,8 +30,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import platform
 import sys
 import time
 import traceback
@@ -46,41 +44,39 @@ _SRC = _HERE.parents[1]  # <app folder>/src, the import root
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from janai.worker import capabilities, devices, imageio, runtime, tiling
+from janai.worker import devices, runtime, tiling
 from janai.worker.control import CTRL
 
 # Importing environment resolves the install layout, puts the vendored backend
 # on sys.path and the bundled tools on PATH. It must happen before any heavy
 # import, which is why nothing below may be reordered above it.
-from janai.worker.environment import MODELS_DIR, PATHS, ROOT
+from janai.worker.environment import MODELS_DIR
 from janai.worker.events import emit, log
 from janai.worker.hold import do_hold
 from janai.worker.job import run_job
 from janai.worker.models import ModelCache, list_models, upscale_array
+from janai.worker.probe import do_probe
 
 # --------------------------------------------------------------------------- #
 # heavy handles, mirrored from janai.worker.runtime
 #
 # Transitional scaffolding for the Phase 1 split. runtime.py owns the lazy
-# imports now, but the probe and profiling code that reads these
-# names still lives further down this file. Each extraction repoints one group
-# of consumers at ``runtime.<name>``; the last one deletes this block.
+# imports now, but the profiling code that reads these names still lives
+# further down this file. The next extraction repoints it and deletes this
+# block.
 #
 # Mirroring is safe because the loaders are idempotent and the handles are
 # module objects, and it is what lets every intermediate commit stay runnable
 # and bisectable instead of forcing one unreviewable mega-move.
 # --------------------------------------------------------------------------- #
-np = None
-cv2 = None
-pyvips = None
 torch = None
 TILE: dict[str, Any] = {}
 
 
 def _mirror_runtime() -> None:
     """Publish runtime's loaded handles under the names this file still uses."""
-    global np, cv2, pyvips, torch, TILE
-    np, cv2, pyvips, torch = runtime.np, runtime.cv2, runtime.pyvips, runtime.torch
+    global torch, TILE
+    torch = runtime.torch
     TILE = runtime.TILE
 
 
@@ -92,65 +88,6 @@ def load_imaging(perf: dict | None = None) -> None:
 def load_backend(perf: dict | None = None) -> None:
     runtime.load_backend(perf)
     _mirror_runtime()
-
-
-# --------------------------------------------------------------------------- #
-# probe report
-# --------------------------------------------------------------------------- #
-def do_probe(models_dir: Path) -> int:
-    info: dict[str, Any] = {
-        "root": str(ROOT),
-        "models_dir": str(models_dir),
-        "python": sys.version.split()[0],
-        "platform": platform.platform(),
-        "paths": PATHS.as_dict(),
-        "ok": True,
-        "errors": [],
-    }
-    try:
-        load_backend()
-    except Exception as exc:
-        info["ok"] = False
-        info["errors"].append(f"backend import failed: {exc}")
-        emit("probe", **info)
-        return 1
-
-    try:
-        info["libvips"] = ".".join(str(pyvips.version(i)) for i in range(3))
-    except Exception:
-        info["libvips"] = "?"
-    info["pyvips"] = getattr(pyvips, "__version__", "?")
-    info["torch"] = getattr(torch, "__version__", "?")
-    try:
-        info["cuda"] = torch.version.cuda or ""
-    except Exception:
-        info["cuda"] = ""
-    try:
-        info["numpy"] = np.__version__
-        info["opencv"] = cv2.__version__
-    except Exception:
-        pass
-
-    info["devices"] = devices.device_objects()
-    gpu = next((d for d in info["devices"] if d["value"] != "cpu"), None)
-    info["default_device"] = gpu["value"] if gpu else "cpu"
-    info["formats"] = imageio.encode_capabilities()
-    info["read_jxl"] = capabilities.vips_has("jxlload") or bool(capabilities.find_djxl())
-    info["read_heif"] = capabilities.vips_has("heifload")
-    info["models"] = list_models(models_dir)
-    info["icc"] = PATHS.icc() is not None
-    info["tools"] = {name: capabilities.find_tool(name) for name in ("cjxl", "djxl")}
-    try:
-        import rarfile
-
-        info["rar"] = bool(
-            rarfile.tool_setup(sevenzip=True, sevenzip2=True, unrar=True, bsdtar=True)
-        )
-    except Exception:
-        info["rar"] = False
-    info["cpu_count"] = os.cpu_count() or 1
-    emit("probe", **info)
-    return 0
 
 
 # --------------------------------------------------------------------------- #
