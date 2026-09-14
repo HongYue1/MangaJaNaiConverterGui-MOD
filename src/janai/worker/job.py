@@ -26,7 +26,8 @@ from janai.worker import devices, imageio, runtime, tiling
 from janai.worker.control import CTRL, Cancelled
 from janai.worker.environment import MODELS_DIR
 from janai.worker.events import emit, log
-from janai.worker.models import ModelCache, list_models, upscale_array
+from janai.worker.models import ModelCache, list_models
+from janai.worker.page import PageEncoder, PageWorker
 from janai.worker.pipeline import BundleWriter, Counters, PagePacker, WritePool, prefetch
 from janai.worker.planning import (
     UTF8_NAME_FLAG,
@@ -43,13 +44,8 @@ from janai.worker.planning import (
 from janai.worker.selection import PagePolicy
 from janai.worker.transforms import (
     GRAY_SAMPLE,
-    auto_levels,
-    final_resize,
     gray_stats,
-    is_long_strip,
     predict_size,
-    standard_resize,
-    to_grayscale,
 )
 
 
@@ -245,64 +241,28 @@ def run_job(job: dict) -> int:
     counters = Counters()
     clock = time.perf_counter()
 
-    def process_array(image, src_name: str):
-        """Full single-image pipeline: (uint8 array, is_gray, model name, info)."""
-        oh, ow = runtime.hwc(image)[:2]
-        gray, score, coloured = gray_stats(image, threshold, colour_percent)
-        if force_gray:
-            gray = True
-        by_rule = policy.excluded(gray, oh, ow)
-        by_size = skip_long and is_long_strip(ow, oh, long_max_side, long_aspect, long_pixels)
-        if by_rule or by_size:
-            why = "excluded by a rule" if by_rule else "long strip"
-            log(f"{src_name}: {ow}x{oh} {why}, passed through without upscaling", "warn")
-            return (
-                image,
-                gray,
-                "",
-                {
-                    "w": ow,
-                    "h": oh,
-                    "src_w": ow,
-                    "src_h": oh,
-                    "score": round(score, 2),
-                    "colour": round(coloured, 2),
-                    "tile": 0,
-                    "passthrough": True,
-                },
-            )
-        if gray and do_gray:
-            image = to_grayscale(image)
-        if pre_h and oh > pre_h:
-            image = standard_resize(image, (round(ow * pre_h / oh), pre_h))
-
-        pick, want_levels = policy.plan(gray, oh, ow)
-        model = cache.get(pick["path"]) if pick else None
-
-        image = auto_levels(image) if want_levels and image.ndim == 2 else runtime.normalize(image)
-        CTRL.gate()
-        planner.note_model(model, pick["name"] if pick else "")
-        tile = planner.choose(model, image)
-        planner.before()
-        image = upscale_array(ctx, image, model, tile)
-        planner.retiled(tiling.tile_actually_used())
-        planner.after()
-        image = runtime.to_uint8(image, normalized=True)
-        image = final_resize(image, t_scale, t_w, t_h, ow, oh, gray and do_gray)
-        out_h, out_w = runtime.hwc(image)[:2]
-        info = {
-            "w": out_w,
-            "h": out_h,
-            "src_w": ow,
-            "src_h": oh,
-            "score": round(score, 2),
-            "colour": round(coloured, 2),
-            "tile": planner.last,
-        }
-        return image, gray, (pick["name"] if pick else ""), info
-
-    def encode_now(image) -> bytes:
-        return imageio.encode(image, fid, opts, caps)
+    # The pixel path gets the collaborators it needs and nothing else: it never
+    # sees `counters`, `total` or the output paths, so a change to how a page is
+    # reported cannot reach how a page is upscaled.
+    encoder = PageEncoder(fid=fid, opts=opts, caps=caps)
+    pager = PageWorker(
+        policy=policy,
+        cache=cache,
+        planner=planner,
+        ctx=ctx,
+        threshold=threshold,
+        colour_percent=colour_percent,
+        force_gray=force_gray,
+        do_gray=do_gray,
+        skip_long=skip_long,
+        long_max_side=long_max_side,
+        long_aspect=long_aspect,
+        long_pixels=long_pixels,
+        pre_h=pre_h,
+        t_scale=t_scale,
+        t_w=t_w,
+        t_h=t_h,
+    )
 
     def write_result(
         index: int,
@@ -322,7 +282,7 @@ def run_job(job: dict) -> int:
             too_long = path_too_long(dest)
             if too_long:
                 raise OSError(too_long)
-            data = encode_now(image)
+            data = encoder.encode(image)
             # `dest` stays plain: it is what the `file` event below reports.
             target = io_path(dest)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -395,7 +355,7 @@ def run_job(job: dict) -> int:
             ms=int(elapsed * 1000),
         )
 
-    bundle = BundleWriter(encode_now, on_bundle_page, on_bundle_fail, on_bundle_done)
+    bundle = BundleWriter(encoder.encode, on_bundle_page, on_bundle_fail, on_bundle_done)
 
     def handle_archive(index: int, unit: dict) -> None:
         src: Path = unit["path"]
@@ -468,7 +428,7 @@ def run_job(job: dict) -> int:
                 # the GPU idled through all of it. The packer overlaps it with
                 # the next page's upscale, with one worker so pages still land
                 # in the order they were read.
-                packer = PagePacker(zf, encode_now, on_page_fail)
+                packer = PagePacker(zf, encoder.encode, on_page_fail)
                 try:
                     for k, name in enumerate(names, 1):
                         if CTRL.cancelled:
@@ -484,7 +444,7 @@ def run_job(job: dict) -> int:
                         )
                         try:
                             raw = reader(name)
-                            image, _gray, _model, _info = process_array(
+                            image, _gray, _model, _info = pager.run(
                                 imageio.read_image_bytes(raw, name), name
                             )
                             # Re-encoding collapses distinct source names onto
@@ -630,7 +590,7 @@ def run_job(job: dict) -> int:
                 taken.add(path_key(dest))
             started = time.perf_counter()
             try:
-                image, gray, model_name, info = process_array(payload, src.name)
+                image, gray, model_name, info = pager.run(payload, src.name)
             except Exception as exc:
                 if CTRL.cancelled:
                     raise Cancelled from exc
