@@ -47,7 +47,7 @@ sys.path.insert(0, str(ROOT / "src"))
 if isinstance(sys.stdout, io.TextIOWrapper):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from janai.worker.job import open_archive
+from janai.worker.archives import open_archive
 
 PAGE = b"\x89PNG\r\n\x1a\nnot decoded by this gate"
 APPLE_DOUBLE = b"\x00\x05\x16\x07resource fork, not an image"
