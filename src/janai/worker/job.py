@@ -26,7 +26,7 @@ from janai.worker import devices, imageio, runtime, tiling
 from janai.worker.control import CTRL, Cancelled
 from janai.worker.environment import MODELS_DIR
 from janai.worker.events import emit, log
-from janai.worker.models import ModelCache, choose_model, list_models, upscale_array
+from janai.worker.models import ModelCache, list_models, upscale_array
 from janai.worker.pipeline import BundleWriter, Counters, PagePacker, WritePool, prefetch
 from janai.worker.planning import (
     UTF8_NAME_FLAG,
@@ -40,6 +40,7 @@ from janai.worker.planning import (
     resolve_out,
     unique_path,
 )
+from janai.worker.selection import PagePolicy
 from janai.worker.transforms import (
     GRAY_SAMPLE,
     auto_levels,
@@ -143,7 +144,6 @@ def run_job(job: dict) -> int:
     model_colour = str(ups.get("model") or "auto")
     model_gray = str(ups.get("model_gray") or "auto") if do_gray else model_colour
     rule_set = _rules.RuleSet.from_dicts(ups.get("rules"))
-    rules_logged: set[str] = set()
     overwrite = bool(outp.get("overwrite", False))
     pattern = str(outp.get("pattern") or "{name}")
     keep_structure = bool(outp.get("keep_structure", True))
@@ -166,75 +166,22 @@ def run_job(job: dict) -> int:
 
     tasks = build_tasks(units, out_dir, keep_structure, container_id)
 
-    def page_factor(oh: int, ow: int) -> float:
-        """The factor this page will actually be upscaled by."""
-        if mode == "height" and t_h:
-            return t_h / max(1, oh)
-        if mode == "width" and t_w:
-            return t_w / max(1, ow)
-        if mode == "fit" and t_w and t_h:
-            return min(t_w / max(1, ow), t_h / max(1, oh))
-        return t_scale
-
-    def resolve_model(wanted: str, gray: bool, oh: int, factor: float) -> dict | None:
-        """Turn a model name (or "auto") into an installed model."""
-        name = (wanted or "").strip()
-        if name.lower() in ("", "auto"):
-            return choose_model(models, gray, oh, factor)
-        found = next((m for m in models if m["name"] == name or m["path"] == name), None)
-        if found is None:
-            found = choose_model(models, gray, oh, factor)
-            if found:
-                log(f"model {name} not found, using {found['name']}", "warn")
-        return found
-
-    def note_rule(hit) -> None:
-        """Say which rule fired, once per distinct rule, not once per page."""
-        text = hit.describe()
-        if text not in rules_logged:
-            rules_logged.add(text)
-            log(f"rule: {text}")
-
-    def page_plan(gray: bool, oh: int, ow: int) -> tuple[dict | None, bool]:
-        """What happens to one page: which model, and whether to auto-level.
-
-        A matching rule decides. A page no rule claims falls back to the
-        built-in picker, which is exactly what the shipped table's catch-all
-        rows do explicitly.
-        """
-        is_gray = force_gray or (gray and do_gray)
-        levels = do_levels
-        if not models:
-            return None, levels
-        factor = page_factor(oh, ow)
-        hit = rule_set.match(gray=is_gray, width=ow, height=oh, scale=factor)
-        if hit is None:
-            wanted = model_gray if is_gray else model_colour
-        else:
-            note_rule(hit)
-            wanted = hit.model
-            if hit.auto_levels is not None:
-                levels = bool(hit.auto_levels)
-        return resolve_model(wanted, is_gray, oh, factor), levels
-
-    def pick_model(gray: bool, oh: int, ow: int) -> dict | None:
-        """Model only; the dry run reports models without touching levels."""
-        return page_plan(gray, oh, ow)[0]
-
-    def excluded_by_rule(gray: bool, oh: int, ow: int) -> bool:
-        """A rule can exclude a page from the model instead of choosing one.
-
-        The row's page-size condition decides which pages skip upscaling and
-        are only re-encoded - the same outcome as the old long-strip switch,
-        with the sizes visible and editable instead of hardcoded.
-        """
-        hit = rule_set.match(
-            gray=force_gray or (gray and do_gray),
-            width=ow,
-            height=oh,
-            scale=page_factor(oh, ow),
-        )
-        return hit is not None and str(getattr(hit, "action", "upscale")) == "passthrough"
+    # One policy object for the whole job: it owns the "which model, levelled or
+    # not, or excluded entirely" decision, and the dry run below is handed its
+    # bound methods so a plan cannot disagree with the run it predicts.
+    policy = PagePolicy(
+        models=models,
+        rule_set=rule_set,
+        model_colour=model_colour,
+        model_gray=model_gray,
+        mode=mode,
+        t_scale=t_scale,
+        t_w=t_w,
+        t_h=t_h,
+        force_gray=force_gray,
+        do_gray=do_gray,
+        do_levels=do_levels,
+    )
 
     if dry:
         return dry_run(
@@ -248,8 +195,8 @@ def run_job(job: dict) -> int:
                 keep_structure=keep_structure,
                 threshold=threshold,
                 colour_percent=colour_percent,
-                pick_model=pick_model,
-                excluded=excluded_by_rule,
+                pick_model=policy.model,
+                excluded=policy.excluded,
                 t_scale=t_scale,
                 t_w=t_w,
                 t_h=t_h,
@@ -304,7 +251,7 @@ def run_job(job: dict) -> int:
         gray, score, coloured = gray_stats(image, threshold, colour_percent)
         if force_gray:
             gray = True
-        by_rule = excluded_by_rule(gray, oh, ow)
+        by_rule = policy.excluded(gray, oh, ow)
         by_size = skip_long and is_long_strip(ow, oh, long_max_side, long_aspect, long_pixels)
         if by_rule or by_size:
             why = "excluded by a rule" if by_rule else "long strip"
@@ -329,7 +276,7 @@ def run_job(job: dict) -> int:
         if pre_h and oh > pre_h:
             image = standard_resize(image, (round(ow * pre_h / oh), pre_h))
 
-        pick, want_levels = page_plan(gray, oh, ow)
+        pick, want_levels = policy.plan(gray, oh, ow)
         model = cache.get(pick["path"]) if pick else None
 
         image = auto_levels(image) if want_levels and image.ndim == 2 else runtime.normalize(image)
