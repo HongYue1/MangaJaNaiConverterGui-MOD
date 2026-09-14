@@ -56,6 +56,11 @@ APPLE_DOUBLE_PREFIX = "._"
 """Prefix of an AppleDouble sidecar. It carries the page's own extension but
 holds a resource fork, so an extension test alone cannot tell them apart."""
 
+UTF8_NAME_FLAG = 0x800
+"""Zip general-purpose bit that declares an entry name to be UTF-8. Older comic
+tooling omits it, and the zip spec then says cp437, which is what `zipfile`
+decodes - turning a Japanese page name into mojibake."""
+
 RESERVED_CHARS = re.compile(r'[<>:"/\\|?*]')
 """Characters Windows rejects in a file name; replaced with an underscore."""
 
@@ -94,6 +99,26 @@ def is_page_entry(name: str) -> bool:
     if base.startswith(APPLE_DOUBLE_PREFIX):
         return False
     return Path(base).suffix.lower() in IMAGE_EXTS
+
+
+def decode_entry_name(name: str, *, utf8_flag: bool) -> str:
+    """Undo the cp437 decode `zipfile` applies to an unflagged entry name.
+
+    Self-proving, which is why it is safe to do unasked: cp437 maps all 256 byte
+    values, so re-encoding recovers the bytes exactly as stored, and those bytes
+    only decode as UTF-8 if they really were UTF-8. A wrong guess raises instead
+    of renaming a page.
+
+    Names in some other codepage (Shift-JIS, GBK) are therefore left exactly as
+    they are - ugly but readable. Recovering those needs a detector or a
+    user-set codepage, and guessing would rename pages silently.
+    """
+    if utf8_flag:
+        return name
+    try:
+        return name.encode("cp437").decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return name
 
 
 def gather_units(inp: dict) -> list[dict]:

@@ -23,7 +23,9 @@ from janai.worker.events import emit, log
 from janai.worker.models import ModelCache, choose_model, list_models, upscale_array
 from janai.worker.pipeline import BundleWriter, Counters, WritePool, prefetch
 from janai.worker.planning import (
+    UTF8_NAME_FLAG,
     build_tasks,
+    decode_entry_name,
     format_name,
     gather_units,
     is_page_entry,
@@ -872,16 +874,36 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
 
 
 def open_archive(path: Path):
-    """Return (sorted entry names, read(name) -> bytes) or None."""
+    """Return (sorted page names, read(name) -> bytes) or None.
+
+    The names are *display* names: an entry stored without the UTF-8 flag is
+    recovered here, and the reader maps that name back to the raw key it is
+    stored under. That split matters because `handle_archive` writes the name it
+    is handed into the output CBZ, so a mojibake name would become permanent.
+    """
     ext = path.suffix.lower()
     if ext in (".zip", ".cbz"):
         zf = ZipFile(path)
-        names = sorted((n for n in zf.namelist() if is_page_entry(n)), key=natural_key)
-        return names, zf.read
+        pages = [info for info in zf.infolist() if is_page_entry(info.filename)]
+        stored = {info.filename for info in pages}
+        raw_by_name: dict[str, str] = {}
+        names: list[str] = []
+        for info in pages:
+            name = decode_entry_name(info.filename, utf8_flag=bool(info.flag_bits & UTF8_NAME_FLAG))
+            # A recovery must never hide another entry: if the recovered form is
+            # already spoken for, keep the raw name so no page is lost.
+            if name != info.filename and (name in stored or name in raw_by_name):
+                name = info.filename
+            names.append(name)
+            raw_by_name[name] = info.filename
+        names.sort(key=natural_key)
+        return names, lambda name: zf.read(raw_by_name.get(name, name))
     if ext in (".rar", ".cbr"):
         try:
             import rarfile
 
+            # rarfile decodes entry names itself, so there is no cp437 decode to
+            # undo on this path.
             rf = rarfile.RarFile(str(path))
             names = sorted((n for n in rf.namelist() if is_page_entry(n)), key=natural_key)
             return names, rf.read

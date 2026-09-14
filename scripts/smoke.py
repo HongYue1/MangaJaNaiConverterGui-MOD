@@ -187,6 +187,36 @@ def page_entries() -> None:
         assert planning.is_page_entry(name), f"{name} was over-filtered"
 
 
+def entry_name_decoding() -> None:
+    """An entry name stored without the UTF-8 flag must be recovered, or left.
+
+    `zipfile` decodes an unflagged name as cp437, so a Japanese page name
+    arrives as mojibake - and `handle_archive` writes the name it is handed into
+    the output CBZ, which makes the corruption permanent. The recovery is
+    self-proving (cp437 maps all 256 bytes, and they only decode as UTF-8 if
+    they were UTF-8), so it must fire for real UTF-8 and never on a guess. The
+    live proof is ``scripts/archname_check.py``, which needs the imaging stack.
+    """
+    true_name = "\u7b2c01\u8a71.jpg"
+
+    kept = planning.decode_entry_name(true_name, utf8_flag=True)
+    assert kept == true_name, "a flagged name was rewritten"
+
+    mojibake = true_name.encode("utf-8").decode("cp437")
+    recovered = planning.decode_entry_name(mojibake, utf8_flag=False)
+    assert recovered == true_name, "unflagged UTF-8 was not recovered"
+
+    # Shift-JIS needs a detector or a user-set codepage; guessing would rename
+    # pages silently, so it has to survive untouched.
+    sjis = true_name.encode("shift_jis").decode("cp437")
+    left = planning.decode_entry_name(sjis, utf8_flag=False)
+    assert left == sjis, "a name that is not UTF-8 was altered on a guess"
+
+    for flag in (True, False):
+        plain = planning.decode_entry_name("page-001.jpg", utf8_flag=flag)
+        assert plain == "page-001.jpg", "an ASCII name was rewritten"
+
+
 def rule_engine() -> None:
     installed = INSTALLED
     working = rules.default_working_set(installed)
@@ -294,6 +324,7 @@ def main() -> int:
     check("path resolution", path_resolution)
     check("output naming", output_naming)
     check("page entries", page_entries)
+    check("entry name decoding", entry_name_decoding)
     check("rule engine", rule_engine)
     check("presets", preset_round_trip)
     if FAILED:
