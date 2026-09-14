@@ -16,6 +16,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -492,6 +493,52 @@ def oom_recovery_frees_without_copying() -> None:
     _assert_oom_arm_frees(src.read_text(encoding="utf-8"))
 
 
+def _assert_job_payload(job: dict[str, Any]) -> None:
+    """Assert a driver payload carries everything ``worker/job.py`` reads.
+
+    job.py reads ``input``/``output``/``format``/``upscale``/``perf`` off the
+    wire and defaults whatever is missing, so a driver that drops a section
+    does not fail loudly - it quietly runs a different job than the one asked
+    for. The empty ``output.dir`` case (F31) wrote every page into the worker's
+    own folder and still reported success, which is why this is asserted
+    rather than trusted.
+    """
+    for section in ("input", "output", "format", "upscale", "perf"):
+        assert isinstance(job.get(section), dict), f"the payload has no {section} section"
+    assert str(job["input"]["path"]).strip(), "the payload carries an empty input.path"
+    assert str(job["output"]["dir"]).strip(), "the payload carries an empty output.dir"
+    assert job["upscale"].get("rules"), "the payload carries no rules, so no model would run"
+    fid = str(job["format"]["id"])
+    assert fid in formats.FORMATS, f"the payload names an unknown format: {fid}"
+
+
+def headless_driver() -> None:
+    """The driver mirrors the GUI's payload, and never drags Qt in with it.
+
+    Qt is the load-bearing half: ``janai.cli`` reaches the worker through
+    ``janai.app.runner``, so one accidental PySide6 import anywhere in that
+    chain would make the driver unusable on exactly the headless machines that
+    want it. Importing it here and inspecting ``sys.modules`` is the only way
+    to catch that, because the import itself is what does the damage.
+    """
+    from janai import cli
+    from janai.app.state import defaults
+
+    assert "PySide6" not in sys.modules, "importing the headless driver pulled in Qt"
+    data = defaults()
+    # The shipped table is seeded from the installed models, so use the fixed
+    # set above rather than whatever this machine happens to have.
+    data["upscale"]["rules"] = rules.default_dicts(INSTALLED)
+    src = ROOT / "src"
+    out = cli.resolve_out_dir(src, "", data)
+    assert out == src / "upscaled", f"the output folder resolved to {out}"
+    job = cli.build_job(data, src, out, None)
+    _assert_job_payload(job)
+    assert set(job) == {"input", "output", "format", "upscale", "perf"}, sorted(job)
+    plan = cli.build_job(data, src, out, None, dry=True)
+    assert plan.get("dry_run") is True, "plan must ask the worker for a dry run"
+
+
 def main() -> int:
     print(f"smoke test in {ROOT}")
     check("output formats", output_formats)
@@ -504,6 +551,7 @@ def main() -> int:
     check("orphan bytecode", orphan_bytecode)
     check("vram budget clamp", vram_budget_clamp)
     check("oom recovery", oom_recovery_frees_without_copying)
+    check("headless driver", headless_driver)
     check("page entries", page_entries)
     check("entry name decoding", entry_name_decoding)
     check("rule engine", rule_engine)

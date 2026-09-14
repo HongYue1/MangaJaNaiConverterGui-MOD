@@ -44,7 +44,7 @@ the tree:
   CI only byte-compiled it. **It was deleted** rather than kept as a misleading
   second copy of the pipeline; recover it from git history if ever needed.
 - **There is no monolith left to split.** `worker/worker.py` went 3264 → 168
-  lines and `app/window.py` 2764 → 811; the package is now 52 files. Do not
+  lines and `app/window.py` 2764 → 811; the package is now 53 files. Do not
   "restore" the old protocol or the old pipeline classes into `src/janai/`.
 
 ## Architecture map
@@ -60,6 +60,7 @@ setup.sh                   the Linux equivalent
 
 src/janai/
   __main__.py              `python -m janai` opens the interface
+  cli.py                   headless driver: run/plan/probe/where, no Qt (see Headless driver)
   app/                     the Qt interface (stdlib + PySide6 only)
     main.py                GUI entry point; inserts src/ on sys.path when run as a file
     window.py              the main window: four cards, a footer, and the run log
@@ -220,6 +221,39 @@ worker.py --hold [--device cuda:0] [--hold-interval 15.0]
                                             keep a GPU context awake until stdin says stop
 ```
 
+### Headless driver (`janai`)
+
+`src/janai/cli.py` is the supported way to convert without the GUI, and the
+thing to drive from a test or a script instead of hand-writing a `job.json`.
+
+```
+janai run   SRC [-o OUT] [options]   convert
+janai plan  SRC [...]                dry run: report every page, write nothing
+janai probe                          devices, encoders and installed models
+janai where                          the locations this install resolves to
+```
+
+It **reuses** the GUI's machinery rather than copying it: the payload is built
+from the same `settings.json` through `app/state.py`, and the worker is spawned,
+cancelled and drained through the same `app/runner.py`. *Why:* a second spawn
+path, or a second author of the job schema, is exactly how a driver drifts from
+the app it is meant to mirror. The direction is `cli → app → core`, no cycle.
+
+Flags worth knowing: `--print-job` prints the resolved payload and runs nothing;
+`--json` passes the worker's event lines through untouched (that stream is the
+contract — do not reformat it into a weaker second one); `--cancel-after
+SECONDS` requests a stop mid-job, which is how cancellation is tested without a
+human at a terminal. Exit codes: `0` finished, `1` the job reported a failure,
+`2` bad usage, `130` cancelled.
+
+Use the console script after an editable install, or run it straight from a
+checkout — it bootstraps `sys.path` exactly as `worker.py` does:
+
+```bash
+$PY src/janai/cli.py where
+$PY src/janai/cli.py plan DIR --print-job
+```
+
 ## Invariants an agent must not "clean up"
 
 Each line is a real bug that was already paid for once. The gate that proves it
@@ -271,6 +305,11 @@ is named where one exists.
     The GUI fabricates one with `ok=False` if the process dies without it, so
     never drop or conditionalise the real one. (`scripts/donepages_check.py`,
     `scripts/counters_check.py`)
+11. **The headless driver's import chain stays Qt-free.** `janai.cli` →
+    `app.runner` → `app.state` must pull in no PySide6. *Why:* the driver exists
+    for machines with no display, so importing Qt for a job that never opens a
+    window would defeat it. (`scripts/smoke.py`'s `headless driver` leg imports
+    the driver and fails if `PySide6` lands in `sys.modules`)
 
 ## Verification
 
@@ -289,6 +328,9 @@ $PY scripts/plannercheck.py             # tile-planner regressions, no GPU neede
 QT_QPA_PLATFORM=offscreen $PY scripts/uicheck.py   # builds the real window and measures it
 $PY scripts/selftest.py                 # end-to-end; needs torch, pyvips and a model
 $PY scripts/bench.py                    # per-file timing across tile settings (GPU + an image)
+
+$PY src/janai/cli.py where                  # headless driver: what this install resolves to
+$PY src/janai/cli.py plan DIR --print-job   # the exact payload the GUI would build
 ```
 
 **Run the gates by glob, not from a list** — new ones get added and a

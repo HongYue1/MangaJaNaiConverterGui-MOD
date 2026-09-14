@@ -37,6 +37,9 @@ dependencies = ["PySide6-Essentials>=6.7,<7"]
 dev = ["ruff>=0.6"]
 
 [project.scripts]
+# The headless driver: the supported way to run or script a conversion without
+# the GUI, and what tests drive instead of hand-writing a job.json.
+janai = "janai.cli:main"
 janai-upscaler = "janai.app.main:main"
 janai-worker = "janai.worker.worker:main"
 
@@ -123,6 +126,9 @@ ignore = [
 # its imports legitimately follow executable statements. Only the entry file
 # does this; the modules it imports are ordinary modules.
 "src/janai/worker/worker.py" = ["E402"]
+# The headless driver is the other entry file, and bootstraps sys.path for the
+# same reason: it can be run as a plain file path from a checkout.
+"src/janai/cli.py" = ["E402"]
 # `Cancelled` is control flow rather than an error, so it keeps its name. The
 # ignore lives with the class, not with whoever imports it.
 "src/janai/worker/control.py" = ["N818"]
