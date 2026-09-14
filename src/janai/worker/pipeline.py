@@ -14,7 +14,9 @@ Three rules hold this together and each one paid for itself in a bug:
   consumer can never wait on a producer that died, and cancelling tears the pool
   down without waiting for queued reads. A consumer that leaves early also
   drains the queue on its way out: the pump can be parked inside ``put``, where
-  setting ``stop`` cannot reach it.
+  setting ``stop`` cannot reach it. ``WritePool.submit`` waits for a write slot
+  in bounded steps for the same reason: a slot is only freed by an in-flight
+  encode, so an unbounded wait would make Cancel arrive a page late.
 * **Shared tallies are locked.** ``Counters`` guards the job's page totals,
   because the write pool, the pack thread and the main loop all bump them and
   ``d[key] += 1`` is a load, an add and a store rather than one step.
@@ -33,12 +35,17 @@ from queue import Empty, Queue
 from typing import Any
 from zipfile import ZIP_STORED, ZipFile
 
-from janai.worker.control import CTRL
+from janai.worker.control import CTRL, Cancelled
 from janai.worker.events import log
 
 WRITE_SLOTS_PER_WORKER = 2
 """Writes allowed to queue per write thread: enough that the GPU never waits on
 disk, few enough that finished pages cannot pile up in memory."""
+
+SLOT_WAIT_SECONDS = 0.05
+"""How long ``submit`` waits for a write slot before re-checking the abort flag.
+Matches the pause poll: short enough that Cancel is not made to wait out an
+encode, long enough not to spin a core."""
 
 PACK_SLOTS = 4
 """Pages allowed to queue for the single packing thread, for the same reason."""
@@ -88,7 +95,17 @@ class WritePool:
         self.lock = threading.Lock()
 
     def submit(self, fn, *args) -> None:
-        self.slots.acquire()
+        """Queue a write, waiting for a slot but never waiting past a cancel.
+
+        A free slot is taken even when cancelled, so a cancel never abandons a
+        page that was about to be written anyway; only the *blocking* path
+        aborts. It raises ``Cancelled`` instead of dropping the page quietly so
+        there is still exactly one abort path: the producer unwinds into
+        ``run_job``'s teardown, as it does at every other gate.
+        """
+        while not self.slots.acquire(timeout=SLOT_WAIT_SECONDS):
+            if CTRL.cancelled:
+                raise Cancelled
 
         def task():
             try:
