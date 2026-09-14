@@ -73,12 +73,22 @@ from janai.worker.planning import (
     resolve_out,
     unique_path,
 )
+from janai.worker.transforms import (
+    GRAY_SAMPLE,
+    auto_levels,
+    final_resize,
+    gray_stats,
+    is_long_strip,
+    predict_size,
+    standard_resize,
+    to_grayscale,
+)
 
 # --------------------------------------------------------------------------- #
 # heavy handles, mirrored from janai.worker.runtime
 #
 # Transitional scaffolding for the Phase 1 split. runtime.py owns the lazy
-# imports now, but the pixel, job and profiling code that reads these
+# imports now, but the job and profiling code that reads these
 # names still lives further down this file. Each extraction repoints one group
 # of consumers at ``runtime.<name>``; the last one deletes this block.
 #
@@ -90,26 +100,16 @@ np = None
 cv2 = None
 pyvips = None
 torch = None
-_PILImage = None
-_ImageCms = None
-_ImageFilter = None
-_cx_resize = None
-_ResizeFilter = None
 _normalize = None
 _to_uint8 = None
-_get_h_w_c = None
 TILE: dict[str, Any] = {}
 
 
 def _mirror_runtime() -> None:
     """Publish runtime's loaded handles under the names this file still uses."""
-    global np, cv2, pyvips, torch, _PILImage, _ImageCms, _ImageFilter
-    global _cx_resize, _ResizeFilter, _normalize, _to_uint8, _get_h_w_c
-    global TILE
+    global np, cv2, pyvips, torch, _normalize, _to_uint8, TILE
     np, cv2, pyvips, torch = runtime.np, runtime.cv2, runtime.pyvips, runtime.torch
-    _PILImage, _ImageCms, _ImageFilter = runtime.PILImage, runtime.ImageCms, runtime.ImageFilter
-    _cx_resize, _ResizeFilter = runtime.cx_resize, runtime.ResizeFilter
-    _normalize, _to_uint8, _get_h_w_c = runtime.normalize, runtime.to_uint8, runtime.get_h_w_c
+    _normalize, _to_uint8 = runtime.normalize, runtime.to_uint8
     TILE = runtime.TILE
 
 
@@ -183,199 +183,8 @@ def do_probe(models_dir: Path) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# image pipeline
-# --------------------------------------------------------------------------- #
-def standard_resize(image, new_size: tuple[int, int]):
-    out = image.astype(np.float32) / 255.0
-    out = _cx_resize(out, new_size, _ResizeFilter.Lanczos, False)
-    out = (out * 255).round().astype(np.uint8)
-    if _get_h_w_c(image)[2] == 1 and out.ndim == 3:
-        out = np.squeeze(out, axis=-1)
-    return out
-
-
-def dotgain20_resize(image, new_size: tuple[int, int]):
-    pair = imageio.icc_transforms()
-    if not pair:
-        return standard_resize(image, new_size)
-    to_gamma, to_dotgain = pair
-    h = _get_h_w_c(image)[0]
-    size_ratio = h / max(1, new_size[1])
-    blur = (1 / size_ratio - 1) / 3.5
-    if blur >= 0.1:
-        blur = min(blur, 250)
-    pil = _PILImage.fromarray(image, mode="L")
-    pil = pil.filter(_ImageFilter.GaussianBlur(radius=blur))
-    pil = _ImageCms.applyTransform(pil, to_gamma, False)
-    out = np.array(pil).astype(np.float32) / 255.0
-    out = _cx_resize(out, new_size, _ResizeFilter.CubicCatrom, False)
-    out = (out * 255).round().astype(np.uint8)
-    pil = _PILImage.fromarray(out[:, :, 0] if out.ndim == 3 else out, mode="L")
-    return np.array(_ImageCms.applyTransform(pil, to_dotgain, False))
-
-
-def image_resize(image, new_size: tuple[int, int], is_gray: bool):
-    if is_gray and image.ndim == 2:
-        return dotgain20_resize(image, new_size)
-    return standard_resize(image, new_size)
-
-
-GRAY_SAMPLE = 768  # long edge of the copy the grayscale test looks at
-
-
-def gray_stats(image, threshold: float, colour_percent: float = 0.25) -> tuple[bool, float, float]:
-    """(is_grayscale, mean colour excess, percent of clearly coloured pixels).
-
-    Three things were wrong with the inherited test:
-
-    * it averaged over every pixel of a full size page, which is slow on an
-      8000 px scan and, worse, blind to a small but unmistakably coloured area:
-      a title logo or one colour panel averages away to nothing, the page is
-      called gray, and the colour is then squashed out of it for good;
-    * it summed the three channel differences in uint8, so a genuinely colourful
-      pixel could wrap past 255 back down to a small number and count as gray;
-    * scanner and JPEG chroma noise pushed clean gray pages over the threshold,
-      which is what made the setting feel arbitrary.
-
-    So: measure on an area-averaged sample (fast, and averaging is what removes
-    the chroma noise), sum in int32, and refuse to call a page gray when a
-    non-trivial share of its pixels are properly coloured. The mean-excess
-    metric and its ``threshold / 12`` comparison are kept, so an existing
-    threshold still means the same thing.
-    """
-    h, w, c = runtime.hwc(image)
-    if c == 1:
-        return True, 0.0, 0.0
-
-    sample = image[:, :, :3]
-    long_edge = max(h, w)
-    if long_edge > GRAY_SAMPLE:
-        factor = GRAY_SAMPLE / float(long_edge)
-        sample = cv2.resize(
-            sample, (max(1, int(w * factor)), max(1, int(h * factor))), interpolation=cv2.INTER_AREA
-        )
-
-    b, g, r = cv2.split(sample)
-    t = int(max(0, min(255, round(threshold))))
-    excess = (
-        cv2.subtract(cv2.absdiff(r, g), t).astype(np.int32)
-        + cv2.subtract(cv2.absdiff(r, b), t).astype(np.int32)
-        + cv2.subtract(cv2.absdiff(g, b), t).astype(np.int32)
-    )
-    high = cv2.max(cv2.max(r, g), b)
-    low = cv2.min(cv2.min(r, g), b)
-    keep = ~np.logical_or(high == 0, low == 255)  # skip pure black / pure white
-    kept = int(np.count_nonzero(keep))
-    if kept == 0:
-        return False, 0.0, 0.0
-
-    mean_excess = float(excess[keep].sum()) / (kept * 3)
-    spread = cv2.subtract(high, low)
-    coloured = int(np.count_nonzero(np.logical_and(keep, spread > max(8, 2 * t))))
-    percent = 100.0 * coloured / kept
-    is_gray = mean_excess <= threshold / 12 and percent <= max(0.0, colour_percent)
-    return is_gray, mean_excess, percent
-
-
-def to_grayscale(image):
-    c = _get_h_w_c(image)[2]
-    if c == 3:
-        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    if c == 4:
-        return cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
-    return image
-
-
-def auto_levels(image):
-    """Black/white point stretch based on histogram peaks (grayscale only)."""
-    pil = _PILImage.fromarray(image).convert("L")
-    hist = pil.histogram()
-
-    black, peak = 0, hist[0]
-    for i in range(1, 31):
-        if hist[i] > peak:
-            peak, black = hist[i], i
-    run = 0
-    for i in range(31, 256):
-        if hist[i] > peak:
-            run, peak, black = 0, hist[i], i
-        elif hist[i] < peak:
-            run += 1
-            if run > 1:
-                break
-
-    white, peak = 255, hist[255]
-    for i in range(254, 224, -1):
-        if hist[i] > peak:
-            peak, white = hist[i], i
-    run = 0
-    for i in range(223, -1, -1):
-        if hist[i] > peak:
-            run, peak, white = 0, hist[i], i
-        elif hist[i] < peak:
-            run += 1
-            if run > 1:
-                break
-
-    if white <= black:
-        return _normalize(image)
-    arr = np.array(pil).astype("float32")
-    arr = np.maximum(arr - black, 0) / (white - black)
-    return np.clip(arr, 0, 1)
-
-
-def final_resize(image, scale: float, width: int, height: int, ow: int, oh: int, is_gray: bool):
-    if height and width:
-        if height / oh < width / ow:
-            width = 0
-        else:
-            height = 0
-    h, w = _get_h_w_c(image)[:2]
-    if height:
-        if h != height:
-            return image_resize(image, (round(w * height / h), height), is_gray)
-    elif width:
-        if w != width:
-            return image_resize(image, (width, round(h * width / w)), is_gray)
-    else:
-        target = round(oh * scale)
-        if h != target:
-            return image_resize(image, (round(w * target / h), target), is_gray)
-    return image
-
-
-def is_long_strip(w: int, h: int, max_side: int, min_aspect: float, min_pixels: int) -> bool:
-    """True for webtoon-style mega strips that may be passed through untouched.
-
-    Adopted from the other fork's SkipLargeLong* settings, with one deliberate
-    change: the pixel clause also requires the long aspect, so an ordinary
-    large page (a 4000x2400 spread, say) is never mistaken for a strip.
-    """
-    if w <= 0 or h <= 0:
-        return False
-    aspect = max(w, h) / max(1, min(w, h))
-    if aspect < min_aspect:
-        return False
-    return max(w, h) >= max_side or (w * h) >= min_pixels
-
-
-# --------------------------------------------------------------------------- #
 # job execution
 # --------------------------------------------------------------------------- #
-def predict_size(ow: int, oh: int, t_scale: float, t_w: int, t_h: int) -> tuple[int, int]:
-    """The size final_resize() lands on, without touching a pixel."""
-    if t_w and t_h:  # fit: whichever side runs out first wins
-        if t_h / max(1, oh) < t_w / max(1, ow):
-            t_w = 0
-        else:
-            t_h = 0
-    if t_h:
-        return max(1, round(ow * t_h / max(1, oh))), t_h
-    if t_w:
-        return t_w, max(1, round(oh * t_w / max(1, ow)))
-    return max(1, round(ow * t_scale)), max(1, round(oh * t_scale))
-
-
 def probe_image(path: Path, threshold: float, colour_percent: float):
     """(width, height, is_gray, score, coloured percent) without a full decode.
 
