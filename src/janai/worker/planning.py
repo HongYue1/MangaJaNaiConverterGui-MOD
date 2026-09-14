@@ -24,30 +24,8 @@ from collections.abc import Container
 from pathlib import Path
 from typing import Any
 
+from janai.core.filetypes import ARCHIVE_EXTS, IMAGE_EXTS
 from janai.core.formats import packs_archive
-
-IMAGE_EXTS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".jfif",
-    ".webp",
-    ".avif",
-    ".jxl",
-    ".bmp",
-    ".tif",
-    ".tiff",
-    ".gif",
-    ".heic",
-    ".heif",
-    ".ppm",
-    ".pgm",
-}
-"""Extensions treated as a page. Also filters entries when listing an archive,
-so a chapter's cover.txt or ComicInfo.xml is never fed to the model."""
-
-ARCHIVE_EXTS = {".zip", ".cbz", ".rar", ".cbr"}
-"""Extensions treated as a container of pages rather than a page."""
 
 MACOS_METADATA_DIR = "__MACOSX"
 """Folder macOS adds when it writes a zip; everything under it is metadata."""

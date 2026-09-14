@@ -24,10 +24,9 @@ from pathlib import Path
 from typing import Any
 
 from janai.core import rules as _rules
+from janai.core.paths import MODEL_EXTS
 from janai.worker import runtime, tiling
 from janai.worker.events import log
-
-MODEL_EXTS = {".pth", ".safetensors", ".pt", ".ckpt"}
 
 
 def list_models(models_dir: Path) -> list[dict]:

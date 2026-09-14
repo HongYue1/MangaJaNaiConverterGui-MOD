@@ -12,6 +12,7 @@ encoders, GPU) use ``scripts/selftest.py`` with the backend interpreter.
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -20,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from janai.app import runlog
-from janai.core import displays, formats, paths, presets, rules
+from janai.core import displays, filetypes, formats, paths, presets, rules
 from janai.worker import planning
 
 FAILED: list[str] = []
@@ -157,6 +158,60 @@ def output_naming() -> None:
         one = planning.format_name(pattern, jpg, 1, 9)
         two = planning.format_name(pattern, png, 2, 9)
         assert one == two, f"{pattern} no longer collides, so the reservation proves nothing"
+
+
+def extension_sets() -> None:
+    """One definition of what counts as a page, read by both processes.
+
+    The GUI's pre-run scan and the worker's real walk used to keep private
+    copies of the same suffix sets - identical only by luck, with nothing
+    holding them in step (F6/F11). Adding a format on one side would have made
+    the preview promise "12 images" and the run convert 11.
+
+    Two guards, because neither alone is enough: the importers must resolve to
+    the *same object* (a re-added local copy changes identity), and no module
+    may quietly grow a second definition somewhere the identity check does not
+    look. The source scan covers the GUI without importing Qt, so this stays
+    dependency-free.
+    """
+    # Read the module namespace rather than attributes: after the move these
+    # names are imports, not part of planning's public surface, so attribute
+    # access is a re-export error under no_implicit_reexport - and it is that
+    # namespace a re-added private copy would rebind anyway.
+    worker_ns = vars(planning)
+    assert worker_ns["IMAGE_EXTS"] is filetypes.IMAGE_EXTS, (
+        "the worker no longer reads the shared page-extension set"
+    )
+    assert worker_ns["ARCHIVE_EXTS"] is filetypes.ARCHIVE_EXTS, (
+        "the worker no longer reads the shared archive-extension set"
+    )
+
+    pkg = ROOT / "src" / "janai"
+    owners = {
+        "IMAGE_EXTS": pkg / "core" / "filetypes.py",
+        "ARCHIVE_EXTS": pkg / "core" / "filetypes.py",
+        "MODEL_EXTS": pkg / "core" / "paths.py",
+    }
+    for name, owner in owners.items():
+        pattern = rf"^{name}\s*="
+        # Without this the scan below would pass vacuously if a set were renamed.
+        assert re.search(pattern, owner.read_text(encoding="utf-8"), re.MULTILINE), (
+            f"{owner.name} no longer defines {name}, so the scan proves nothing"
+        )
+        for path in sorted(pkg.rglob("*.py")):
+            if path == owner:
+                continue
+            if re.search(pattern, path.read_text(encoding="utf-8"), re.MULTILINE):
+                raise AssertionError(f"{path.relative_to(ROOT)} defines a second {name}")
+
+    reads = {
+        pkg / "app" / "input_panel.py": "from janai.core.filetypes import",
+        pkg / "worker" / "models.py": "from janai.core.paths import MODEL_EXTS",
+    }
+    for path, line in reads.items():
+        assert line in path.read_text(encoding="utf-8"), (
+            f"{path.relative_to(ROOT)} no longer reads the shared set"
+        )
 
 
 def page_entries() -> None:
@@ -323,6 +378,7 @@ def main() -> int:
     check("log formatting", log_formatting)
     check("path resolution", path_resolution)
     check("output naming", output_naming)
+    check("extension sets", extension_sets)
     check("page entries", page_entries)
     check("entry name decoding", entry_name_decoding)
     check("rule engine", rule_engine)

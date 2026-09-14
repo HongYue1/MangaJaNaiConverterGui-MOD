@@ -7,10 +7,11 @@ freeze the window, so the count is produced off the GUI thread and delivered as
 a synthetic ``scan`` event through ``runner.events`` - the same queue the worker
 process uses, so the window has exactly one place where events arrive.
 
-The extension sets below are the GUI's own copy on purpose. The worker keeps
-its authoritative copies in :mod:`janai.worker.planning`, and importing that
-from the app would drag the worker's environment bootstrap (sys.path and PATH
-side effects) into the GUI process just to preview a file count.
+The page and archive extension sets come from :mod:`janai.core.filetypes`, the
+single definition both processes read. They live in ``core`` because the GUI
+must not import the worker package: the worker's environment bootstrap
+(sys.path and PATH side effects) would follow it into the GUI process just to
+preview a file count.
 
 Mixed into :class:`janai.app.window.MainWindow`, so ``self`` is the window.
 """
@@ -24,31 +25,12 @@ from typing import TYPE_CHECKING
 from PySide6.QtWidgets import QFileDialog
 
 from janai.app.widgets import Card, DropZone, button, checkbox, row
+from janai.core.filetypes import ARCHIVE_EXTS, IMAGE_EXTS
 
 if TYPE_CHECKING:
     from janai.app.surface import WindowSurface as _Base
 else:  # type-only: at runtime the base is object, so the MRO is untouched
     _Base = object
-
-#: What the pre-run scan counts as a page. The worker decides for real.
-IMAGE_EXTS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".jfif",
-    ".webp",
-    ".avif",
-    ".jxl",
-    ".bmp",
-    ".tif",
-    ".tiff",
-    ".gif",
-    ".heic",
-    ".heif",
-    ".ppm",
-    ".pgm",
-}
-ARCHIVE_EXTS = {".zip", ".cbz", ".rar", ".cbr"}
 
 FILE_FILTER = (
     "Images and archives (*.png *.jpg *.jpeg *.jfif *.webp *.avif *.jxl *.bmp "
