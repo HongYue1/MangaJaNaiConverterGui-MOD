@@ -39,6 +39,7 @@ selftest.py all hardcode it, as does the janai-worker console script.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import sys
 import traceback
@@ -93,9 +94,19 @@ def main(argv: list[str] | None = None) -> int:
 
     runtime.install_warning_filters()  # before torch is imported anywhere in this process
 
+    # UTF-8 on stdout is part of the wire format - the GUI decodes these lines
+    # as JSONL - and errors="replace" on stdin is what keeps one undecodable
+    # byte from killing the control reader (F3, asserted by stdin_check.py).
+    # typeshed types sys.stdout/sys.stdin as TextIO, which has no
+    # reconfigure(); only the concrete TextIOWrapper does. Narrowing is
+    # behaviour-identical to the bare call it replaces: a stream that is not a
+    # TextIOWrapper raised AttributeError straight into the except below, so it
+    # was already a silent skip - but now it is checkable instead of hidden.
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace", newline="\n")
-        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+        if isinstance(sys.stdout, io.TextIOWrapper):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace", newline="\n")
+        if isinstance(sys.stdin, io.TextIOWrapper):
+            sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 

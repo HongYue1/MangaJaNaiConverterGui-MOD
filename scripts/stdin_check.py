@@ -26,6 +26,7 @@ stdin reconfiguration in ``worker.main()``.
 
 from __future__ import annotations
 
+import io
 import sys
 import threading
 import time
@@ -62,6 +63,14 @@ def pump_alive() -> bool:
 def main() -> int:
     production = "--reconfigure" in sys.argv
     if production:
+        # Only the concrete TextIOWrapper has reconfigure(); typeshed types
+        # sys.stdin as TextIO. If stdin is anything else this gate cannot
+        # reproduce worker.main()'s configuration, and the cancel assertion
+        # below would pass for the wrong reason - so fail loudly instead of
+        # silently skipping the thing under test.
+        if not isinstance(sys.stdin, io.TextIOWrapper):
+            print("FAIL  stdin is not a TextIOWrapper; cannot reproduce production config")
+            return 1
         sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     print(f"stdin encoding={sys.stdin.encoding} errors={sys.stdin.errors}", flush=True)
 

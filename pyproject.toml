@@ -237,13 +237,16 @@ disable_error_code = ["assignment"]
 # instead of an untyped lambda. No override survives for janai.worker.devices,
 # janai.worker.models or janai.worker.job.
 
-# Cause 2b - `sys.stdin/stdout.reconfigure`. typeshed declares both as TextIO,
-# which has no reconfigure; the real objects are TextIOWrapper. Every call site
-# is already inside try/except because a re-parented stream genuinely can lack
-# it, so the runtime behaviour is correct and only the annotation is wrong.
-[[tool.mypy.overrides]]
-module = ["janai.worker.worker", "stdin_check", "archname_check"]
-disable_error_code = ["union-attr"]
+# Cause 2b is FIXED, and in the code rather than here: worker.main(),
+# stdin_check and archname_check narrow with `isinstance(s, io.TextIOWrapper)`
+# before calling reconfigure(). typeshed declares sys.stdin/stdout as TextIO,
+# which has no reconfigure; only the concrete wrapper does. The narrowing is
+# behaviour-identical in the worker - the calls already sat inside
+# try/except Exception, so a non-wrapper stream raised AttributeError and was
+# swallowed, i.e. it was already a silent skip - while stdin_check fails loudly
+# instead, because a gate that silently skips the thing it asserts is worse
+# than no gate. Do not restore a union-attr override here: it would also hide
+# every other union-attr mistake in those three modules.
 
 # Cause 4 - gate-script residue (7 findings). These appeared only once
 # `mypy_path = "src"` let the checker see the real janai types instead of Any,

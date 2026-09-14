@@ -27,6 +27,7 @@ Run: backend/python/python.exe scripts/archname_check.py
 
 from __future__ import annotations
 
+import io
 import sys
 import tempfile
 from pathlib import Path
@@ -36,8 +37,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 # The Windows console is cp1252 and these fixtures carry non-ASCII names; the
-# worker reconfigures its own stdout the same way (worker.py:97).
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+# worker reconfigures its own stdout the same way (see worker.main(), named
+# rather than cited by line so the reference cannot go stale). Only the
+# concrete TextIOWrapper has reconfigure(); typeshed types sys.stdout as
+# TextIO, so narrow instead of suppressing the error.
+if isinstance(sys.stdout, io.TextIOWrapper):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from janai.worker.job import open_archive
 
