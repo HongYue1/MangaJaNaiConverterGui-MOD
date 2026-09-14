@@ -1,4 +1,5 @@
-"""Live proof for what `open_archive` calls a page (F22), and what it calls it (F21).
+"""Live proof for what `open_archive` calls a page (F22), what it calls it (F21),
+and that it closes what it opens (F19).
 
 `archive_check.py` covers what happens to pages once they are found; this gate
 covers the step before that - deciding which zip entries ARE pages. It needs no
@@ -30,6 +31,8 @@ from __future__ import annotations
 import io
 import sys
 import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from zipfile import ZIP_STORED, ZipFile
 
@@ -83,11 +86,16 @@ def legacy_zip(path: Path, raw_name: bytes, extra: dict[str, bytes] | None = Non
     path.write_bytes(blob.replace(placeholder.encode("ascii"), raw_name))
 
 
-def opened(path: Path):
-    """Return (names, reader) as `handle_archive` receives them."""
-    opener = open_archive(path)
-    assert opener is not None, f"open_archive refused {path.name}"
-    return list(opener[0]), opener[1]
+@contextmanager
+def opened(path: Path) -> Iterator[tuple[list[str], Callable[[str], bytes]]]:
+    """Yield (names, reader) as `pack_archive` receives them.
+
+    A context manager because `open_archive` is one: the reader is only valid
+    while the archive is open, so every assertion about it belongs inside.
+    """
+    with open_archive(path) as pair:
+        assert pair is not None, f"open_archive refused {path.name}"
+        yield list(pair[0]), pair[1]
 
 
 def reads(reader, name: str) -> bool:
@@ -99,8 +107,8 @@ def reads(reader, name: str) -> bool:
 
 
 def listed(path: Path) -> list[str]:
-    opener = open_archive(path)
-    return list(opener[0]) if opener else []
+    with open_archive(path) as pair:
+        return list(pair[0]) if pair else []
 
 
 def main() -> int:
@@ -175,38 +183,67 @@ def main() -> int:
         print("\n[names] a flagged non-ASCII name is passed through untouched")
         flagged = base / "Flagged.cbz"
         build(flagged, {true_name: PAGE})
-        names, reader = opened(flagged)
-        check("the flagged name is unchanged", names == [true_name], repr(names))
-        check("and it reads back", reads(reader, true_name))
+        with opened(flagged) as (names, reader):
+            check("the flagged name is unchanged", names == [true_name], repr(names))
+            check("and it reads back", reads(reader, true_name))
 
         print("\n[names] UTF-8 bytes with the flag unset are recovered")
         noflag = base / "NoFlag.cbz"
         legacy_zip(noflag, true_name.encode("utf-8"))
-        names, reader = opened(noflag)
-        check("the true name is recovered, not mojibake", names == [true_name], repr(names))
-        check("the recovered name is what the reader accepts", reads(reader, true_name))
+        with opened(noflag) as (names, reader):
+            check("the true name is recovered, not mojibake", names == [true_name], repr(names))
+            check("the recovered name is what the reader accepts", reads(reader, true_name))
 
         print("\n[names] bytes that are not UTF-8 are left alone")
         sjis = base / "Sjis.cbz"
         legacy_zip(sjis, true_name.encode("shift_jis"))
-        names, reader = opened(sjis)
-        check("the entry is still listed", len(names) == 1, repr(names))
-        check("it is still readable", reads(reader, names[0]) if names else False)
-        check(
-            "it is not mangled with replacement characters",
-            all("\ufffd" not in n for n in names),
-            repr(names),
-        )
+        with opened(sjis) as (names, reader):
+            check("the entry is still listed", len(names) == 1, repr(names))
+            check("it is still readable", reads(reader, names[0]) if names else False)
+            check(
+                "it is not mangled with replacement characters",
+                all("\ufffd" not in n for n in names),
+                repr(names),
+            )
 
         print("\n[names] a recovery that would collide must not drop a page")
         clash = base / "Clash.cbz"
         legacy_zip(clash, true_name.encode("utf-8"), extra={true_name: PAGE})
-        names, reader = opened(clash)
-        check("both entries survive", len(names) == 2, repr(names))
-        check("their names stay distinct", len(set(names)) == 2, repr(names))
-        check("both are readable", all(reads(reader, n) for n in names))
+        with opened(clash) as (names, reader):
+            check("both entries survive", len(names) == 2, repr(names))
+            check("their names stay distinct", len(set(names)) == 2, repr(names))
+            check("both are readable", all(reads(reader, n) for n in names))
 
-        reader = None  # drop the archive handle before cleanup (F19)
+        print("\n[close] the archive is released when the caller is done (F19)")
+        held = base / "Held.cbz"
+        build(held, {"page-001.jpg": PAGE})
+        cm = open_archive(held)
+        check(
+            "open_archive is a context manager",
+            hasattr(cm, "__enter__") and hasattr(cm, "__exit__"),
+            f"got {type(cm).__name__}",
+        )
+        if hasattr(cm, "__enter__"):
+            with cm as pair:
+                check("it yields the (names, reader) pair", pair is not None and len(pair) == 2)
+                held_reader = pair[1] if pair else None
+                check("a page reads inside the block", reads(held_reader, "page-001.jpg"))
+            check(
+                "the reader is dead once the block exits",
+                not reads(held_reader, "page-001.jpg"),
+            )
+            # The user-visible half: Windows refuses to move or delete a file
+            # while a handle on it is open, so a leaked archive locks the very
+            # source the user just converted.
+            moved = base / "Held-moved.cbz"
+            try:
+                held.rename(moved)
+                lock = ""
+            except OSError as exc:
+                lock = f"{type(exc).__name__}: {exc}"
+            check("the source file can be renamed afterwards", moved.exists(), lock)
+            with open_archive(base / "Nope.7z") as unsupported:
+                check("an unsupported container yields None", unsupported is None)
 
     print(f"\n{len(failures)} FAILED: {failures}" if failures else "\nALL PASS")
     return 1 if failures else 0

@@ -6,12 +6,16 @@ than in a module of its own, because the two have to agree on output paths, on
 entry names inside a bundle and on predicted sizes. When they drift the user is
 shown a plan the run will not honour, which is worse than no plan at all.
 
-``open_archive`` is the read side of a CBZ/CBR source, and both paths use it.
+``open_archive`` is the read side of a CBZ/CBR source, and both paths use it. It
+is a context manager because pages are read *through* the still-open archive.
 """
 
 import time
 import traceback
+from collections.abc import Callable, Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
+from typing import Any
 from zipfile import ZIP_STORED, ZipFile
 
 from janai.core import rules as _rules
@@ -456,12 +460,32 @@ def run_job(job: dict) -> int:
             return
         io_path(dest).parent.mkdir(parents=True, exist_ok=True)
         started = time.perf_counter()
-        opener = open_archive(src)
-        if opener is None:
-            counters.bump("failed")
-            emit("file", i=index, total=total, path=str(src), error="unsupported archive")
-            return
-        names, reader = opener
+        # Scoped to exactly the span that reads from it: `pack_archive` pulls
+        # every page through `reader` and nothing touches the source after it
+        # returns, so the handle is released the moment packing is done.
+        with open_archive(src) as opened:
+            if opened is None:
+                counters.bump("failed")
+                emit("file", i=index, total=total, path=str(src), error="unsupported archive")
+                return
+            names, reader = opened
+            pack_archive(index, src, dest, names, reader, started)
+
+    def pack_archive(
+        index: int,
+        src: Path,
+        dest: Path,
+        names: list[str],
+        reader: ArchiveReader,
+        started: float,
+    ) -> None:
+        """Encode every page of one already-open archive into its output CBZ.
+
+        Split from `handle_archive` so the source can be held by a `with` for
+        precisely as long as it is read: this half is the only code that calls
+        `reader`. The failure accounting lives here because the `.part` file it
+        has to clean up is created here too.
+        """
         tmp = dest.with_suffix(".cbz.part")
         # `dest` and `tmp` stay plain: they are what the `file` event and the
         # log carry. Only these two handles cross into the file system, so only
@@ -826,8 +850,8 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
             dest = resolve_out(unit, out_dir, pattern, ".cbz", cfg["keep_structure"], index, total)
             entries = 0
             try:
-                opener = open_archive(src)
-                entries = len(opener[0]) if opener else 0
+                with open_archive(src) as opened:
+                    entries = len(opened[0]) if opened else 0
             except Exception as exc:
                 log(f"{src.name}: {exc}", "warn")
             exists = dest.exists() and not overwrite
@@ -962,47 +986,86 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
     return 0 if counters["failed"] == 0 else 1
 
 
-def open_archive(path: Path):
-    """Return (sorted page names, read(name) -> bytes) or None.
+ArchiveReader = Callable[[str], bytes]
+"""Reads one entry of an open archive, by the display name it was listed under."""
+
+OpenedArchive = tuple[list[str], ArchiveReader]
+
+
+def _open_rar(path: Path) -> tuple[Any, list[str]] | None:
+    """Open a RAR source and list its pages, or report why it cannot be read.
+
+    Typed `Any` because rarfile ships no stubs and is an optional, lazily
+    imported dependency -- the import itself is the usual failure here.
+    """
+    try:
+        import rarfile
+
+        # rarfile decodes entry names itself, so there is no cp437 decode to
+        # undo on this path.
+        rf = rarfile.RarFile(str(path))
+        return rf, sorted((n for n in rf.namelist() if is_page_entry(n)), key=natural_key)
+    except Exception as exc:
+        log(f"cannot open {path.name}: {exc} (RAR needs unrar/7z on PATH)", "warn")
+        return None
+
+
+@contextmanager
+def open_archive(path: Path) -> Iterator[OpenedArchive | None]:
+    """Yield (sorted page names, read(name) -> bytes) for a CBZ/CBR, or None.
+
+    A context manager because the caller reads entries *through* the archive:
+    it has to stay open for the whole page loop and be closed exactly once
+    afterwards. This used to hand back a reader bound to an open ZipFile and
+    leave closing to refcounting, which is a CPython implementation detail
+    rather than a guarantee -- and until it closes, Windows holds a lock on the
+    source the user just converted, so it cannot be moved or deleted.
 
     The names are *display* names: an entry stored without the UTF-8 flag is
     recovered here, and the reader maps that name back to the raw key it is
-    stored under. That split matters because `handle_archive` writes the name it
+    stored under. That split matters because `pack_archive` writes the name it
     is handed into the output CBZ, so a mojibake name would become permanent.
+
+    An unsupported or unopenable container yields None; both callers report
+    that themselves. No `yield` may sit inside the RAR branch's `except
+    Exception`: a generator that caught the consumer's exception there would
+    swallow it, turning a failed chapter into a silent success.
     """
     ext = path.suffix.lower()
     if ext in (".zip", ".cbz"):
-        zf = ZipFile(path)
-        pages = [info for info in zf.infolist() if is_page_entry(info.filename)]
-        stored = {info.filename for info in pages}
-        raw_by_name: dict[str, str] = {}
-        names: list[str] = []
-        for info in pages:
-            name = decode_entry_name(info.filename, utf8_flag=bool(info.flag_bits & UTF8_NAME_FLAG))
-            # A recovery must never hide another entry: if the recovered form is
-            # already spoken for, keep the raw name so no page is lost.
-            if name != info.filename and (name in stored or name in raw_by_name):
-                name = info.filename
-            names.append(name)
-            raw_by_name[name] = info.filename
-        names.sort(key=natural_key)
+        with ZipFile(path) as zf:
+            pages = [info for info in zf.infolist() if is_page_entry(info.filename)]
+            stored = {info.filename for info in pages}
+            raw_by_name: dict[str, str] = {}
+            names: list[str] = []
+            for info in pages:
+                name = decode_entry_name(
+                    info.filename, utf8_flag=bool(info.flag_bits & UTF8_NAME_FLAG)
+                )
+                # A recovery must never hide another entry: if the recovered form is
+                # already spoken for, keep the raw name so no page is lost.
+                if name != info.filename and (name in stored or name in raw_by_name):
+                    name = info.filename
+                names.append(name)
+                raw_by_name[name] = info.filename
+            names.sort(key=natural_key)
 
-        def read_zip(name: str) -> bytes:
-            # Maps the display name back to the raw key the entry is stored
-            # under; unrecovered names map to themselves.
-            return zf.read(raw_by_name.get(name, name))
+            def read_zip(name: str) -> bytes:
+                # Maps the display name back to the raw key the entry is stored
+                # under; unrecovered names map to themselves.
+                return zf.read(raw_by_name.get(name, name))
 
-        return names, read_zip
+            yield names, read_zip
+        return
     if ext in (".rar", ".cbr"):
-        try:
-            import rarfile
-
-            # rarfile decodes entry names itself, so there is no cp437 decode to
-            # undo on this path.
-            rf = rarfile.RarFile(str(path))
-            names = sorted((n for n in rf.namelist() if is_page_entry(n)), key=natural_key)
-            return names, rf.read
-        except Exception as exc:
-            log(f"cannot open {path.name}: {exc} (RAR needs unrar/7z on PATH)", "warn")
-            return None
-    return None
+        rar = _open_rar(path)
+        if rar is None:
+            yield None
+            return
+        rf, rar_names = rar
+        # closing() rather than `with rf`: close() is RarFile's documented API
+        # in every version, while the context-manager protocol is not.
+        with closing(rf):
+            yield rar_names, rf.read
+        return
+    yield None
