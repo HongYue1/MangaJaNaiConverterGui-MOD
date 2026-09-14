@@ -32,7 +32,6 @@ import argparse
 import json
 import os
 import platform
-import re
 import sys
 import threading
 import time
@@ -63,6 +62,7 @@ from janai.worker.control import CTRL, Cancelled
 # import, which is why nothing below may be reordered above it.
 from janai.worker.environment import MODELS_DIR, PATHS, ROOT
 from janai.worker.events import emit, log
+from janai.worker.models import ModelCache, choose_model, list_models, upscale_array
 from janai.worker.pipeline import BundleWriter, WritePool, prefetch
 from janai.worker.planning import (
     IMAGE_EXTS,
@@ -74,14 +74,11 @@ from janai.worker.planning import (
     unique_path,
 )
 
-MODEL_EXTS = {".pth", ".safetensors", ".pt", ".ckpt"}
-
-
 # --------------------------------------------------------------------------- #
 # heavy handles, mirrored from janai.worker.runtime
 #
 # Transitional scaffolding for the Phase 1 split. runtime.py owns the lazy
-# imports now, but the pixel, model, tiling and profiling code that reads these
+# imports now, but the pixel, job and profiling code that reads these
 # names still lives further down this file. Each extraction repoints one group
 # of consumers at ``runtime.<name>``; the last one deletes this block.
 #
@@ -101,8 +98,6 @@ _ResizeFilter = None
 _normalize = None
 _to_uint8 = None
 _get_h_w_c = None
-_upscale_image_node = None
-_load_model_node = None
 TILE: dict[str, Any] = {}
 
 
@@ -110,12 +105,11 @@ def _mirror_runtime() -> None:
     """Publish runtime's loaded handles under the names this file still uses."""
     global np, cv2, pyvips, torch, _PILImage, _ImageCms, _ImageFilter
     global _cx_resize, _ResizeFilter, _normalize, _to_uint8, _get_h_w_c
-    global _upscale_image_node, _load_model_node, TILE
+    global TILE
     np, cv2, pyvips, torch = runtime.np, runtime.cv2, runtime.pyvips, runtime.torch
     _PILImage, _ImageCms, _ImageFilter = runtime.PILImage, runtime.ImageCms, runtime.ImageFilter
     _cx_resize, _ResizeFilter = runtime.cx_resize, runtime.ResizeFilter
     _normalize, _to_uint8, _get_h_w_c = runtime.normalize, runtime.to_uint8, runtime.get_h_w_c
-    _upscale_image_node, _load_model_node = runtime.upscale_image_node, runtime.load_model_node
     TILE = runtime.TILE
 
 
@@ -130,43 +124,8 @@ def load_backend(perf: dict | None = None) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# model discovery
+# probe report
 # --------------------------------------------------------------------------- #
-def list_models(models_dir: Path) -> list[dict]:
-    if not models_dir.is_dir():
-        return []
-    return [
-        model_info(p)
-        for p in sorted(models_dir.rglob("*"))
-        if p.is_file() and p.suffix.lower() in MODEL_EXTS
-    ]
-
-
-def model_info(p: Path) -> dict:
-    name = p.stem
-    low = name.lower()
-    m = re.match(r"(\d+)x[_\-]", name)
-    scale = int(m.group(1)) if m else 0
-    hm = re.search(r"(\d{3,4})p", low)
-    height = int(hm.group(1)) if hm else 0
-    if "mangajanai" in low:
-        family = "manga"
-    elif "illustrationjanai" in low:
-        family = "illustration"
-    else:
-        family = "other"
-    return {
-        "name": p.name,
-        "path": str(p),
-        "scale": scale,
-        "height": height,
-        "family": family,
-        "denoise": "denoise" in low,
-        "detail": "detail" in low,
-        "fp16": "fp16" in low,
-    }
-
-
 def do_probe(models_dir: Path) -> int:
     info: dict[str, Any] = {
         "root": str(ROOT),
@@ -398,109 +357,6 @@ def is_long_strip(w: int, h: int, max_side: int, min_aspect: float, min_pixels: 
     if aspect < min_aspect:
         return False
     return max(w, h) >= max_side or (w * h) >= min_pixels
-
-
-class ModelCache:
-    def __init__(self, ctx, want_scale: float = 0.0) -> None:
-        self.ctx = ctx
-        # Target factor for plain scale runs, 0 when the target is a width,
-        # height or display fit (there the factor depends on each page).
-        self.want_scale = float(want_scale or 0.0)
-        self._cache: dict[str, Any] = {}
-
-    def get(self, path: str):
-        got = self._cache.get(path)
-        if got is None:
-            loaded = _load_model_node(self.ctx, Path(path))
-            got = loaded[0] if isinstance(loaded, tuple) else loaded
-            self._cache[path] = got
-            scale = getattr(got, "scale", None)
-            log(f"loaded model {Path(path).name} (x{scale or '?'})")
-            # Read off the weights rather than the filename: this is the
-            # authoritative version of the warning the GUI shows from the name.
-            if scale and self.want_scale > 0 and abs(float(scale) - self.want_scale) > 0.01:
-                log(
-                    f"{Path(path).name} is x{scale} but the target is "
-                    f"{self.want_scale:g}x, so every page gets resampled to the "
-                    f"target and loses detail",
-                    "warn",
-                )
-        return got
-
-
-# Upstream's height bands and the colour defaults live with the rules engine,
-# so the shipped default working set and this fallback picker can never drift
-# apart. See janai/core/rules.py.
-GRAY_HEIGHT_BANDS = _rules.GRAY_HEIGHT_BANDS
-GRAY_TOP_BUCKET = _rules.GRAY_TOP_BUCKET
-COLOUR_DEFAULTS = _rules.COLOUR_DEFAULTS
-
-_auto_pick_logged: set[tuple] = set()
-
-
-def gray_bucket(src_h: int) -> int:
-    """The MangaJaNai page-height bucket (1200p, 1300p, ...) for a source height."""
-    for limit, bucket in GRAY_HEIGHT_BANDS:
-        if src_h <= limit:
-            return bucket
-    return GRAY_TOP_BUCKET
-
-
-def choose_model(models: list[dict], is_gray: bool, src_h: int, target_scale: float) -> dict | None:
-    """Resolve "auto" to an installed model, the way the original fork did.
-
-    Gray pages follow upstream's height bands: a 1920px page gets the 1920p
-    model, and the 2x or 4x flavour is chosen from the target scale. Colour
-    pages get the current IllustrationJaNai denoise default for that scale.
-    Both fall back to the nearest installed match rather than failing.
-    """
-    if not models:
-        return None
-    want_scale = 2 if target_scale <= 2.0 else 4
-    want_family = "manga" if is_gray else "illustration"
-    pool = [m for m in models if m["family"] == want_family] or models
-    scaled = [m for m in pool if m["scale"] == want_scale] or pool
-
-    if is_gray:
-        bucket = gray_bucket(src_h)
-        tagged = [m for m in scaled if m["height"]]
-        if tagged:
-            pick = min(tagged, key=lambda m: (abs(m["height"] - bucket), m["height"], m["name"]))
-            why = (
-                f"{bucket}p band for a {src_h}px page"
-                if pick["height"] == bucket
-                else f"{bucket}p band for a {src_h}px page, nearest installed"
-            )
-        else:
-            pick = min(scaled, key=lambda m: m["name"])
-            why = "no height-tagged MangaJaNai model installed"
-    else:
-        wanted = COLOUR_DEFAULTS.get(want_scale, "")
-        pick = next((m for m in scaled if m["name"] == wanted), None)
-        if pick is not None:
-            why = f"default x{want_scale} colour model"
-        else:
-            denoise = [m for m in scaled if m["denoise"]]
-            pick = min(denoise or scaled, key=lambda m: m["name"])
-            why = f"{wanted} not installed, closest match" if wanted else "closest installed match"
-
-    key = (is_gray, want_scale, pick["name"], why)
-    if key not in _auto_pick_logged:
-        _auto_pick_logged.add(key)
-        log(f"auto {'gray' if is_gray else 'colour'} model -> {pick['name']} ({why})")
-    return pick
-
-
-def upscale_array(ctx, image, model, tile):
-    if model is None:
-        return image
-    report = tiling.split_report()
-    if report is not None:
-        report["tile"] = 0
-    result = _upscale_image_node(ctx, image, model, False, 0, tile, 256, False)
-    if runtime.hwc(image)[2] == 1 and result.ndim == 3:
-        result = np.squeeze(result, axis=-1)
-    return result
 
 
 # --------------------------------------------------------------------------- #
