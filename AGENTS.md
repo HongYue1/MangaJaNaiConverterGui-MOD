@@ -44,7 +44,7 @@ the tree:
   CI only byte-compiled it. **It was deleted** rather than kept as a misleading
   second copy of the pipeline; recover it from git history if ever needed.
 - **There is no monolith left to split.** `worker/worker.py` went 3264 → 168
-  lines and `app/window.py` 2764 → 811; the package is now 51 files. Do not
+  lines and `app/window.py` 2764 → 811; the package is now 52 files. Do not
   "restore" the old protocol or the old pipeline classes into `src/janai/`.
 
 ## Architecture map
