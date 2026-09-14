@@ -1,4 +1,4 @@
-"""Live proof for the archive-input path (F9, F10, F13, F23).
+"""Live proof for the archive-input path (F9, F10, F13, F23, F24).
 
 `selftest.py` covers loose files and CBZ *output*; nothing exercises
 `handle_archive`, the CBZ *input* path. These fixtures cover what that code
@@ -6,6 +6,8 @@ is actually responsible for:
 
   Corrupt.cbz    two readable pages and one entry that is not an image
   Collision.cbz  a.jpg and a.png, which re-encode onto the SAME output name
+  Ordered.cbz    six pages stored out of order, under natural-sort-sensitive
+                 names, and more pages than the pack queue is deep
   AllBad.cbz     every entry is a page name whose bytes cannot be decoded
   NoPages.cbz    a valid zip holding no page at all, only a metadata sidecar
 
@@ -18,6 +20,13 @@ Asserted, in the terms the GUI sees:
     stays true and the process still exits 0 - the chosen policy for a page a
     chapter could not keep
   * colliding names produce two distinct entries, not one name written twice
+  * page ORDER survives. Order inside a .cbz is what the reader sees, yet every
+    other check here asserts entry *identity* and de-dup only, so nothing would
+    have caught a reordering. Asserted BEFORE the archive path gained a pack
+    pool, and it has to keep passing after. The fixture is stored scrambled and
+    named so natural order (p2 before p10) differs from lexicographic order, so
+    a stored-order pass-through and a plain sort both fail it; it also holds
+    more pages than PACK_SLOTS, so the producer really does wait for a slot.
   * an archive that could keep NO page publishes nothing at all, counts as a
     failed unit and exits 1 - the far end of the same policy: losing some pages
     is a warning, losing every page is a failure, and an empty .cbz must never
@@ -53,6 +62,11 @@ ALL_BAD_ENTRIES = ("page-001.png", "page-002.png")
 # Not a page name at all, so `is_page_entry` filters it out and the archive is
 # left with nothing to convert - the other way to end up writing no pages.
 NO_PAGE_ENTRY = "ComicInfo.xml"
+# Stored deliberately scrambled, and named so that natural order differs from
+# lexicographic order: a reorder, a plain sort and a stored-order pass-through
+# each produce a different list, so one assertion catches all three.
+ORDERED_STORED = ("p10.png", "p2.png", "p20.png", "p1.png", "p11.png", "p3.png")
+ORDERED_EXPECTED = ["p1.png", "p2.png", "p3.png", "p10.png", "p11.png", "p20.png"]
 
 failures: list[str] = []
 
@@ -154,6 +168,9 @@ def main() -> int:
     with ZipFile(src / "Collision.cbz", "w") as zf:
         zf.writestr("a.jpg", jpg)
         zf.writestr("a.png", png)
+    with ZipFile(src / "Ordered.cbz", "w") as zf:
+        for entry in ORDERED_STORED:
+            zf.writestr(entry, png)
 
     proc, events = run_worker(src, out, tmp / "job.json")
 
@@ -168,11 +185,11 @@ def main() -> int:
 
     check("worker exits 0 despite the bad page", proc.returncode == 0, str(proc.returncode))
     check("done.ok stays true", bool(done.get("ok")), json.dumps(done))
-    check("both archives counted as processed", int(done.get("processed") or 0) == 2)
+    check("every archive counted as processed", int(done.get("processed") or 0) == 3)
     check("no archive counted as failed", int(done.get("failed") or 0) == 0)
     check(
         "one file event per archive, so the progress counter cannot inflate",
-        len(files) == 2,
+        len(files) == 3,
         f"{len(files)} event(s)",
     )
 
@@ -205,7 +222,9 @@ def main() -> int:
 
     produced = {p.stem: p for p in out.rglob("*.cbz")}
     check(
-        "both archives were written", set(produced) == {"Corrupt", "Collision"}, str(set(produced))
+        "every archive was written",
+        set(produced) == {"Corrupt", "Collision", "Ordered"},
+        str(set(produced)),
     )
 
     bad_names = names_in(produced["Corrupt"]) if "Corrupt" in produced else []
@@ -219,6 +238,14 @@ def main() -> int:
         "colliding names were de-duped rather than written twice",
         good_names == ["a.png", "a_2.png"],
         str(good_names),
+    )
+
+    # --- page order, which the reader sees directly (F24) ---
+    ordered_names = names_in(produced["Ordered"]) if "Ordered" in produced else []
+    check(
+        "pages are packed in natural order, not stored or lexicographic order",
+        ordered_names == ORDERED_EXPECTED,
+        str(ordered_names),
     )
     for stem, path in sorted(produced.items()):
         got = [n.lower() for n in names_in(path)]
