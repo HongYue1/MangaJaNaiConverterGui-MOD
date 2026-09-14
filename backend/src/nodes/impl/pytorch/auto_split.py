@@ -142,12 +142,14 @@ def pytorch_auto_split(
         except RuntimeError as e:
             # Check to see if its actually an out of memory error
             if "allocate" in str(e) or "CUDA" in str(e) or "out of memory" in str(e).lower():
-                # Collect garbage (clear memory)
+                # Release the device allocation; do NOT copy the tile back to
+                # the host first. The discarded input_tensor.detach().cpu()
+                # that used to stand here asked for host RAM for a whole tile
+                # at the exact moment an allocation had just failed, and the
+                # except-pass wrapped around it hid anything that went wrong
+                # while cleaning up. del + gc.collect() + cache-empty are what
+                # actually free the accelerator.
                 if input_tensor is not None:
-                    try:
-                        input_tensor.detach().cpu()
-                    except Exception:
-                        pass
                     del input_tensor
                 gc.collect()
                 safe_accelerator_cache_empty(device)

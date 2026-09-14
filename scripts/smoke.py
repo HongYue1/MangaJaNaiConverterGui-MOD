@@ -455,6 +455,43 @@ def vram_budget_clamp() -> None:
     _assert_free_vram_clamp(src.read_text(encoding="utf-8"))
 
 
+def _assert_oom_arm_frees(text: str) -> None:
+    """The OOM recovery arm must free the tile and report what goes wrong.
+
+    Split out from the file read so a negative control can hand this the
+    pre-fix bytes straight from git and prove the guard still bites.
+    """
+    marker = "except RuntimeError as e:"
+    assert marker in text, "the OOM recovery arm has moved; re-point this guard"
+    # Scan code only: the comment at that site names the copy it forbids, and a
+    # guard that reads its own documentation as code miscounts - which is
+    # exactly what _assert_free_vram_clamp did before it was fixed.
+    arm = "\n".join(line.split("#", 1)[0] for line in text.split(marker, 1)[1].splitlines())
+    assert ".cpu()" not in arm, (
+        "the OOM recovery arm copies the tile to host RAM while out of memory"
+    )
+    assert "except Exception" not in arm, (
+        "the OOM recovery arm swallows exceptions raised while freeing memory"
+    )
+    assert "del input_tensor" in arm, "the OOM recovery arm no longer releases the input tensor"
+
+
+def oom_recovery_frees_without_copying() -> None:
+    """OOM recovery must release the tile, not copy it back to host RAM.
+
+    ``input_tensor.detach().cpu()`` asked the host for a whole tile's worth of
+    RAM - and synchronised the device to do it - at the exact moment an
+    allocation had just failed, then threw the result away. ``del`` plus
+    ``gc.collect()`` plus the cache-empty call are what actually free the
+    accelerator. The copy was also wrapped in ``except Exception: pass``, so
+    anything that went wrong while freeing memory vanished silently. Both read
+    like cleanup, which is why they need a guard and not just a comment.
+    """
+    src = ROOT / "backend" / "src" / "nodes" / "impl" / "pytorch" / "auto_split.py"
+    assert src.is_file(), f"the vendored OOM recovery is missing: {src}"
+    _assert_oom_arm_frees(src.read_text(encoding="utf-8"))
+
+
 def main() -> int:
     print(f"smoke test in {ROOT}")
     check("output formats", output_formats)
@@ -466,6 +503,7 @@ def main() -> int:
     check("extension sets", extension_sets)
     check("orphan bytecode", orphan_bytecode)
     check("vram budget clamp", vram_budget_clamp)
+    check("oom recovery", oom_recovery_frees_without_copying)
     check("page entries", page_entries)
     check("entry name decoding", entry_name_decoding)
     check("rule engine", rule_engine)
