@@ -62,24 +62,35 @@ def install_warning_filters() -> None:
 
 # --------------------------------------------------------------------------- #
 # handles, bound by the loaders below
+#
+# The `Any` annotations are the honest type, not laziness. Each name is None
+# until a loader binds the real module, so the *inferred* type is `Any | None`
+# and every `runtime.np.<x>` elsewhere in the worker reads as an error against
+# the None arm - 75 of them across 10 modules, all describing the same
+# deliberate design rather than 75 defects. Declaring the type these names hold
+# once bound keeps the lazy-import rule above intact while letting the rest of
+# the package typecheck, and costs nothing at run time: `from __future__ import
+# annotations` leaves annotations unevaluated. Do not replace this with real
+# imported types - that would import the heavy stack at module import time and
+# break the rule this module exists to enforce.
 # --------------------------------------------------------------------------- #
-np = None
-cv2 = None
-pyvips = None
-torch = None
-PILImage = None
-ImageCms = None
-ImageFilter = None
-cx_resize = None
-ResizeFilter = None
-normalize = None
-to_uint8 = None
-get_h_w_c = None
-upscale_image_node = None
-load_model_node = None
-SettingsParser = None
-NodeContext = None
-ProgressController = None
+np: Any = None
+cv2: Any = None
+pyvips: Any = None
+torch: Any = None
+PILImage: Any = None
+ImageCms: Any = None
+ImageFilter: Any = None
+cx_resize: Any = None
+ResizeFilter: Any = None
+normalize: Any = None
+to_uint8: Any = None
+get_h_w_c: Any = None
+upscale_image_node: Any = None
+load_model_node: Any = None
+SettingsParser: Any = None
+NodeContext: Any = None
+ProgressController: Any = None
 TILE: dict[str, Any] = {}
 _heavy_loaded = False
 

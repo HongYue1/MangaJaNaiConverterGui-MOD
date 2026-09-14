@@ -245,42 +245,28 @@ disable_error_code = ["attr-defined", "has-type", "name-defined"]
 module = ["janai.app.window"]
 disable_error_code = ["assignment"]
 
-# Cause 2 - the deliberate lazy imports (75 findings). runtime.py holds the
-# heavy handles as None until a loader binds them, so a dry run, --probe and
-# the model list never pay for torch, numpy or pyvips; mypy therefore infers
-# `Any | None` at every use. Fixed by annotating those handles, never by
-# importing eagerly. Same reason ruff ignores PLC0415.
-[[tool.mypy.overrides]]
-module = [
-  "janai.worker.transforms",
-  "janai.worker.tiling",
-  "janai.worker.imageio",
-  "janai.worker.runtime",
-  "janai.worker.probe",
-  "janai.worker.profiling",
-  "janai.worker.capabilities",
-]
-disable_error_code = ["union-attr", "misc"]
+# Cause 2 is FIXED. runtime.py's lazy handles now declare the type they hold
+# once a loader binds them, so the 75 findings that one deliberate design
+# produced are gone, and the seven modules that had nothing else wrong need no
+# override at all. What survives below is genuine residue, not a pattern.
 
-# Cause 2, plus residue: devices.py:115 subclasses `runtime.NodeContext`, which
-# is a None-initialised handle rather than a type, and two cleanup sets need
-# annotations.
+# Residue: devices.py:115 subclasses runtime.NodeContext, and the two cleanup
+# sets at 121-122 need element types.
 [[tool.mypy.overrides]]
 module = ["janai.worker.devices"]
-disable_error_code = ["union-attr", "misc", "valid-type", "var-annotated"]
+disable_error_code = ["valid-type", "var-annotated", "misc"]
 
-# Cause 2, plus residue: models.py:144 passes None as a `next()` default that is
-# declared dict.
+# Residue: models.py:144 passes None as a next() default that is declared dict.
 [[tool.mypy.overrides]]
 module = ["janai.worker.models"]
-disable_error_code = ["union-attr", "misc", "arg-type"]
+disable_error_code = ["arg-type"]
 
-# Cause 2, plus two residues worth real triage: job.py:687 indexes a value typed
-# `dict | None`, and job.py:984 hands `str | None` to ZipFile.read, which would
-# be a TypeError if that name were ever None.
+# Residue worth real triage: job.py:687 indexes a value typed `dict | None`, and
+# job.py:984 hands `str | None` to ZipFile.read, which would be a TypeError if
+# that name were ever None.
 [[tool.mypy.overrides]]
 module = ["janai.worker.job"]
-disable_error_code = ["union-attr", "misc", "index", "arg-type"]
+disable_error_code = ["index", "arg-type"]
 
 # Cause 2b - `sys.stdin/stdout.reconfigure`. typeshed declares both as TextIO,
 # which has no reconfigure; the real objects are TextIOWrapper. Every call site
