@@ -35,15 +35,17 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Generator
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any
+from typing import Any, TypeAlias
 from zipfile import ZIP_STORED, ZipFile
 
 from janai.core.fspath import io_path
 from janai.worker.control import CTRL, Cancelled
 from janai.worker.events import log
+from janai.worker.imagetypes import ImageArray
 
 WRITE_SLOTS_PER_WORKER = 2
 """Writes allowed to queue per write thread: enough that the GPU never waits on
@@ -112,10 +114,10 @@ class WritePool:
         self.workers = max(1, int(workers or 1))
         self.pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="write")
         self.slots = threading.Semaphore(self.workers * WRITE_SLOTS_PER_WORKER)
-        self.pending: set = set()
+        self.pending: set[Future[None]] = set()
         self.lock = threading.Lock()
 
-    def submit(self, fn, *args) -> None:
+    def submit(self, fn: Callable[..., object], *args: object) -> None:
         """Queue a write, waiting for a slot but never waiting past a cancel.
 
         A free slot is taken even when cancelled, so a cancel never abandons a
@@ -128,7 +130,7 @@ class WritePool:
             if CTRL.cancelled:
                 raise Cancelled
 
-        def task():
+        def task() -> None:
             try:
                 fn(*args)
             finally:
@@ -143,7 +145,7 @@ class WritePool:
             self.pending.add(fut)
         fut.add_done_callback(self._finished)
 
-    def _finished(self, fut) -> None:
+    def _finished(self, fut: Future[None]) -> None:
         with self.lock:
             self.pending.discard(fut)
 
@@ -172,8 +174,16 @@ PUMP_RELEASE_POLL_SECONDS = 0.05
 """How often that drain re-checks, matching the pause poll: fast enough to feel
 instant, slow enough not to spin a core."""
 
+Unit: TypeAlias = dict[str, Any]
+"""One thing to convert: a loose image, or one entry inside an archive. It is
+built from the JSON job payload, so its keys are the wire's rather than ours."""
 
-def _release_pump(pending: Queue) -> None:
+PrefetchItem: TypeAlias = tuple[Unit, Future[ImageArray]] | None
+"""What the pump hands the consumer: a unit with the future decoding it, or the
+``None`` sentinel that proves the pump reached its ``finally``."""
+
+
+def _release_pump(pending: Queue[PrefetchItem]) -> None:
     """Drain until the pump's sentinel arrives, so the pump thread can exit.
 
     ``stop`` is only tested between items, so setting it cannot wake a thread
@@ -191,8 +201,21 @@ def _release_pump(pending: Queue) -> None:
             continue
 
 
-def prefetch(units: list[dict], workers: int, reader):
-    """Yield (unit, array_or_exception) in order, decoding ahead of the pipeline."""
+def prefetch(
+    units: list[Unit],
+    workers: int,
+    reader: Callable[[Unit], ImageArray],
+) -> Generator[tuple[Unit, ImageArray | Exception], None, None]:
+    """Yield (unit, array_or_exception) in order, decoding ahead of the pipeline.
+
+    Declared as a Generator rather than an Iterator because *closing it is part
+    of the contract*: a consumer that walks away early -- a cancel raises
+    ``Cancelled`` straight out of the ``for`` loop in ``run_images`` -- must be
+    able to call ``close()`` to release the pump thread parked in
+    ``queue.put``. ``prefetch_check`` exercises exactly that, and an
+    ``Iterator`` annotation hides ``close()`` from both the checker and the
+    next reader.
+    """
     workers = max(1, int(workers or 1))
     if workers == 1:
         for u in units:
@@ -207,10 +230,10 @@ def prefetch(units: list[dict], workers: int, reader):
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="read")
     # One slot per reader plus one, so the pump stays exactly one item ahead of
     # the readers rather than racing the whole unit list into memory.
-    queue: Queue = Queue(maxsize=workers + 1)
+    queue: Queue[PrefetchItem] = Queue(maxsize=workers + 1)
     stop = threading.Event()
 
-    def pump():
+    def pump() -> None:
         try:
             for u in units:
                 if stop.is_set() or CTRL.cancelled:
@@ -243,6 +266,15 @@ def prefetch(units: list[dict], workers: int, reader):
             _release_pump(queue)
 
 
+PageMeta: TypeAlias = dict[str, Any]
+"""The per-page record the reporting callbacks pass straight through on its way
+to the `file` and `bundle` events. It comes off the job wire too, so its keys
+are the wire's rather than ours to narrow."""
+
+EncodeFn: TypeAlias = Callable[[ImageArray], bytes]
+"""Encodes one finished page into the bytes stored in the archive."""
+
+
 class BundleWriter:
     """Packs finished pages into one .cbz, off the GPU thread but in order.
 
@@ -253,7 +285,13 @@ class BundleWriter:
     .cbz.part behind rather than a half written chapter.
     """
 
-    def __init__(self, encode_fn, on_page, on_fail, on_done) -> None:
+    def __init__(
+        self,
+        encode_fn: EncodeFn,
+        on_page: Callable[[PageMeta, str, int], None],
+        on_fail: Callable[[PageMeta, str, str], None],
+        on_done: Callable[[str, Path, int, int, float], None],
+    ) -> None:
         self.encode = encode_fn
         self.on_page = on_page
         self.on_fail = on_fail
@@ -263,11 +301,11 @@ class BundleWriter:
         self.key: str | None = None
         self.dest: Path | None = None
         self.tmp: Path | None = None
-        self.zf: Any = None
+        self.zf: ZipFile | None = None
         self.entries = 0
         self.failed = 0
         self.started = 0.0
-        self.futures: list = []
+        self.futures: list[Future[None]] = []
 
     def open(self, key: str, dest: Path) -> None:
         self.close()
@@ -284,7 +322,7 @@ class BundleWriter:
         self.failed = 0
         self.started = time.perf_counter()
 
-    def add(self, name: str, image, meta: dict) -> None:
+    def add(self, name: str, image: ImageArray, meta: PageMeta) -> None:
         """Queue a page for packing, waiting for a slot but never past a cancel.
 
         The same bounded wait as ``WritePool.submit``, for the same reason: only
@@ -371,7 +409,12 @@ class PagePacker:
     caller may only read them once ``close`` has joined every task.
     """
 
-    def __init__(self, zf: Any, encode_fn, on_fail) -> None:
+    def __init__(
+        self,
+        zf: ZipFile,
+        encode_fn: EncodeFn,
+        on_fail: Callable[[str, Exception], None],
+    ) -> None:
         self.zf = zf
         self.encode = encode_fn
         self.on_fail = on_fail
@@ -379,9 +422,9 @@ class PagePacker:
         self.slots = threading.Semaphore(PACK_SLOTS)
         self.written = 0
         self.failed = 0
-        self.futures: list = []
+        self.futures: list[Future[None]] = []
 
-    def add(self, name: str, image) -> None:
+    def add(self, name: str, image: ImageArray) -> None:
         """Queue one page, waiting for a slot but never waiting past a cancel.
 
         The bounded wait of ``WritePool.submit``, for its reason: only an
