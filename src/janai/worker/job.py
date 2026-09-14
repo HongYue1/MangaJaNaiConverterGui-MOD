@@ -14,6 +14,7 @@ import time
 import traceback
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from zipfile import ZIP_STORED, ZipFile
@@ -232,26 +233,26 @@ def run_job(job: dict) -> int:
         return dry_run(
             tasks,
             total,
-            {
-                "out_dir": out_dir,
-                "ext": ext,
-                "pattern": pattern,
-                "overwrite": overwrite,
-                "keep_structure": keep_structure,
-                "threshold": threshold,
-                "colour_percent": colour_percent,
-                "pick_model": pick_model,
-                "excluded": excluded_by_rule,
-                "t_scale": t_scale,
-                "t_w": t_w,
-                "t_h": t_h,
-                "fid": fid,
-                "container": container_id,
-                "model_count": len(models),
-                "device": str(perf.get("device") or ""),
-                "fp16": devices.wants_fp16(perf.get("use_fp16", True)),
-                "tile_label": tile_label,
-            },
+            DryRunPlan(
+                out_dir=out_dir,
+                ext=ext,
+                pattern=pattern,
+                overwrite=overwrite,
+                keep_structure=keep_structure,
+                threshold=threshold,
+                colour_percent=colour_percent,
+                pick_model=pick_model,
+                excluded=excluded_by_rule,
+                t_scale=t_scale,
+                t_w=t_w,
+                t_h=t_h,
+                fid=fid,
+                container=container_id,
+                model_count=len(models),
+                device=str(perf.get("device") or ""),
+                fp16=devices.wants_fp16(perf.get("use_fp16", True)),
+                tile_label=tile_label,
+            ),
         )
 
     io_path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -815,12 +816,55 @@ def probe_image(path: Path, threshold: float, colour_percent: float):
     return w, h, gray, score, coloured
 
 
-def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
+ModelPicker = Callable[[bool, int, int], dict | None]
+"""Chooses the model for one page, from (gray, height, width)."""
+
+PagePredicate = Callable[[bool, int, int], bool]
+"""Answers one yes/no question about a page, from (gray, height, width)."""
+
+
+@dataclass(frozen=True, slots=True)
+class DryRunPlan:
+    """Everything the dry run needs to predict what a real run would produce.
+
+    A dataclass rather than the 18-key dict this used to be: the plan and the
+    run have to agree, and a mistyped or forgotten key surfaced as a
+    ``KeyError`` mid-preview, *after* the ``start`` event had already promised
+    the user a plan. The one call site now either builds a complete plan or
+    fails before anything is emitted.
+
+    ``pick_model`` and ``excluded`` are the real run's own choosers, passed in
+    rather than reimplemented, so a preview cannot name a model the run would
+    not load or predict a size the page would never reach. Frozen because the
+    dry run only ever reads it.
+    """
+
+    out_dir: Path
+    ext: str
+    pattern: str
+    overwrite: bool
+    keep_structure: bool
+    threshold: float
+    colour_percent: float
+    pick_model: ModelPicker
+    excluded: PagePredicate
+    t_scale: float
+    t_w: int
+    t_h: int
+    fid: str
+    container: str
+    model_count: int
+    device: str
+    fp16: bool
+    tile_label: str
+
+
+def dry_run(tasks: list[dict], total: int, plan: DryRunPlan) -> int:
     """Report exactly what a real run would produce, writing nothing at all."""
-    out_dir: Path = cfg["out_dir"]
-    ext: str = cfg["ext"]
-    pattern: str = cfg["pattern"]
-    overwrite: bool = cfg["overwrite"]
+    out_dir = plan.out_dir
+    ext = plan.ext
+    pattern = plan.pattern
+    overwrite = plan.overwrite
     counters = Counters()
     clock = time.perf_counter()
     cancelled = False
@@ -829,12 +873,12 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
         "start",
         total=total,
         out_dir=str(out_dir),
-        device=cfg["device"] or "auto",
-        fp16=cfg["fp16"],
-        tile=cfg["tile_label"],
-        format=cfg["fid"],
-        container=cfg["container"],
-        models=cfg["model_count"],
+        device=plan.device or "auto",
+        fp16=plan.fp16,
+        tile=plan.tile_label,
+        format=plan.fid,
+        container=plan.container,
+        models=plan.model_count,
         dry=True,
         bundles=sum(1 for t in tasks if t["kind"] == "bundle"),
     )
@@ -847,7 +891,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
             unit = task["unit"]
             src: Path = unit["path"]
             index = int(unit.get("index") or 0)
-            dest = resolve_out(unit, out_dir, pattern, ".cbz", cfg["keep_structure"], index, total)
+            dest = resolve_out(unit, out_dir, pattern, ".cbz", plan.keep_structure, index, total)
             entries = 0
             try:
                 with open_archive(src) as opened:
@@ -905,9 +949,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
                 sub_n=len(units) if bundle else 0,
             )
             try:
-                w, h, gray, score, coloured = probe_image(
-                    src, cfg["threshold"], cfg["colour_percent"]
-                )
+                w, h, gray, score, coloured = probe_image(src, plan.threshold, plan.colour_percent)
             except Exception as exc:
                 counters.bump("failed")
                 emit(
@@ -923,8 +965,8 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
             # rule, then let an exclusion overrule the answer. The plan used
             # to name a model the real run would never load, and predict a
             # size the page was never going to reach.
-            pick = cfg["pick_model"](bool(gray), h, w)
-            excluded = bool(cfg.get("excluded") and cfg["excluded"](bool(gray), h, w))
+            pick = plan.pick_model(bool(gray), h, w)
+            excluded = plan.excluded(bool(gray), h, w)
             if excluded:
                 pick = None
                 pw, ph = w, h
@@ -934,7 +976,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
                     "warn",
                 )
             else:
-                pw, ph = predict_size(w, h, cfg["t_scale"], cfg["t_w"], cfg["t_h"])
+                pw, ph = predict_size(w, h, plan.t_scale, plan.t_w, plan.t_h)
             entry = ""
             if bundle and dest_bundle is not None:
                 entry = format_name(pattern, src, position, len(units)) + ext
@@ -944,7 +986,7 @@ def dry_run(tasks: list[dict], total: int, cfg: dict) -> int:
                 dest = dest_bundle
                 exists = False
             else:
-                dest = resolve_out(unit, out_dir, pattern, ext, cfg["keep_structure"], index, total)
+                dest = resolve_out(unit, out_dir, pattern, ext, plan.keep_structure, index, total)
                 # Mirror run_images' reservation, or the plan promises one file
                 # per colliding name while the run writes a de-duped second one.
                 claimed = path_key(dest) in taken
