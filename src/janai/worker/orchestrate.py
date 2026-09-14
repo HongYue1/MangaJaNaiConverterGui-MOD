@@ -36,8 +36,9 @@ from janai.worker import imageio
 from janai.worker.archives import ArchiveReader, open_archive
 from janai.worker.control import CTRL, Cancelled
 from janai.worker.events import emit, log
+from janai.worker.imagetypes import ImageArray
 from janai.worker.page import PageEncoder, PageWorker
-from janai.worker.pipeline import BundleWriter, Counters, PagePacker, WritePool, prefetch
+from janai.worker.pipeline import BundleWriter, Counters, PagePacker, Unit, WritePool, prefetch
 from janai.worker.planning import format_name, path_key, resolve_out, unique_path
 from janai.worker.reporting import JobReporter
 
@@ -82,7 +83,7 @@ class UnitRunner:
     total: int
     io_workers: int
 
-    def handle_archive(self, index: int, unit: dict) -> None:
+    def handle_archive(self, index: int, unit: Unit) -> None:
         src: Path = unit["path"]
         dest = resolve_out(
             unit, self.out_dir, self.pattern, ".cbz", self.keep_structure, index, self.total
@@ -263,18 +264,21 @@ class UnitRunner:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
-    def read_unit(self, unit: dict) -> Any:
+    def read_unit(self, unit: Unit) -> ImageArray | None:
         """Decode one planned unit ahead of the pipeline, on a prefetch thread.
 
         Named for the thing it reads -- a *unit* -- because `pack_archive`
         takes a `reader` parameter that reads *archive entries*. As sibling
         closures in one scope the two names shadowed each other.
+
+        ``None`` means "nothing to decode ahead of time": an archive unit is
+        opened by `handle_archive` on the consuming side instead.
         """
         if unit["kind"] == "image":
             return imageio.read_image(unit["path"])
         return None
 
-    def run_images(self, items: list[dict], into: dict | None) -> None:
+    def run_images(self, items: list[Unit], into: dict[str, Any] | None) -> None:
         """Upscale a run of images, either to loose files or into one archive."""
         count = len(items)
         # `seen` claims entry names inside a bundle; `taken` claims paths on

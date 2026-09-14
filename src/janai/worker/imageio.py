@@ -31,17 +31,18 @@ from janai.core.formats import FORMATS, merged, save_kwargs
 from janai.worker import capabilities, runtime
 from janai.worker.environment import PATHS
 from janai.worker.events import log
+from janai.worker.imagetypes import ImageArray
 
 
 # --------------------------------------------------------------------------- #
 # encoder capability probe
 # --------------------------------------------------------------------------- #
-def encode_capabilities() -> dict:
+def encode_capabilities() -> dict[str, dict[str, Any]]:
     """What this install can really write, checked by encoding a 1x1 image."""
-    caps: dict[str, dict] = {}
+    caps: dict[str, dict[str, Any]] = {}
     probe = runtime.np.zeros((1, 1), dtype=runtime.np.uint8)
     for fid, spec in FORMATS.items():
-        entry = {"ok": False, "via": "", "reason": ""}
+        entry: dict[str, Any] = {"ok": False, "via": "", "reason": ""}
         if capabilities.vips_has(spec.probe):
             try:
                 vips_from_array(probe).write_to_buffer(spec.suffix)
@@ -62,7 +63,11 @@ def encode_capabilities() -> dict:
 # --------------------------------------------------------------------------- #
 # decoding
 # --------------------------------------------------------------------------- #
-def vips_from_array(arr):
+# `-> Any` here and on `_pil_image` is deliberate: both hand back a third-party
+# handle (a pyvips.Image, a PIL.Image) that the checker cannot resolve, because
+# those libraries exist only in backend/python and must not be imported at
+# module scope. There is no real type to spell here, unlike the pages.
+def vips_from_array(arr: ImageArray) -> Any:
     a = runtime.np.ascontiguousarray(arr)
     if a.ndim == 2:
         h, w = a.shape
@@ -77,7 +82,7 @@ def vips_from_array(arr):
     return img
 
 
-def read_image(path: Path):
+def read_image(path: Path) -> ImageArray:
     if path.suffix.lower() == ".jxl" and not capabilities.vips_has("jxlload"):
         return read_jxl_djxl(path)
     return (
@@ -87,7 +92,7 @@ def read_image(path: Path):
     )
 
 
-def read_image_bytes(data: bytes, name: str = ""):
+def read_image_bytes(data: bytes, name: str = "") -> ImageArray:
     if name.lower().endswith(".jxl") and not capabilities.vips_has("jxlload"):
         with tempfile.TemporaryDirectory(prefix="janai-jxl-") as td:
             src = Path(td) / "in.jxl"
@@ -100,7 +105,7 @@ def read_image_bytes(data: bytes, name: str = ""):
     )
 
 
-def read_jxl_djxl(path: Path):
+def read_jxl_djxl(path: Path) -> ImageArray:
     """Decode JPEG XL through djxl, for a libvips built without jxlload."""
     exe = capabilities.find_djxl()
     if not exe:
@@ -126,12 +131,17 @@ def read_jxl_djxl(path: Path):
 # the transforms costs more than the resize that uses them. The empty tuple is a
 # cached "these profiles are missing", so the warning is logged once rather than
 # once per page.
-_icc_pair = None
+_icc_pair: tuple[Any, ...] | None = None
 _icc_warned = False
 
 
-def icc_transforms():
-    """(dotgain20 -> gamma1, gamma1 -> dotgain20) or None when profiles are missing."""
+def icc_transforms() -> tuple[Any, ...]:
+    """(dotgain20 -> gamma1, gamma1 -> dotgain20), or empty when profiles are missing.
+
+    Empty rather than ``None``: ``None`` is the cache's "not looked yet" state
+    above, so the two states must not be spelled the same way. Callers test it
+    for truthiness.
+    """
     global _icc_pair, _icc_warned
     if _icc_pair is not None:
         return _icc_pair
@@ -155,7 +165,7 @@ def icc_transforms():
 # --------------------------------------------------------------------------- #
 # encoding
 # --------------------------------------------------------------------------- #
-def encode(image, fid: str, opts: dict, caps: dict) -> bytes:
+def encode(image: ImageArray, fid: str, opts: dict[str, Any], caps: dict[str, Any]) -> bytes:
     spec = FORMATS[fid]
     cap = caps.get(fid, {})
     via = cap.get("via") or "libvips"
@@ -168,23 +178,27 @@ def encode(image, fid: str, opts: dict, caps: dict) -> bytes:
     raise RuntimeError(f"no encoder available for {spec.label}")
 
 
-def encode_vips(image, fid: str, opts: dict) -> bytes:
+def encode_vips(image: ImageArray, fid: str, opts: dict[str, Any]) -> bytes:
     spec = FORMATS[fid]
     img = vips_from_array(image)
     if img.bands == 4 and fid == "jpeg":
         img = img.flatten(background=255)
     kwargs = save_kwargs(fid, opts)
+    # A declared local, not a cast and not bytes(...): pyvips is unresolvable so
+    # write_to_buffer() is Any, and bytes(buf) would copy every encoded page in
+    # the hot loop just to satisfy the checker.
     try:
-        return img.write_to_buffer(spec.suffix, **kwargs)
+        buf: bytes = img.write_to_buffer(spec.suffix, **kwargs)
     except Exception as exc:
         keep = {
             k: v for k, v in kwargs.items() if k in ("Q", "lossless", "compression", "distance")
         }
         log(f"{spec.label}: {exc}; retrying with {keep or 'defaults'}", "warn")
-        return img.write_to_buffer(spec.suffix, **keep)
+        buf = img.write_to_buffer(spec.suffix, **keep)
+    return buf
 
 
-def _pil_image(image):
+def _pil_image(image: ImageArray) -> Any:
     if image.ndim == 2:
         return runtime.PILImage.fromarray(image, mode="L")
     if image.shape[2] == 4:
@@ -192,7 +206,7 @@ def _pil_image(image):
     return runtime.PILImage.fromarray(image[:, :, :3], mode="RGB")
 
 
-def encode_jxl_pillow(image, opts: dict) -> bytes:
+def encode_jxl_pillow(image: ImageArray, opts: dict[str, Any]) -> bytes:
     import pillow_jxl  # noqa: F401
 
     vals = merged("jxl", opts)
@@ -208,7 +222,7 @@ def encode_jxl_pillow(image, opts: dict) -> bytes:
     return buf.getvalue()
 
 
-def encode_jxl_cjxl(image, opts: dict) -> bytes:
+def encode_jxl_cjxl(image: ImageArray, opts: dict[str, Any]) -> bytes:
     exe = capabilities.find_cjxl()
     if not exe:
         raise RuntimeError("cjxl not found")
