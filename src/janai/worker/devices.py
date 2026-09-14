@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -118,8 +119,8 @@ def make_context(perf: dict):
             self.progress = progress
             self.__settings = settings
             self._storage_dir = storage_dir
-            self.chain_cleanup_fns = set()
-            self.node_cleanup_fns = set()
+            self.chain_cleanup_fns: set[Callable[[], None]] = set()
+            self.node_cleanup_fns: set[Callable[[], None]] = set()
 
         @property
         def aborted(self) -> bool:

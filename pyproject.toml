@@ -228,25 +228,14 @@ disable_error_code = ["assignment"]
 # Cause 2 is FIXED. runtime.py's lazy handles now declare the type they hold
 # once a loader binds them, so the 75 findings that one deliberate design
 # produced are gone, and the seven modules that had nothing else wrong need no
-# override at all. What survives below is genuine residue, not a pattern.
-
-# Residue: devices.py:115 subclasses runtime.NodeContext, and the two cleanup
-# sets at 121-122 need element types.
-[[tool.mypy.overrides]]
-module = ["janai.worker.devices"]
-disable_error_code = ["valid-type", "var-annotated", "misc"]
-
-# Residue: models.py:144 passes None as a next() default that is declared dict.
-[[tool.mypy.overrides]]
-module = ["janai.worker.models"]
-disable_error_code = ["arg-type"]
-
-# Residue worth real triage: job.py:687 indexes a value typed `dict | None`, and
-# job.py:984 hands `str | None` to ZipFile.read, which would be a TypeError if
-# that name were ever None.
-[[tool.mypy.overrides]]
-module = ["janai.worker.job"]
-disable_error_code = ["index", "arg-type"]
+# override at all.
+#
+# Its residue is FIXED too, and in the code rather than here: devices.py gives
+# its two cleanup sets element types, models.py declares `pick` before the
+# branch that fills it, job.py names the no-destination case instead of
+# indexing None two lines later, and open_archive returns a typed reader
+# instead of an untyped lambda. No override survives for janai.worker.devices,
+# janai.worker.models or janai.worker.job.
 
 # Cause 2b - `sys.stdin/stdout.reconfigure`. typeshed declares both as TextIO,
 # which has no reconfigure; the real objects are TextIOWrapper. Every call site

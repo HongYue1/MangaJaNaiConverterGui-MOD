@@ -670,6 +670,11 @@ def run_job(job: dict) -> int:
                     write_result, index, src, dest, image, gray, model_name, info, started
                 )
                 continue
+            if into is None:
+                # A page with neither a bundle nor a destination has nowhere to
+                # go. This used to surface two lines below as "NoneType is not
+                # subscriptable", which named the wrong cause entirely.
+                raise RuntimeError(f"no output destination for {src}")
             entry = format_name(pattern, src, position, count) + ext
             while entry.lower() in seen:
                 entry = f"{entry[: -len(ext)]}_{position}{ext}"
@@ -981,7 +986,13 @@ def open_archive(path: Path):
             names.append(name)
             raw_by_name[name] = info.filename
         names.sort(key=natural_key)
-        return names, lambda name: zf.read(raw_by_name.get(name, name))
+
+        def read_zip(name: str) -> bytes:
+            # Maps the display name back to the raw key the entry is stored
+            # under; unrecovered names map to themselves.
+            return zf.read(raw_by_name.get(name, name))
+
+        return names, read_zip
     if ext in (".rar", ".cbr"):
         try:
             import rarfile

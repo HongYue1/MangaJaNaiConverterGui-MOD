@@ -178,7 +178,7 @@ class TilePlanner:
                 return 0
         if self.device.startswith("xpu"):
             try:
-                xpu = runtime.torch.xpu  # type: ignore[attr-defined]
+                xpu = runtime.torch.xpu
                 free, _total = xpu.mem_get_info(self.device)
                 return int(free)
             except Exception:

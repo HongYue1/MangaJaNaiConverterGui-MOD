@@ -126,6 +126,10 @@ def choose_model(models: list[dict], is_gray: bool, src_h: int, target_scale: fl
     pool = [m for m in models if m["family"] == want_family] or models
     scaled = [m for m in pool if m["scale"] == want_scale] or pool
 
+    # Declared before the branch because the two arms start from different
+    # shapes: the gray arm from min(), which always yields a model, and the
+    # colour arm from next(..., None), which may not.
+    pick: dict | None
     if is_gray:
         bucket = gray_bucket(src_h)
         tagged = [m for m in scaled if m["height"]]
