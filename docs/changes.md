@@ -190,6 +190,10 @@ to a move.
 | One definition of the page/archive extension sets, replacing three copies | `ce44ab9` |
 | The Open dialog's file filter is derived from those sets. It had drifted to 13 of 15 image suffixes, so the picker hid `.ppm`/`.pgm` pages that the pre-run scan counted and the worker converts. | `e77a2f1` |
 | Status label: one monotonic file counter, one writer | `50411f2` |
+| The dry run reads the resume manifest, so previewing a half-finished job reports finished work as skipped instead of listing it as work still to do. `fingerprint()` excludes `dry_run`, so the preview and the real run share one manifest. | `0fdec01` |
+| A bundle consults the manifest, not only whether the destination `.cbz` exists. With overwrite on the existence test never fired, so a run announced `resuming: 1 of 1 already done` and then re-converted and re-packed the page anyway. | `0fdec01` |
+| A single chosen file names its own CBZ in both packaging modes, instead of being named after whichever folder it sat in (`planning.bundle_stem()`; a lone file used to come out as `Downloads.cbz`) | `19e95b8` |
+| A fixed tile size holds the size that fitted after a step-down, instead of re-asking for the size that failed on every page — the vendored `auto_split` absorbs the OOM inside the page, so the cost was one failed pass per page and a log that looked like the setting was ignored | `fe1e239` |
 
 ### 8c. The vendored inference backend
 
@@ -332,9 +336,10 @@ $PY scripts/plannercheck.py
 QT_QPA_PLATFORM=offscreen $PY scripts/uicheck.py
 $PY scripts/selftest.py                   # real GPU, end to end
 $PY scripts/bench.py
-$PY scripts/<name>_check.py               # 14 focused gates: archives, names,
+$PY scripts/<name>_check.py               # 15 focused gates: archives, names,
                                           # output dirs, counters, write pool,
-                                          # bundles, long paths, stdin, ...
+                                          # bundles, solo bundles, resume
+                                          # plans, long paths, stdin, ...
 uvx ruff@0.16.7 check . && uvx ruff@0.16.7 format --check .
 uvx mypy@2.3.1
 ```
@@ -414,4 +419,8 @@ derive the Open dialog filter from them.
 **Follow-up scope** — `0f01da1` headless driver; `7807581` + `af4dd0e` resume;
 `f401d5c` pin pillow and assert the two dependency lists agree; `4d40f8a` mypy
 2.3.1; `77c7049` take the byte-identical dependency bumps, hold the one that is
-not; `f4b84f7` type-check in CI on the platform that ships.
+not; `f4b84f7` type-check in CI on the platform that ships; `50f2cf9` put the
+output subfolder beside a folder input; `b125dae` report the packages this
+install really has; `0fdec01` read the resume manifest in the dry run and for
+whole archives; `19e95b8` name a single file's CBZ after the file; `fe1e239`
+hold the tile size that fitted.

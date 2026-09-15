@@ -43,18 +43,26 @@ than kept alongside the new UI.
 * **Adaptive tiling from measurement.** The machine is profiled once, then tile
   size is chosen from that measurement and held across a chapter instead of
   being re-guessed per image. A fixed tile size and a VRAM budget are still
-  available.
+  available; a fixed size that turns out not to fit steps down once and is then
+  held at the size that did fit, so only the first page pays for the failed
+  attempt, and the fallback is reported once per model rather than per page.
 * **A capability probe at startup.** Devices, encoders, models and library
   versions are detected and reported, so the format list offers only what this
   install can actually write, with a tooltip explaining anything that is off.
 * **JPEG XL output**, added by this fork. `.jxl` is written through libvips,
   `pillow-jxl` or the bundled `cjxl`, whichever this install actually has, and
-  the probe reports which one it used.
+  the probe reports which one it used. The in-process encoders are preferred
+  because `cjxl` has to hand the page over as a temporary PNG: measured here,
+  that detour is 3.6 s of a 9.2 s encode for one 2880x16000 page.
 * **Output packaging**, added by this fork. Loose files, one CBZ per source
   folder or archive, or a single CBZ for the whole run — so a folder of loose
-  pages becomes a ready-to-read archive without a second tool.
+  pages becomes a ready-to-read archive without a second tool. A single chosen
+  file is named after the file in both CBZ modes, never after whichever folder
+  it happened to sit in.
 * **Dry run.** Reports exactly what a run would write — including skips and
-  exclusions — without loading a model.
+  exclusions — without loading a model. It reads the same resume manifest a real
+  run would, so previewing a half-finished job reports finished work as skipped
+  instead of listing it as work still to do.
 * **Resume.** A `.janai-resume.json` manifest is written next to the output and
   keyed by source path, so a run cancelled in the middle of file 11 of 100
   resumes inside file 11, not at file 1. Archives are tracked at page level, not
@@ -184,11 +192,13 @@ long session does not pay repeated warm-up costs.
 
 **Dry run** answers "what would this actually do?" without loading a model —
 useful for checking exclusions, naming and skip behaviour before committing to a
-long run.
+long run. It consults the resume manifest as well, so a preview of an
+interrupted run shows `already done, would skip` against work already finished.
 
 **Resume.** If a run is cancelled or interrupted, starting the same job again
 skips everything already finished, including pages already converted inside a
-half-processed archive.
+half-processed archive, and including a CBZ whose pages the manifest already
+records — a packed archive is skipped rather than silently rebuilt.
 
 ### Shortcuts
 

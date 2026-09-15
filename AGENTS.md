@@ -343,6 +343,38 @@ is named where one exists.
     upscale failure must stay a failure, so the translation is keyed on that one
     class and on nothing wider. (`scripts/smoke.py`'s `cancel is not a lost
     page` leg)
+14. **The dry run reads the resume manifest a real run would read.** The
+    preview loads the manifest for the same fingerprint and reports `already
+    done, would skip`, counted as skipped rather than as planned work. *Why:*
+    the preview exists to answer "what will this run do *now*", and one that
+    ignores finished work answers a different question — it listed every page
+    of a half-finished job as work still to do. `fingerprint()` deliberately
+    excludes `dry_run` and `perf`, so a preview and its real run share a
+    manifest. (`scripts/resumeplan_check.py`)
+15. **A bundle asks the manifest, not only the filesystem.** Packing a CBZ is
+    skipped when the manifest records its member pages as done, not merely
+    when the destination archive happens to exist. *Why:* with overwrite on
+    the existence test never fires, so a run printed `resuming: 1 of 1 already
+    done` and then re-converted and re-packed the page anyway — the log said
+    resumed, the counters said processed, and both could not be right.
+    (`scripts/resumeplan_check.py`)
+16. **What an archive is named after is whatever the user chose.**
+    `planning.bundle_stem()` is the single answer: a chosen file names itself,
+    a chosen folder names the folder. *Why:* `unit["base"]` cannot answer this
+    alone, because for a single-file run the base *is* the parent folder — so
+    dropping one file in produced `Downloads.cbz`, named after a folder nobody
+    picked. Both CBZ modes go through that one function, so they cannot
+    disagree; page names *inside* the archive still come from the pattern.
+    (`scripts/solobundle_check.py`)
+17. **A fixed tile size holds the size that actually fitted.** When a hand-set
+    tile does not fit, the step-down that rescued the first page is remembered
+    for that model and reused, and the fallback is announced once per model.
+    *Why:* the vendored `auto_split` catches the OOM and steps down *inside*
+    the page, so re-asking for the too-large size made every page pay the
+    failed pass while the log showed the smaller tile — indistinguishable from
+    the planner ignoring the setting. A fixed tile that fits is never lowered,
+    and nothing below the proven size is recorded as proven.
+    (`scripts/plannercheck.py` sections G and H)
 
 ## Verification
 
