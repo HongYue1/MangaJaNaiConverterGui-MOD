@@ -115,6 +115,10 @@ class OutputPanelMixin(_Base):
             stretch=False,
         )
         body.control(self.w_dest_custom)
+        # That row is created visible, so a saved "next to the input" choice
+        # came back with a stale output path still on screen - and the first
+        # thing that usually hid it again was Browse, which turns the mode off.
+        self._apply_dest_mode()
 
         self.ed_pattern = line_edit(
             str(o.get("pattern") or "{name}_JaNai"),
@@ -155,10 +159,19 @@ class OutputPanelMixin(_Base):
         self.update_summary()
         self.update_start_state()
 
-    def on_dest_change(self) -> None:
+    def _apply_dest_mode(self) -> None:
+        """Show only the destination controls the chosen mode actually uses.
+
+        Split out of :meth:`on_dest_change` because the builder needs it as
+        well, and at build time the other cards do not exist yet - so this
+        deliberately touches nothing but this card's own widgets.
+        """
         same = self.chk_same.isChecked()
         self.ed_sub.setEnabled(same)
         self.w_dest_custom.setVisible(not same)
+
+    def on_dest_change(self) -> None:
+        self._apply_dest_mode()
         self.update_start_state()
         self.update_summary()
 
@@ -266,7 +279,11 @@ class OutputPanelMixin(_Base):
             if not src:
                 return None
             path = Path(src)
-            base = path.parent if path.is_file() else path
+            # Beside the input, never inside it. A folder input used to get the
+            # subfolder created *within* the tree being scanned, so the next
+            # run - a resume above all - walked in and read its own output back
+            # as input. A drive root is the one place with no "beside".
+            base = path.parent if path.parent != path else path
             sub = self.ed_sub.text().strip() or "upscaled"
             return base / sub
         custom = self.ed_out.text().strip()

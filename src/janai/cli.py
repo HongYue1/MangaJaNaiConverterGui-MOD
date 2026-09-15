@@ -147,7 +147,10 @@ def resolve_out_dir(src: Path, out: str, data: dict[str, Any]) -> Path:
         saved = str(outp.get("dir") or "").strip()
         if saved:
             return Path(saved).expanduser()
-    base = src.parent if src.is_file() else src
+    # Beside the input whether it is a file or a folder: a subfolder created
+    # inside a folder input is walked by the next scan, so the run would read
+    # its own output back in. A drive root has no "beside", so it keeps itself.
+    base = src.parent if src.parent != src else src
     return base / (str(outp.get("subfolder") or "").strip() or DEFAULT_SUBFOLDER)
 
 

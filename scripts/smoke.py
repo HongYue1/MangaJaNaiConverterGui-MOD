@@ -580,7 +580,11 @@ def headless_driver() -> None:
     data["upscale"]["rules"] = rules.default_dicts(INSTALLED)
     src = ROOT / "src"
     out = cli.resolve_out_dir(src, "", data)
-    assert out == src / "upscaled", f"the output folder resolved to {out}"
+    # Beside a folder input, not inside it: output written into the tree being
+    # scanned is read back as input by the next run, resume above all.
+    assert out == ROOT / "upscaled", f"the output folder resolved to {out}"
+    beside = cli.resolve_out_dir(ROOT / "README.md", "", data)
+    assert beside == ROOT / "upscaled", f"a file input resolved to {beside}"
     job = cli.build_job(data, src, out, None)
     _assert_job_payload(job)
     assert set(job) == {"input", "output", "format", "upscale", "perf"}, sorted(job)
