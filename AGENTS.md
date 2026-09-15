@@ -486,8 +486,16 @@ yourself; nothing else will.
   Never commit them, never assume a fresh clone has them.
 - **`setup.sh` refuses to run if `backend/src` is missing** — the worker imports
   the vendored backend from there, so it is not optional.
-- **`sanic==24.6.0` is in `requirements.txt` only because vendored backend
+- **`sanic==25.12.1` is in `requirements.txt` only because vendored backend
   modules import `sanic.log`.** It is not a web server here.
+- **`pyvips-binary` is held at `8.16.1` on purpose: it is libvips itself, the
+  encoder.** 8.18.6 re-encodes — the same page came out with different PNG
+  bytes and a different AVIF size — so every user's output would change on
+  identical models and settings. It still has no `jxlsave` either, so `.jxl`
+  goes out through the bundled `cjxl.exe` either way. The `pyvips` line above
+  it is the pure Python binding and is byte-identical, so that one does move.
+  `smoke.py`'s `dependency pins` leg keeps this file and
+  `backend/src/pyproject.toml` agreeing.
 - **ruff excludes `backend/`, `logs/` and `.tmp/`** (`pyproject.toml`); vendored
   code is not held to this project's style. Line length is **100**.
 - **Orphan bytecode is rot, not cache.** A `__pycache__/*.pyc` whose `.py` is

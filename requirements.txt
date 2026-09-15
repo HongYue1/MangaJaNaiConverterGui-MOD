@@ -21,12 +21,18 @@ chainner_ext==0.3.10
 
 numpy==2.2.5
 opencv-python==4.11.0.86
-pyvips==3.0.0
+# pyvips is the Python binding and is safe to move: the same page encoded
+# through encode_vips() comes out byte-identical on 3.2.0. pyvips-binary is
+# libvips itself and is held at 8.16.1 on purpose - 8.18.6 re-encodes
+# (different PNG bytes, and AVIF changed size too: 736 -> 762 B gray,
+# 1218 -> 1091 B rgb) and it gains nothing we use, since it still has no
+# jxlsave and .jxl still goes out through the bundled cjxl.exe.
+pyvips==3.2.0
 pyvips-binary==8.16.1
 pillow==11.3.0
 
-psutil==6.0.0
-pynvml==11.5.3
-packaging==25.0
-rarfile==4.2
-sanic==24.6.0
+psutil==7.2.2
+pynvml==13.0.1
+packaging==26.3
+rarfile==4.5
+sanic==25.12.1
