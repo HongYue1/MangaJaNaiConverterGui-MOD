@@ -128,6 +128,9 @@ class TilePlanner:
         self._pages: dict[int, int] = {}
         self._good: dict[int, int] = {}
         self._failed: dict[int, int] = {}
+        # Models whose fixed-tile request has already been reported as not
+        # fitting. Said once per model, not once per page. See choose().
+        self._said_fixed: set[int] = set()
         self._last_page: tuple[int, int, int, int] | None = None
         self._contaminated = False
 
@@ -294,8 +297,30 @@ class TilePlanner:
             self.last = -2
             return runtime.TILE["maximum"]
         if self.mode == "fixed":
-            self.last = self.fixed
-            return runtime.TILE["cls"](self.fixed)
+            # A fixed tile is a request, not a guarantee: auto_split still
+            # lowers a tile the page cannot pay for, and this branch used to
+            # return before the planner noted anything, so every page repeated
+            # the same failed pass and the result line reported the fallback as
+            # if it had been chosen -- 1536px asked for, "tile 1056" logged,
+            # 24.0s against 17.3s for the tile that fitted. Going through _arm
+            # lets retiled() record what did fit; the cap and the measured cost
+            # are deliberately not applied, so nothing but a real miss lowers
+            # the number the user asked for.
+            tile = self.fixed
+            if model is None:
+                self.last = tile
+                return runtime.TILE["cls"](tile)
+            key = id(model)
+            proven = self._good.get(key, 0)
+            if proven and proven < tile:
+                if key not in self._said_fixed:
+                    self._said_fixed.add(key)
+                    log(
+                        f"the fixed tile of {tile}px did not fit; holding {proven}px, which did",
+                        "warn",
+                    )
+                tile = proven
+            return self._arm(key, model, w, h, c, tile, 0, 0)
         if model is None:
             self.last = 0
             return runtime.TILE["estimate"]

@@ -121,6 +121,14 @@ def new_planner() -> tuple[Planner, Model]:
     return planner, model
 
 
+def fixed_planner(size: int) -> tuple[Planner, Model]:
+    """A planner with the tile pinned by hand, as the Performance tab does."""
+    model = Model()
+    planner = Planner("fixed", size, "cuda:0", True, profile=PROFILE)
+    planner.note_model(model, NAME)
+    return planner, model
+
+
 def run_page(planner: Planner, model: Model, retries: int, peak_mib: int) -> int:
     """One page through choose -> before -> (upscale) -> after."""
     tile = int(planner.choose(model, Page()))
@@ -213,6 +221,38 @@ def main() -> int:
     notes()
     check("no cost learned from a page that missed", id(model) not in planner._per_px)
     check(f"but {planned}px is remembered as a ceiling", planner._ceiling(id(model)) < planned)
+
+    print("\nG: a fixed tile the page cannot pay for is not paid for twice")
+    # A fixed tile is a request: auto_split lowers it one grid step when the
+    # page does not fit, and the planner used to hear nothing about it, so
+    # every page re-attempted the size that had already failed -- 1536px asked
+    # for, "tile 1056" reported, 24.0s against 17.3s.
+    planner, model = fixed_planner(1536)
+    asked = int(planner.choose(model, Page()))
+    planner.before()
+    planner.retiled(1056)
+    CUDA.peak = int(5800 * MIB)
+    planner.after()
+    held = int(planner.choose(model, Page()))
+    third = int(planner.choose(model, Page()))
+    said = [note for note in NOTES if "fixed tile" in note]
+    notes()
+    check(f"page 1 asks for the {asked}px that was set", asked == 1536)
+    check(f"page 2 holds the {held}px that fitted", held == 1056)
+    check(f"page 3 too, not back to 1536px: {third}px", third == 1056)
+    check(f"and the fallback is reported once, not per page: {len(said)} note(s)", len(said) == 1)
+
+    print("\nH: a fixed tile that fits is never lowered")
+    planner, model = fixed_planner(1024)
+    sizes = [run_page(planner, model, retries=2, peak_mib=5800) for _ in range(3)]
+    warned = [note for note in NOTES if "fixed tile" in note]
+    proven = planner._good.get(id(model), 0)
+    NOTES.clear()
+    check(f"three pages at the size set: {sizes}", sizes == [1024, 1024, 1024])
+    # Retries and a peak against the ceiling cap an *auto* tile. A hand-set one
+    # is only ever lowered by a real miss, so nothing below it is on record.
+    check(f"pressure records nothing below it: {proven}px proven", proven >= 1024)
+    check(f"and no fallback is announced: {len(warned)} note(s)", not warned)
 
     if FAILS:
         print(f"\n{len(FAILS)} FAILED: {FAILS}")
