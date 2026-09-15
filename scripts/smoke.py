@@ -252,6 +252,55 @@ def orphan_bytecode() -> None:
     assert not orphans, f"bytecode whose source is gone (delete the files): {orphans}"
 
 
+def dependency_pins() -> None:
+    """Both dependency lists must pin exactly, and must not disagree.
+
+    `setup.cmd` feeds `requirements.txt` to uv, and that file's own header says
+    it mirrors `backend/src/pyproject.toml` "so the upscaling results stay
+    identical". Neither half of that was enforced (F37). `pillow>=11.0.0` was
+    the one line that did not pin, so a setup run today installs Pillow 12.3.0
+    while this machine has 11.3.0 - a floating version in the decode and ICC
+    path, which is exactly where a silent pixel change comes from. And nothing
+    compared the two files, so bumping one and forgetting the other drifts in
+    silence.
+
+    The shared-pin count is asserted too: if the parsing below ever stops
+    matching, the comparison would pass by finding nothing to compare.
+    """
+
+    def normalize(name: str) -> str:
+        # PEP 503: spandrel_extra_arches and Spandrel-Extra-Arches are one name.
+        return re.sub(r"[-_.]+", "-", name).lower()
+
+    pinned = re.compile(r"([A-Za-z0-9._-]+)==([A-Za-z0-9._+!-]+)")
+    unpinned: list[str] = []
+    wanted: dict[str, str] = {}
+    for raw in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        found = pinned.fullmatch(line)
+        if found is None:
+            unpinned.append(line)
+            continue
+        wanted[normalize(found.group(1))] = found.group(2)
+    assert not unpinned, f"requirements.txt lines that do not pin with ==: {unpinned}"
+
+    toml = (ROOT / "backend" / "src" / "pyproject.toml").read_text(encoding="utf-8")
+    block = re.search(r"\ndependencies = \[(.*?)\n\]", toml, re.DOTALL)
+    assert block is not None, "backend/src/pyproject.toml lost its dependencies array"
+    mirror: dict[str, str] = {normalize(n): v for n, v in pinned.findall(block.group(1))}
+
+    shared = sorted(wanted.keys() & mirror.keys())
+    assert len(shared) >= 10, f"only {len(shared)} shared pins parsed - the parser broke"
+    drift = [
+        f"{name}: requirements.txt {wanted[name]} vs pyproject.toml {mirror[name]}"
+        for name in shared
+        if wanted[name] != mirror[name]
+    ]
+    assert not drift, f"the two dependency lists disagree: {drift}"
+
+
 def page_entries() -> None:
     """An archive entry is a page only if it is really an image.
 
@@ -840,6 +889,7 @@ def main() -> int:
     check("output naming", output_naming)
     check("extension sets", extension_sets)
     check("orphan bytecode", orphan_bytecode)
+    check("dependency pins", dependency_pins)
     check("vram budget clamp", vram_budget_clamp)
     check("oom recovery", oom_recovery_frees_without_copying)
     check("headless driver", headless_driver)
