@@ -413,6 +413,10 @@ class UnitRunner:
                 )
                 continue
             dest: Path | None = None
+            # Stays empty for a bundle member: those are recorded once, by the
+            # job, after the archive's atomic publish. A per-page record here
+            # would claim pages that so far exist only inside a `.part`.
+            resume_key = ""
             if into is None:
                 dest = resolve_out(
                     unit,
@@ -423,6 +427,22 @@ class UnitRunner:
                     index,
                     self.total,
                 )
+                # The manifest is asked before exists(), and regardless of
+                # `overwrite`, exactly as the archive path asks it: it records
+                # what THIS job finished, which exists() cannot tell apart from
+                # an unrelated file that happens to sit at the destination.
+                resume_key = unit_key(src, Path(str(unit["base"])))
+                if self.resume.is_done(resume_key):
+                    self.counters.bump("skipped")
+                    emit(
+                        "file",
+                        i=index,
+                        total=self.total,
+                        path=str(src),
+                        out=str(dest),
+                        error="already done, skipped",
+                    )
+                    continue
                 # a.jpg and a.png both resolve to a.png, and a {parent} pattern
                 # collapses a whole folder onto one name. A name this run has
                 # already handed out must NOT take the skip branch: it belongs
@@ -472,6 +492,7 @@ class UnitRunner:
                     model_name,
                     info,
                     started,
+                    resume_key,
                 )
                 continue
             if into is None:

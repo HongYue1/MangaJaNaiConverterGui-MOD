@@ -56,6 +56,19 @@ FINGERPRINT_CHARS = 16
 #: spelling of its path would discard perfectly good progress.
 LOCATION_KEYS = frozenset({"dir"})
 
+#: How many deferred records may wait before one flush covers them all.
+#: Measured rather than guessed: every flush rewrites the *whole* manifest, so
+#: a caller that records once per page costs O(n^2) bytes -- 4000 pages spent
+#: 13.9 s and rewrote 1412 MiB on bookkeeping alone, and doubling the pages
+#: quadrupled both (`.tmp/f39b_flush_cost.py`, embedded interpreter). Batching
+#: turns that into tens of MiB while risking at most this many redundant
+#: re-converts after a hard kill -- the cheap side of the asymmetry above.
+FLUSH_EVERY_RECORDS = 64
+
+#: ...and no deferred record waits longer than this, so a slow job still
+#: leaves usable progress behind instead of holding a batch open for minutes.
+FLUSH_INTERVAL_SECONDS = 10.0
+
 
 def unit_key(src: Path, base: Path) -> str:
     """Stable identity of one source file inside this job's input root.
@@ -145,6 +158,8 @@ class ResumeLog:
         self._units: dict[str, dict[str, Any]] = {}
         self._partials: dict[str, dict[str, Any]] = {}
         self._warned = False
+        self._deferred = 0
+        self._last_write = time.monotonic()
 
     @classmethod
     def load(cls, out_dir: Path, fp: str, *, enabled: bool = True) -> "ResumeLog":
@@ -197,8 +212,17 @@ class ResumeLog:
         entries = record.get("entries")
         return [str(name) for name in entries] if isinstance(entries, list) else []
 
-    def mark_done(self, key: str, out: Path, entries: int = 0) -> None:
-        """Record a finished source. Call this *after* the publishing rename."""
+    def mark_done(self, key: str, out: Path, entries: int = 0, *, defer: bool = False) -> None:
+        """Record a finished source. Call this *after* the publishing rename.
+
+        ``defer`` batches the disk write for callers that fire once per *page*
+        instead of once per chapter -- see :data:`FLUSH_EVERY_RECORDS` for the
+        measurement that made batching necessary. Deferring can only delay a
+        record, never claim one early, so it stays on the safe side of the
+        asymmetry in this module's docstring; the price is that the job must
+        call :meth:`flush` before it exits or the tail of the batch is lost.
+        Chapters do not defer: they are rare and each one is worth minutes.
+        """
         if not self.enabled:
             return
         with self._lock:
@@ -208,7 +232,15 @@ class ResumeLog:
                 "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }
             self._partials.pop(key, None)
-            self._write()
+            if not defer:
+                self._write()
+                return
+            self._deferred += 1
+            if (
+                self._deferred >= FLUSH_EVERY_RECORDS
+                or time.monotonic() - self._last_write >= FLUSH_INTERVAL_SECONDS
+            ):
+                self._write()
 
     def mark_partial(self, key: str, tmp: Path, entries: Sequence[str]) -> None:
         """Record how far an unfinished archive got, and where its ``.part`` is."""
@@ -228,6 +260,19 @@ class ResumeLog:
             if changed:
                 self._write()
 
+    def flush(self) -> None:
+        """Write out any deferred records.
+
+        Called on every exit path of the job, normal or cancelled, because a
+        deferred record that never reaches disk is work the next run repeats.
+        Idempotent, so belt-and-braces calls are free.
+        """
+        if not self.enabled:
+            return
+        with self._lock:
+            if self._deferred:
+                self._write()
+
     def _write(self) -> None:
         """Flush the manifest. Caller holds the lock.
 
@@ -243,6 +288,11 @@ class ResumeLog:
             "partials": self._partials,
         }
         tmp = self.path.with_name(self.path.name + ".part")
+        # Reset before attempting the write, not after it succeeds: a
+        # read-only output folder would otherwise make every subsequent
+        # deferred record retry the failing write in the hot page loop.
+        self._deferred = 0
+        self._last_write = time.monotonic()
         try:
             target, staging = io_path(self.path), io_path(tmp)
             target.parent.mkdir(parents=True, exist_ok=True)

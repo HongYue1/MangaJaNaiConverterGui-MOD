@@ -366,9 +366,16 @@ class BundleWriter:
                 log(f"pack failed: {exc}", "error")
         self.futures.clear()
 
-    def close(self, keep: bool = True) -> None:
+    def close(self, keep: bool = True) -> bool:
+        """Finish the open archive, reporting whether it actually published.
+
+        The return value exists so a caller can record resume state for the
+        sources that went into this archive, and only once it is true: the
+        `.part` is the work, the `replace()` below is the publish, and a record
+        written without that rename would claim a chapter no reader can open.
+        """
         if self.zf is None:
-            return
+            return False
         self.drain()
         try:
             self.zf.close()
@@ -379,12 +386,13 @@ class BundleWriter:
         elapsed = time.perf_counter() - self.started
         self.key = self.dest = self.tmp = None
         if tmp is None or dest is None:
-            return
+            return False
         if not keep or entries == 0:
             io_path(tmp).unlink(missing_ok=True)
-            return
+            return False
         io_path(tmp).replace(io_path(dest))
         self.on_done(key or "", dest, entries, failed, elapsed)
+        return True
 
     def shutdown(self) -> None:
         self.pool.shutdown(wait=True)

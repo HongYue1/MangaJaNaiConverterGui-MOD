@@ -661,6 +661,95 @@ def resume_wiring() -> None:
     _assert_resume_wiring(ORCHESTRATE.read_text(encoding="utf-8"))
 
 
+#: The other two paths that finish work record it from their own modules, and
+#: `resume wiring` above reads the orchestrator ONLY -- so without these pins
+#: both new recorders would sit here completely unpoliced while its count of
+#: one recorder per archive stayed true.
+REPORTING = ROOT / "src" / "janai" / "worker" / "reporting.py"
+JOB = ROOT / "src" / "janai" / "worker" / "job.py"
+PIPELINE = ROOT / "src" / "janai" / "worker" / "pipeline.py"
+
+
+def _assert_loose_page_recorded(text: str) -> None:
+    code = _code_only(text)
+    write = code.find("target.write_bytes(data)")
+    record = code.find("self.resume.mark_done(")
+    assert write != -1, "the loose-page write is gone"
+    assert record != -1, "a written loose page no longer records itself"
+    assert write < record, (
+        "the write IS the publish for a loose page, so recording first would "
+        "claim a page that never reached disk"
+    )
+    assert "if resume_key:" in code, (
+        "an empty key is planning's bundle placeholder, and a record under it "
+        "would claim a source nobody converted"
+    )
+    assert "defer=True" in code, (
+        "every flush rewrites the whole manifest, so flushing per page is "
+        "quadratic: 1.4 GiB rewritten across a 4000-page run"
+    )
+
+
+def _assert_loose_page_key_passed(text: str) -> None:
+    code = _code_only(text)
+    submit = code.find("self.writer.submit(")
+    assert submit != -1, "the loose-page submit is gone"
+    call = code[submit : code.index(")", code.index("started,", submit))]
+    assert "resume_key," in call, (
+        "write_page takes the key positionally through submit(fn, *args), which "
+        "mypy cannot check, so a dropped key would surface only as a resumed "
+        "run silently re-converting every loose page"
+    )
+    assert "self.resume.is_done(" in code, (
+        "loose pages have to ask the manifest, or resuming redoes all of them"
+    )
+
+
+def _assert_bundle_recorded(text: str) -> None:
+    code = _code_only(text)
+    guard = code.find("if bundle.close():")
+    assert guard != -1, (
+        "a bundle may only be recorded once close() reports it published: the "
+        ".part is the work, and the rename inside close() is the publish"
+    )
+    body = code[guard : code.index("resume.flush()", guard)]
+    assert "unit_key(" in body, "bundle members are recorded per source file"
+    assert '"key"' not in body, (
+        "planning leaves the task key empty for a single-archive run, so a "
+        "record under it would skip a different input into the same folder"
+    )
+    assert code.count("resume.flush()") >= 2, (
+        "one flush per published bundle and one on the way out, so a cancel "
+        "cannot discard the deferred page records"
+    )
+
+
+def _assert_publish_reported(text: str) -> None:
+    code = _code_only(text)
+    close = code.index("def close(self, keep: bool = True) -> bool:")
+    body = code[close : code.index("def shutdown", close)]
+    assert body.count("return True") == 1, "one success path, so one meaning"
+    assert body.index("return True") > body.index("replace(io_path(dest))"), (
+        "close() may only report success after the rename that publishes the "
+        "archive, because its caller records resume state on that answer"
+    )
+
+
+def resume_records_every_path() -> None:
+    """Whatever finishes work records it, and never before it is published.
+
+    The archive path is pinned by ``resume wiring``; these are the other two.
+    A loose page is published by its own write and a bundle by the rename
+    inside ``BundleWriter.close()``, so each records at a different moment --
+    and each is invisible to a guard that reads only the orchestrator.
+    Pinned by source because importing either module pulls in the decoder.
+    """
+    _assert_loose_page_recorded(REPORTING.read_text(encoding="utf-8"))
+    _assert_loose_page_key_passed(ORCHESTRATE.read_text(encoding="utf-8"))
+    _assert_bundle_recorded(JOB.read_text(encoding="utf-8"))
+    _assert_publish_reported(PIPELINE.read_text(encoding="utf-8"))
+
+
 def cancel_not_a_lost_page() -> None:
     """A user stop must never be reported as a page the run failed to convert.
 
@@ -756,6 +845,7 @@ def main() -> int:
     check("headless driver", headless_driver)
     check("resume manifest", resume_manifest)
     check("resume wiring", resume_wiring)
+    check("resume records every path", resume_records_every_path)
     check("cancel is not a lost page", cancel_not_a_lost_page)
     check("page entries", page_entries)
     check("entry name decoding", entry_name_decoding)

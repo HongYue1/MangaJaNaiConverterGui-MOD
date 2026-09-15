@@ -8,8 +8,8 @@ events, so their keys may be added to but never renamed or dropped.
 
 Every method can run off the main thread: `write_page` is submitted to the
 `WritePool`, and the bundle callbacks are invoked by `BundleWriter`. They may
-therefore only touch `Counters`, which is locked, and `emit`, which serialises
-its writes.
+therefore only touch `Counters` and `ResumeLog`, both of which are locked, and
+`emit`, which serialises its writes.
 """
 
 import time
@@ -22,6 +22,7 @@ from janai.core.fspath import io_path, path_too_long
 from janai.worker.events import emit, log
 from janai.worker.page import PageEncoder
 from janai.worker.pipeline import Counters
+from janai.worker.resume import ResumeLog
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +38,10 @@ class JobReporter:
     counters: Counters
     total: int
     encoder: PageEncoder
+    # By reference for the same reason as `counters`: it is this run's single
+    # resume writer, and "this page reached disk" is exactly the fact the next
+    # run needs in order not to convert it a second time.
+    resume: ResumeLog
 
     def write_page(
         self,
@@ -48,6 +53,7 @@ class JobReporter:
         model_name: str,
         info: dict,
         started: float,
+        resume_key: str,
     ) -> None:
         try:
             # A name longer than the file system allows is not a MAX_PATH
@@ -62,6 +68,15 @@ class JobReporter:
             target = io_path(dest)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
+            # Recorded only once the bytes are on disk: for a loose page the
+            # write *is* the publish, so this obeys the same rule the archive
+            # path obeys with its rename. Deferred because it fires once per
+            # page and every flush rewrites the whole manifest -- see
+            # `resume.FLUSH_EVERY_RECORDS` for the measurement. An empty key is
+            # never recorded: planning uses "" as the *bundle* placeholder, so a
+            # record under it would claim a source nobody converted.
+            if resume_key:
+                self.resume.mark_done(resume_key, dest, defer=True)
             self.counters.bump("processed")
             emit(
                 "file",

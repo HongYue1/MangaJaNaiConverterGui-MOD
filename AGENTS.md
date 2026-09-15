@@ -317,8 +317,9 @@ is named where one exists.
     for machines with no display, so importing Qt for a job that never opens a
     window would defeat it. (`scripts/smoke.py`'s `headless driver` leg imports
     the driver and fails if `PySide6` lands in `sys.modules`)
-12. **A source is recorded as finished only *after* the rename that publishes
-    it, and `worker/resume.py` is the manifest's only writer.** *Why:* the
+12. **A source is recorded as finished only *after* whatever publishes it — the
+    rename for an archive or a bundle, the write itself for a loose page — and
+    `worker/resume.py` is the manifest's only writer.** *Why:* the
     manifest may forget a finished chapter — that costs one redundant
     re-convert — but if it can claim an unfinished one, a resumed run silently
     skips a chapter the user never got. The same asymmetry decides the rest of
@@ -326,8 +327,12 @@ is named where one exists.
     entry names inside it, and the next run appends only when those names are a
     *prefix* of this run's plan, because appending out of order changes page
     order in the reader. A manifest whose fingerprint does not match the current
-    job is ignored, never merged. (`scripts/smoke.py`'s `resume manifest` and
-    `resume wiring` legs)
+    job is ignored, never merged. A bundle is recorded against its member
+    *sources*, never against the task key, which planning leaves empty for a
+    single-archive run — a record under that key would claim "the bundle for
+    this folder is done" and skip a different input converted into the same
+    folder. (`scripts/smoke.py`'s `resume manifest`, `resume wiring` and
+    `resume records every path` legs)
 13. **Every call into a vendored node translates `api.node_context.Aborted`
     back into `Cancelled`.** `ModelCache.get` and `upscale_array` (both in
     `worker/models.py`) are the only two such call sites, and both do it.

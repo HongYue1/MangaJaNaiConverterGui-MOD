@@ -39,7 +39,7 @@ from janai.worker.planning import (
     unique_path,
 )
 from janai.worker.reporting import JobReporter
-from janai.worker.resume import ResumeLog, fingerprint
+from janai.worker.resume import ResumeLog, fingerprint, unit_key
 from janai.worker.selection import PagePolicy
 from janai.worker.transforms import (
     GRAY_SAMPLE,
@@ -252,24 +252,27 @@ def run_job(job: dict) -> int:
         t_h=t_h,
     )
 
-    # Reporting is one object so this job's slice of the wire format lives in
-    # one module: every method only moves a counter and emits one event. It is
-    # given `counters` by reference on purpose -- that locked tally is the
-    # shared state, and `write_page` runs on a write-pool thread.
-    reporter = JobReporter(counters=counters, total=total, encoder=encoder)
-    bundle = BundleWriter(
-        encoder.encode, reporter.bundle_page, reporter.bundle_failed, reporter.bundle_done
-    )
-
     # Which sources this output folder has already finished, read from the
     # manifest that sits beside them. Default on, because a resume record that
     # only exists when the user thought to ask for it is no use to the user who
     # cancelled without planning to. The fingerprint is what keeps it honest: a
     # record written under different settings is ignored, not trusted.
+    # Built before the reporter, which records each finished loose page into it:
+    # one resume writer for the run, shared by reference exactly like
+    # `counters`, so no two objects can disagree about what is done.
     resume = ResumeLog.load(out_dir, fingerprint(job), enabled=bool(job.get("resume", True)))
     already = resume.finished_count()
     if already:
         log(f"resuming: {already} of {total} already done", "info")
+
+    # Reporting is one object so this job's slice of the wire format lives in
+    # one module: every method only moves a counter and emits one event. It is
+    # given `counters` by reference on purpose -- that locked tally is the
+    # shared state, and `write_page` runs on a write-pool thread.
+    reporter = JobReporter(counters=counters, total=total, encoder=encoder, resume=resume)
+    bundle = BundleWriter(
+        encoder.encode, reporter.bundle_page, reporter.bundle_failed, reporter.bundle_done
+    )
 
     # One object for everything that happens to a single planned unit, so the
     # loop below is dispatch and nothing else. The collaborators go in by
@@ -323,7 +326,22 @@ def run_job(job: dict) -> int:
                 continue
             bundle.open(task["key"], dest_bundle)
             runner.run_images(units_here, task)
-            bundle.close()
+            if bundle.close():
+                # Recorded per SOURCE, never under `task["key"]`: planning
+                # leaves that key empty for a single-archive run, so a record
+                # under it would claim "the bundle for this folder is done" and
+                # silently skip a different input converted into the same folder
+                # later. The atomic publish inside close() is what makes every
+                # member true at once -- hence only when it returns True.
+                for member in units_here:
+                    resume.mark_done(
+                        unit_key(member["path"], Path(str(member["base"]))),
+                        dest_bundle,
+                        defer=True,
+                    )
+                # One manifest write per archive rather than per member: a
+                # cbz_single run groups every page of a folder into one bundle.
+                resume.flush()
     except Cancelled:
         cancelled = True
     except KeyboardInterrupt:
@@ -335,6 +353,11 @@ def run_job(job: dict) -> int:
             log(f"could not finish the archive: {exc}", "error")
         bundle.shutdown()
         writer.close()
+        # After `writer.close()` has joined every queued page write, so each
+        # page that reached disk has already recorded itself. Page records are
+        # batched, and a deferred record that never reaches disk is work the
+        # next run repeats for nothing -- on the cancel path above all.
+        resume.flush()
         if CTRL.cancelled:
             cancelled = True
         # One try per hook: a single failing hook used to abandon every later
