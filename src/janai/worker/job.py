@@ -168,10 +168,17 @@ def run_job(job: dict) -> int:
     )
 
     if dry:
+        # The preview has to answer the same question the run will, so it
+        # reads the same manifest under the same fingerprint. Read-only by
+        # construction: nothing in dry_run marks or flushes, so previewing a
+        # half-finished run cannot leave behind a record of work never done.
         return dry_run(
             tasks,
             total,
             DryRunPlan(
+                resume=ResumeLog.load(
+                    out_dir, fingerprint(job), enabled=bool(job.get("resume", True))
+                ),
                 out_dir=out_dir,
                 ext=ext,
                 pattern=pattern,
@@ -312,6 +319,24 @@ def run_job(job: dict) -> int:
                 continue
             dest_bundle: Path = task["dest"]
             units_here: list[dict] = task["units"]
+            # Ask the manifest before the filesystem. An archive whose every
+            # page is recorded and whose file is still there is finished work:
+            # without this, "resuming: 1 of 1 already done" printed and the
+            # page was converted and packed all over again, because the only
+            # question asked here was whether the .cbz existed -- and with
+            # overwrite on, not even that.
+            if bundle_done(resume, units_here, dest_bundle):
+                counters.bump("skipped", len(units_here))
+                emit(
+                    "file",
+                    i=int(units_here[0].get("index") or 0),
+                    total=total,
+                    path=str(units_here[0]["path"].parent),
+                    out=str(dest_bundle),
+                    entries=len(units_here),
+                    error="already done, skipped",
+                )
+                continue
             if dest_bundle.exists() and not overwrite:
                 counters.bump("skipped", len(units_here))
                 emit(
@@ -421,6 +446,22 @@ PagePredicate = Callable[[bool, int, int], bool]
 """Answers one yes/no question about a page, from (gray, height, width)."""
 
 
+def bundle_done(resume: ResumeLog, units: list[dict], dest: Path) -> bool:
+    """Is every page of this archive recorded, with the archive still there?
+
+    Bundle members are recorded per source, all at once, and only after the
+    atomic publish inside ``close()`` -- so "every member recorded" means this
+    exact archive was published under these settings. The existence test is
+    what keeps a stale record from skipping a chapter the user has since
+    deleted: the record alone would report a resume and leave no file behind.
+    """
+    if not units:
+        return False
+    if not all(resume.is_done(unit_key(u["path"], Path(str(u["base"])))) for u in units):
+        return False
+    return dest.exists()
+
+
 @dataclass(frozen=True, slots=True)
 class DryRunPlan:
     """Everything the dry run needs to predict what a real run would produce.
@@ -455,6 +496,10 @@ class DryRunPlan:
     device: str
     fp16: bool
     tile_label: str
+    # The same manifest the run would consult, loaded read-only. The dry run
+    # used to return before resume was ever loaded, so a preview of a
+    # half-finished run listed every finished page as work still to do.
+    resume: ResumeLog
 
 
 def dry_run(tasks: list[dict], total: int, plan: DryRunPlan) -> int:
@@ -481,6 +526,13 @@ def dry_run(tasks: list[dict], total: int, plan: DryRunPlan) -> int:
         bundles=sum(1 for t in tasks if t["kind"] == "bundle"),
     )
 
+    # Same wording and same position in the log as the real run, so a preview
+    # and the run it predicts read identically.
+    resume = plan.resume
+    already = resume.finished_count()
+    if already:
+        log(f"resuming: {already} of {total} already done", "info")
+
     for task in tasks:
         if CTRL.cancelled:
             cancelled = True
@@ -496,8 +548,19 @@ def dry_run(tasks: list[dict], total: int, plan: DryRunPlan) -> int:
                     entries = len(opened[0]) if opened else 0
             except Exception as exc:
                 log(f"{src.name}: {exc}", "warn")
-            exists = dest.exists() and not overwrite
-            counters.bump("skipped" if exists else "processed")
+            # handle_archive asks the manifest first, and regardless of
+            # `overwrite`; the preview asks in the same order.
+            key = unit_key(src, Path(str(unit["base"])))
+            done = resume.is_done(key)
+            carried = 0 if done else len(resume.partial_entries(key))
+            if carried:
+                log(
+                    f"{src.name}: {carried} page(s) packed by an earlier run;"
+                    " it would carry on from there if the partial still matches",
+                    "info",
+                )
+            exists = not done and dest.exists() and not overwrite
+            counters.bump("skipped" if done or exists else "processed")
             emit(
                 "file",
                 i=index,
@@ -506,26 +569,33 @@ def dry_run(tasks: list[dict], total: int, plan: DryRunPlan) -> int:
                 out=str(dest),
                 dry=True,
                 entries=entries,
-                error="exists, would skip" if exists else None,
+                error=(
+                    "already done, would skip" if done else "exists, would skip" if exists else None
+                ),
             )
             continue
 
         bundle = task["kind"] == "bundle"
         units: list[dict] = task["units"]
         dest_bundle: Path | None = task.get("dest")
-        if bundle and dest_bundle is not None and dest_bundle.exists() and not overwrite:
-            counters.bump("skipped", len(units))
-            emit(
-                "file",
-                i=int(units[0].get("index") or 0),
-                total=total,
-                path=str(units[0]["path"].parent),
-                out=str(dest_bundle),
-                dry=True,
-                entries=len(units),
-                error="exists, would skip",
-            )
-            continue
+        if bundle and dest_bundle is not None:
+            # The run's two questions, in the run's order: a fully recorded
+            # archive that is still on disk is skipped whatever `overwrite`
+            # says, and only then does an unrecorded file in the way count.
+            packed = bundle_done(resume, units, dest_bundle)
+            if packed or (dest_bundle.exists() and not overwrite):
+                counters.bump("skipped", len(units))
+                emit(
+                    "file",
+                    i=int(units[0].get("index") or 0),
+                    total=total,
+                    path=str(units[0]["path"].parent),
+                    out=str(dest_bundle),
+                    dry=True,
+                    entries=len(units),
+                    error="already done, would skip" if packed else "exists, would skip",
+                )
+                continue
         if bundle and dest_bundle is not None:
             emit("bundle", out=str(dest_bundle), entries=len(units), planned=True, dry=True)
 
@@ -582,17 +652,26 @@ def dry_run(tasks: list[dict], total: int, plan: DryRunPlan) -> int:
                     entry = f"{entry[: -len(ext)]}_{position}{ext}"
                 seen.add(entry.lower())
                 dest = dest_bundle
+                # Membership is decided for the whole archive above, so a page
+                # inside one is never skipped on its own.
+                done = False
                 exists = False
             else:
                 dest = resolve_out(unit, out_dir, pattern, ext, plan.keep_structure, index, total)
+                done = resume.is_done(unit_key(src, Path(str(unit["base"]))))
                 # Mirror run_images' reservation, or the plan promises one file
                 # per colliding name while the run writes a de-duped second one.
-                claimed = path_key(dest) in taken
-                if claimed:
-                    dest = unique_path(dest, taken)
-                taken.add(path_key(dest))
-                exists = not claimed and dest.exists() and not overwrite
-            counters.bump("skipped" if exists else "processed")
+                # A page the run would skip reserves nothing, because run_images
+                # skips before it claims a name: reserving it here would predict
+                # a de-duped suffix for a page that keeps its own.
+                claimed = False
+                if not done:
+                    claimed = path_key(dest) in taken
+                    if claimed:
+                        dest = unique_path(dest, taken)
+                    taken.add(path_key(dest))
+                exists = not done and not claimed and dest.exists() and not overwrite
+            counters.bump("skipped" if done or exists else "processed")
             emit(
                 "file",
                 i=index,
@@ -610,7 +689,9 @@ def dry_run(tasks: list[dict], total: int, plan: DryRunPlan) -> int:
                 model=(pick["name"] if pick else ""),
                 passthrough=excluded,
                 dry=True,
-                error="exists, would skip" if exists else None,
+                error=(
+                    "already done, would skip" if done else "exists, would skip" if exists else None
+                ),
             )
         if cancelled:
             break
