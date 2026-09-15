@@ -27,6 +27,36 @@ jobs:
       - name: Lint
         run: ruff check --output-format=github .
 
+  types:
+    name: mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # Pinned for the same reason ruff is: a new mypy release must not fail
+      # an unrelated pull request.
+      - name: Install mypy
+        run: pip install mypy==2.3.1
+
+      # --platform win32 is load-bearing. This runner is Linux, and mypy
+      # resolves platform-specific stubs for the platform it targets, so
+      # without the flag the os.startfile call in app/runner.py is an
+      # attr-defined error even though sys.platform == "win32" already guards
+      # it. Measured both ways: linux finds exactly that one false error,
+      # win32 is clean across all 73 source files. The app ships on Windows,
+      # so Windows is what CI has to type-check.
+      #
+      # No project dependencies are installed, deliberately: this is the same
+      # dependency-free run the local gate does, and it is green. Pulling
+      # torch and PySide6 into a type-check job would cost minutes and prove
+      # nothing extra.
+      - name: Type-check
+        run: mypy --platform win32
+
   check:
     # Packaging is Windows-first, but the engine has to keep working on Linux,
     # so the import-level checks run on both.

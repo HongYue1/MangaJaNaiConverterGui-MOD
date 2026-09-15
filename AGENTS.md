@@ -425,6 +425,11 @@ noise, not proof. Promote a file only when a real type exists (as
 
 - **ruff job** (Ubuntu): `pip install ruff==0.16.7`, `ruff format --check --diff .`,
   `ruff check --output-format=github .`
+- **mypy job** (Ubuntu): `pip install mypy==2.3.1`, `mypy --platform win32`. The
+  flag is load-bearing, not decoration: the runner is Linux, and without it the
+  `os.startfile` call in `app/runner.py` fails as `attr-defined` even though
+  `sys.platform == "win32"` already guards it. Windows is what ships, so Windows
+  is what CI checks.
 - **matrix job** (windows-latest **and** ubuntu-latest): `compileall src scripts`,
   `compileall backend/src`, `smoke.py`, `plannercheck.py`, then the
   dependency-free gates `prefetch_check`, `counters_check`, `writepool_check`,
@@ -432,8 +437,11 @@ noise, not proof. Promote a file only when a real type exists (as
   `uicheck.py` with `PySide6-Essentials==6.11.2` (Linux also installs `libegl1`
   and `libxkbcommon-x11-0`, which Qt links against).
 
-**mypy is not in CI** — it is a local gate only. If you touch typing, run it
-yourself; nothing else will.
+**mypy now runs in CI**, so a typing regression fails on the pull request
+instead of waiting for someone to remember the local gate. It is the same
+checker at the same version in both places, so the two cannot disagree. The
+strict sweep above is still local and still informational: it is a to-do list,
+not a gate.
 
 ## Conventions
 
