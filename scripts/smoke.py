@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Dependency-free checks for the parts that must never break.
 
 Nothing here imports torch, pyvips or Qt, so it runs on a bare Python

@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """JaNaiUpscaler worker.
 
 Runs the upscale pipeline out of process so the GUI stays responsive and never

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Interface geometry harness for the Qt window.
 
 Builds the real window and asserts the things that actually went wrong in the
@@ -50,6 +49,7 @@ from janai.app.rules_table import RulesTable
 from janai.app.theme import BASE_SIZES, Theme
 from janai.app.widgets import Card, Collapsible, DropZone, LogView
 from janai.app.window import MainWindow
+from janai.core import rules
 from janai.core.filetypes import ARCHIVE_EXTS, IMAGE_EXTS
 
 FAILURES: list[str] = []
@@ -294,6 +294,13 @@ def check_page_kind(window: MainWindow, app: QApplication) -> None:
     print("page kind")
     check("three exclusive page kinds", window.cb_pagekind.count() == 3)
     was = window.page_kind()
+    # The hint only names the idle half of the table while the table has rows,
+    # and the shipped set is built from the models that are installed - a CI
+    # machine has none, so the row comes from here rather than from whatever
+    # this machine happens to have, and the check asserts the same thing
+    # everywhere instead of passing only where models are installed.
+    was_rules = list(window.rules)
+    window.set_all_rules([rules.Rule(kind=rules.GRAYSCALE, height="1920", model="uicheck.pth")])
     window.set_page_kind("colour")
     window.on_pagekind_change()
     pump(app)
@@ -323,6 +330,7 @@ def check_page_kind(window: MainWindow, app: QApplication) -> None:
         "detect per page brings the detection settings back",
         window.sp_threshold.isEnabled() and window.sp_colour.isEnabled(),
     )
+    window.set_all_rules(was_rules)
     window.set_page_kind(was)
     window.on_pagekind_change()
     pump(app)
