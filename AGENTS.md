@@ -389,7 +389,7 @@ Lint, format and type-check (none of these is installed in `backend/python`;
 uvx ruff@0.16.7 format --check .        # CI uses: ruff format --check --diff .
 uvx ruff@0.16.7 check .                 # CI uses: ruff check --output-format=github .
 uvx ruff@0.16.7 format .                # to apply formatting
-uvx mypy@1.18.2                         # files/mypy_path come from pyproject.toml
+uvx mypy@2.3.1                          # files/mypy_path come from pyproject.toml
 ```
 
 mypy is **green with no config-level suppressions**: there is no
@@ -408,8 +408,8 @@ line, delete the ignore rather than widen it.
 `app.runlog`. To see what those flags would cost everywhere else:
 
 ```bash
-uvx mypy@1.18.2 --disallow-any-generics --disallow-untyped-defs \
-                --disallow-incomplete-defs --warn-return-any
+uvx mypy@2.3.1 --disallow-any-generics --disallow-untyped-defs \
+               --disallow-incomplete-defs --warn-return-any
 ```
 
 That reports **163 findings, all outside Tier 1, and they are deliberately
