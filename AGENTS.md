@@ -44,7 +44,7 @@ the tree:
   CI only byte-compiled it. **It was deleted** rather than kept as a misleading
   second copy of the pipeline; recover it from git history if ever needed.
 - **There is no monolith left to split.** `worker/worker.py` went 3264 → 168
-  lines and `app/window.py` 2764 → 811; the package is now 53 files. Do not
+  lines and `app/window.py` 2764 → 811; the package is now 54 files. Do not
   "restore" the old protocol or the old pipeline classes into `src/janai/`.
 
 ## Architecture map
@@ -96,6 +96,7 @@ src/janai/
     selection.py           which model a page gets, whether it is levelled, whether it is skipped
     pipeline.py            the concurrency primitives the pipeline stages are built from
     planning.py            what a run will produce, before a single pixel is decoded
+    resume.py              resume state: which sources an output folder has already finished
     control.py             cancel and pause, fed by the interface as bare words on stdin
     events.py              the worker's half of the wire protocol: one JSON object per stdout line
     imageio.py             pixels in, bytes out: decoding, ICC transforms and encoding
@@ -243,8 +244,14 @@ Flags worth knowing: `--print-job` prints the resolved payload and runs nothing;
 `--json` passes the worker's event lines through untouched (that stream is the
 contract — do not reformat it into a weaker second one); `--cancel-after
 SECONDS` requests a stop mid-job, which is how cancellation is tested without a
-human at a terminal. Exit codes: `0` finished, `1` the job reported a failure,
-`2` bad usage, `130` cancelled.
+human at a terminal; `--no-resume` converts everything again instead of trusting
+the output folder's resume manifest. Exit codes: `0` finished, `1` the job
+reported a failure, `2` bad usage, `130` cancelled.
+
+The payload carries `resume` **only** when it differs from the worker's default,
+so `janai run --print-job` still prints byte-for-byte what the GUI would build.
+*Why:* the driver's whole value is being the same job the app runs, and a key
+only the driver ever sets is how that stops being true.
 
 Use the console script after an editable install, or run it straight from a
 checkout — it bootstraps `sys.path` exactly as `worker.py` does:
@@ -310,6 +317,17 @@ is named where one exists.
     for machines with no display, so importing Qt for a job that never opens a
     window would defeat it. (`scripts/smoke.py`'s `headless driver` leg imports
     the driver and fails if `PySide6` lands in `sys.modules`)
+12. **A source is recorded as finished only *after* the rename that publishes
+    it, and `worker/resume.py` is the manifest's only writer.** *Why:* the
+    manifest may forget a finished chapter — that costs one redundant
+    re-convert — but if it can claim an unfinished one, a resumed run silently
+    skips a chapter the user never got. The same asymmetry decides the rest of
+    the contract: a cancelled archive keeps its `.cbz.part` and records the
+    entry names inside it, and the next run appends only when those names are a
+    *prefix* of this run's plan, because appending out of order changes page
+    order in the reader. A manifest whose fingerprint does not match the current
+    job is ignored, never merged. (`scripts/smoke.py`'s `resume manifest` and
+    `resume wiring` legs)
 
 ## Verification
 
@@ -463,6 +481,14 @@ yourself; nothing else will.
   exist. Two survived the Tk→Qt rewrite and the `window.py` split, and this
   document used to name one of the two. `smoke.py` now fails on any of them:
   delete the file, not the check.
+- **`.janai-resume.json` in the output root is the resume manifest**
+  (`worker/resume.py`), not output the user asked for. Deleting it is safe — it
+  only costs the next run its progress — and the scanners ignore it because
+  `.json` is in neither extension set.
+- **A cancelled archive now leaves a `.cbz.part` behind on purpose.** It used to
+  be deleted. That file is what lets "cancelled inside chapter 11" resume inside
+  chapter 11, and keeping it publishes nothing: the atomic `replace()` is still
+  the only way the real `.cbz` is ever created.
 
 ## Working protocol for agents
 

@@ -29,7 +29,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from zipfile import ZIP_STORED, ZipFile
+from zipfile import ZIP_STORED, BadZipFile, ZipFile
 
 from janai.core.fspath import io_path, path_too_long
 from janai.worker import imageio
@@ -41,6 +41,7 @@ from janai.worker.page import PageEncoder, PageWorker
 from janai.worker.pipeline import BundleWriter, Counters, PagePacker, Unit, WritePool, prefetch
 from janai.worker.planning import format_name, path_key, resolve_out, unique_path
 from janai.worker.reporting import JobReporter
+from janai.worker.resume import ResumeLog, planned_entries, unit_key
 
 
 class NoPagesError(Exception):
@@ -82,12 +83,34 @@ class UnitRunner:
     overwrite: bool
     total: int
     io_workers: int
+    #: Resume state for this output folder. Added after the thirteen fields
+    #: above and shared by reference like the other collaborators, because it
+    #: is this job's single record of which sources are already finished.
+    resume: ResumeLog
 
     def handle_archive(self, index: int, unit: Unit) -> None:
         src: Path = unit["path"]
+        key = unit_key(src, Path(str(unit["base"])))
         dest = resolve_out(
             unit, self.out_dir, self.pattern, ".cbz", self.keep_structure, index, self.total
         )
+        # Asked before `exists()` and regardless of `overwrite`, because it is
+        # a different question: the manifest records what *this* job finished
+        # under *these* settings, which is exactly what a resumed run needs to
+        # know. `exists()` cannot tell a chapter this job published from an
+        # unrelated file sitting at that path, and says nothing at all when
+        # the user has overwrite on.
+        if self.resume.is_done(key):
+            self.counters.bump("skipped")
+            emit(
+                "file",
+                i=index,
+                total=self.total,
+                path=str(src),
+                out=str(dest),
+                error="already done, skipped",
+            )
+            return
         if io_path(dest).exists() and not self.overwrite:
             self.counters.bump("skipped")
             emit(
@@ -117,7 +140,7 @@ class UnitRunner:
                 emit("file", i=index, total=self.total, path=str(src), error="unsupported archive")
                 return
             names, reader = opened
-            self.pack_archive(index, src, dest, names, reader, started)
+            self.pack_archive(index, src, dest, names, reader, started, key)
 
     def pack_archive(
         self,
@@ -127,6 +150,7 @@ class UnitRunner:
         names: list[str],
         reader: ArchiveReader,
         started: float,
+        key: str = "",
     ) -> None:
         """Encode every page of one already-open archive into its output CBZ.
 
@@ -143,6 +167,15 @@ class UnitRunner:
         written = 0
         failed_entries = 0
         seen: set[str] = set()
+        # What this run *would* name each page, worked out without decoding
+        # anything, purely so a surviving `.part` can be checked against it.
+        planned = planned_entries(names, self.ext)
+        resumed = self.resume_point(key, tmp, planned)
+        if resumed:
+            # Re-claim the names already in the archive, so the de-dup inside
+            # the loop cannot hand one of them out a second time.
+            seen.update(entry.lower() for entry in planned[:resumed])
+            log(f"{src.name}: resuming after {resumed} of {len(names)} pages", "info")
 
         def on_page_fail(entry: str, exc: BaseException) -> None:
             """Report a page the packer could not encode. Runs on the pack thread.
@@ -156,7 +189,10 @@ class UnitRunner:
             log(traceback.format_exc(limit=4), "debug")
 
         try:
-            with ZipFile(tmp_io, "w", ZIP_STORED) as zf:
+            # Append when resuming so the pages already packed keep their
+            # place: "w" would truncate them, and page order is user-visible
+            # in a reader.
+            with ZipFile(tmp_io, "a" if resumed else "w", ZIP_STORED) as zf:
                 # Encoding is not cheap beside the upscale it follows -- ~9% of a
                 # page for PNG, ~72% for AVIF -- and it used to run inline, so
                 # the GPU idled through all of it. The packer overlaps it with
@@ -164,7 +200,9 @@ class UnitRunner:
                 # in the order they were read.
                 packer = PagePacker(zf, self.encoder.encode, on_page_fail)
                 try:
-                    for k, name in enumerate(names, 1):
+                    # `k` stays the absolute page number so progress still
+                    # reads 1..N and the de-dup suffix keeps its meaning.
+                    for k, name in enumerate(names[resumed:], resumed + 1):
                         if CTRL.cancelled:
                             raise Cancelled
                         CTRL.gate()
@@ -220,10 +258,14 @@ class UnitRunner:
                 finally:
                     # The zip must not close under an in-flight writestr, and
                     # the packer's tallies are only readable once every task has
-                    # joined. A cancelled run discards the .part, so its queued
-                    # pages are dropped rather than encoded for nothing.
+                    # joined. A cancelled run still drops its queued pages
+                    # rather than encoding pages nobody is waiting for; what
+                    # already reached the .part is kept for the next run.
                     packer.close(drain=not CTRL.cancelled)
-                    written = packer.written
+                    # Pages carried over from an interrupted run count as well.
+                    # Without them a fully-resumed archive would look empty and
+                    # be thrown away by the guard below.
+                    written = resumed + packer.written
                     failed_entries += packer.failed
             if written == 0:
                 # Publishing now would put an EMPTY .cbz where a chapter
@@ -238,6 +280,9 @@ class UnitRunner:
                     else "no pages in archive"
                 )
             tmp_io.replace(dest_io)
+            # Only now. The manifest's one promise is that a recorded unit is
+            # published, and this rename is the moment that becomes true.
+            self.resume.mark_done(key, dest, written)
             self.counters.bump("processed")
             emit(
                 "file",
@@ -251,10 +296,18 @@ class UnitRunner:
                 failed=failed_entries,
             )
         except Cancelled:
-            tmp_io.unlink(missing_ok=True)
+            # Keep what was packed, so the next run carries on inside this
+            # archive instead of starting it over. Nothing is published by
+            # doing so: `replace()` above is still the only way `dest` is ever
+            # created, so a partial chapter cannot pose as a finished one.
+            self.keep_partial(key, tmp)
             raise
         except Exception as exc:
             tmp_io.unlink(missing_ok=True)
+            # The .part is gone, so the record pointing at it has to go too,
+            # or the next run would try to resume from a file that is no
+            # longer there.
+            self.resume.drop(key)
             self.counters.bump("failed")
             emit(
                 "file",
@@ -263,6 +316,53 @@ class UnitRunner:
                 path=str(src),
                 error=f"{type(exc).__name__}: {exc}",
             )
+
+    def resume_point(self, key: str, tmp: Path, planned: list[str]) -> int:
+        """How many pages of this archive a surviving ``.part`` already holds.
+
+        Zero means start over. The survivor must hold exactly the entry names
+        of a *prefix* of this run's plan: a gap -- a page that failed last time
+        -- or an unexpected name means it cannot be appended to without
+        changing page order, which is user-visible in a reader, so it is
+        discarded instead of being repaired on a guess.
+        """
+        recorded = self.resume.partial_entries(key)
+        if not recorded or not io_path(tmp).exists():
+            return 0
+        try:
+            with ZipFile(io_path(tmp)) as zf:
+                existing = zf.namelist()
+        except (OSError, BadZipFile) as exc:
+            log(f"ignoring an unreadable partial archive: {exc}", "debug")
+            return 0
+        if existing != recorded or planned[: len(existing)] != existing:
+            return 0
+        return len(existing)
+
+    def keep_partial(self, key: str, tmp: Path) -> None:
+        """Record how far an interrupted archive got, and keep its ``.part``.
+
+        The entry names are read back from the closed zip rather than tracked
+        in memory, because only the file itself knows which encodes actually
+        landed before the cancel arrived. An unreadable or empty survivor is
+        deleted: it could only mislead the next run.
+        """
+        if not self.resume.enabled:
+            io_path(tmp).unlink(missing_ok=True)
+            return
+        try:
+            with ZipFile(io_path(tmp)) as zf:
+                entries = zf.namelist()
+        except (OSError, BadZipFile) as exc:
+            log(f"discarding an unusable partial archive: {exc}", "debug")
+            io_path(tmp).unlink(missing_ok=True)
+            self.resume.drop(key)
+            return
+        if not entries:
+            io_path(tmp).unlink(missing_ok=True)
+            self.resume.drop(key)
+            return
+        self.resume.mark_partial(key, tmp, entries)
 
     def read_unit(self, unit: Unit) -> ImageArray | None:
         """Decode one planned unit ahead of the pipeline, on a prefetch thread.

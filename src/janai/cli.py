@@ -158,6 +158,7 @@ def build_job(
     models_dir: Path | None,
     *,
     dry: bool = False,
+    resume: bool = True,
 ) -> dict[str, Any]:
     """The worker payload for these settings.
 
@@ -199,6 +200,11 @@ def build_job(
     }
     if dry:
         job["dry_run"] = True
+    # Same shape as ``dry_run``: the key is present only when it deviates from
+    # the worker's default, so the payload the GUI builds stays byte-identical
+    # and the mirror claimed above stays true. Resume is on unless asked.
+    if not resume:
+        job["resume"] = False
     return job
 
 
@@ -484,7 +490,14 @@ def cmd_run(args: argparse.Namespace, *, dry: bool) -> int:
             file=sys.stderr,
         )
         return EXIT_USAGE
-    job = build_job(data, src, resolve_out_dir(src, str(args.out or ""), data), models_dir, dry=dry)
+    job = build_job(
+        data,
+        src,
+        resolve_out_dir(src, str(args.out or ""), data),
+        models_dir,
+        dry=dry,
+        resume=bool(args.resume),
+    )
     if args.print_job:
         print(json.dumps(job, indent=2, ensure_ascii=False))
         return EXIT_OK
@@ -544,6 +557,12 @@ def job_options() -> argparse.ArgumentParser:
     ap.add_argument("--format", dest="format_id", choices=FORMAT_IDS, help="output format")
     ap.add_argument("--pattern", help='output name pattern, e.g. "{name}_JaNai"')
     ap.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=None)
+    ap.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="skip sources the output folder's manifest already records as done",
+    )
     ap.add_argument("--keep-structure", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument(

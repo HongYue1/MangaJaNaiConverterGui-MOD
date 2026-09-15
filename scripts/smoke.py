@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from janai.app import runlog
 from janai.core import displays, filetypes, formats, paths, presets, rules
-from janai.worker import planning
+from janai.worker import planning, resume
 
 FAILED: list[str] = []
 
@@ -539,6 +539,128 @@ def headless_driver() -> None:
     assert plan.get("dry_run") is True, "plan must ask the worker for a dry run"
 
 
+def resume_manifest() -> None:
+    """The manifest may forget a finished unit; it must never invent one.
+
+    Both halves of that asymmetry are asserted here, plus the fingerprint rule
+    that stops a stale record from skipping exactly the work the user's new
+    settings would have changed.
+    """
+    job: dict[str, Any] = {
+        "input": {"dir": "in"},
+        "output": {"dir": "out", "format": "cbz", "overwrite": False},
+        "format": {"kind": "jpeg", "quality": 90},
+        "upscale": {"scale": 2},
+        "perf": {"threads": 4},
+    }
+    fp = resume.fingerprint(job)
+    assert resume.fingerprint({**job, "perf": {"threads": 1}}) == fp, (
+        "perf decides how long a page takes, not what it contains"
+    )
+    moved = {**job, "output": {**job["output"], "dir": r"D:\elsewhere"}}
+    assert resume.fingerprint(moved) == fp, "the same output spelled differently is one job"
+    worse = {**job, "format": {"kind": "jpeg", "quality": 60}}
+    assert resume.fingerprint(worse) != fp, "a quality change rewrites the bytes"
+    assert resume.fingerprint({**job, "upscale": {"scale": 4}}) != fp, "scale changes the output"
+
+    base = Path(tempfile.gettempdir(), "manga")
+    key = resume.unit_key(base / "Vol 01" / "Ch 11.cbz", base)
+    assert key == "vol 01/ch 11.cbz", key
+    outside = resume.unit_key(Path(tempfile.gettempdir(), "Loose.cbz"), base)
+    assert outside.endswith("loose.cbz") and "\\" not in outside, outside
+
+    assert resume.planned_entries(["b.png", "a.jpg", "b.jpeg", "b.bmp"], ".png") == [
+        "b.png",
+        "a.png",
+        "b_3.png",
+        "b_4.png",
+    ], "the prediction must de-dup exactly as the packer does"
+
+    with tempfile.TemporaryDirectory() as raw:
+        out = Path(raw)
+        state = resume.ResumeLog.load(out, fp)
+        assert not state.is_done(key) and state.finished_count() == 0
+        state.mark_partial(key, out / "Ch 11.cbz.part", ["001.png", "002.png"])
+        assert not state.is_done(key), "a partial is progress, not a finished unit"
+        assert (out / resume.MANIFEST_NAME).exists(), "the manifest sits in the output root"
+
+        reopened = resume.ResumeLog.load(out, fp)
+        assert reopened.partial_entries(key) == ["001.png", "002.png"], "page order survives"
+        reopened.mark_done(key, out / "Ch 11.cbz", 24)
+        assert reopened.is_done(key) and reopened.finished_count() == 1
+        assert reopened.partial_entries(key) == [], "publishing retires the partial"
+        assert resume.ResumeLog.load(out, fp).is_done(key), "a finished unit survives a restart"
+
+        changed = resume.ResumeLog.load(out, "0" * resume.FINGERPRINT_CHARS)
+        assert not changed.is_done(key), "a record from other settings is not trusted"
+        assert changed.finished_count() == 0
+
+        off = resume.ResumeLog.load(out, fp, enabled=False)
+        assert not off.is_done(key), "--no-resume must convert everything again"
+        assert off.partial_entries(key) == []
+        off.mark_done("other.cbz", out / "other.cbz", 1)
+        assert resume.ResumeLog.load(out, fp).is_done(key), (
+            "a disabled log must not write, or opting out would erase real progress"
+        )
+
+        resume.ResumeLog.load(out, fp).drop(key)
+        assert not resume.ResumeLog.load(out, fp).is_done(key), "drop is persistent"
+
+        (out / resume.MANIFEST_NAME).write_text("{ truncated", encoding="utf-8")
+        assert not resume.ResumeLog.load(out, fp).is_done(key), (
+            "an unreadable manifest is ignored, never fatal"
+        )
+
+
+#: The publish-then-record order and the cancel arm cannot be exercised from
+#: here -- importing the orchestrator pulls in the decoder and torch -- so they
+#: are pinned by reading its source instead.
+ORCHESTRATE = ROOT / "src" / "janai" / "worker" / "orchestrate.py"
+
+
+def _code_only(text: str) -> str:
+    """Source with comments stripped, so prose can never satisfy a guard.
+
+    A WHY comment at one of these very sites once matched a guard that was
+    counting call sites, and the guard passed while the code was still wrong.
+    """
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+
+
+def _assert_resume_wiring(text: str) -> None:
+    code = _code_only(text)
+    publish = code.find("tmp_io.replace(dest_io)")
+    record = code.find("self.resume.mark_done(")
+    assert publish != -1, "the publishing rename is gone"
+    assert record != -1, "a finished archive no longer records itself"
+    assert publish < record, (
+        "mark_done must follow the publishing replace(), or a crash between the "
+        "two would leave a record claiming a chapter that was never published"
+    )
+    assert code.count("self.resume.mark_done(") == 1, (
+        "one recorder per archive, so no other path can claim an unpublished one"
+    )
+    # The cancel arm of the *publishing* try block. `except Cancelled:` occurs
+    # twice in that function -- the inner one drops a single page -- and only
+    # the outer arm is the one that has to leave the .part on disk, so the
+    # search starts at the rename rather than at the top of the file.
+    cancelled = code.index("except Cancelled:", publish)
+    arm = code[cancelled : code.index("except Exception", cancelled)]
+    assert "keep_partial" in arm, "a cancelled archive must record how far it got"
+    assert "unlink" not in arm, (
+        "the .part has to survive a cancel, or resuming inside chapter 11 starts "
+        "chapter 11 from its first page"
+    )
+    assert "def planned_entries" not in code, (
+        "planned_entries lives in janai.worker.resume so this dependency-free "
+        "gate can test it; a local copy would drift from the packer it mirrors"
+    )
+
+
+def resume_wiring() -> None:
+    _assert_resume_wiring(ORCHESTRATE.read_text(encoding="utf-8"))
+
+
 def main() -> int:
     print(f"smoke test in {ROOT}")
     check("output formats", output_formats)
@@ -552,6 +674,8 @@ def main() -> int:
     check("vram budget clamp", vram_budget_clamp)
     check("oom recovery", oom_recovery_frees_without_copying)
     check("headless driver", headless_driver)
+    check("resume manifest", resume_manifest)
+    check("resume wiring", resume_wiring)
     check("page entries", page_entries)
     check("entry name decoding", entry_name_decoding)
     check("rule engine", rule_engine)

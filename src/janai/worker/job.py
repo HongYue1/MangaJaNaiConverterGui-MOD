@@ -39,6 +39,7 @@ from janai.worker.planning import (
     unique_path,
 )
 from janai.worker.reporting import JobReporter
+from janai.worker.resume import ResumeLog, fingerprint
 from janai.worker.selection import PagePolicy
 from janai.worker.transforms import (
     GRAY_SAMPLE,
@@ -260,6 +261,16 @@ def run_job(job: dict) -> int:
         encoder.encode, reporter.bundle_page, reporter.bundle_failed, reporter.bundle_done
     )
 
+    # Which sources this output folder has already finished, read from the
+    # manifest that sits beside them. Default on, because a resume record that
+    # only exists when the user thought to ask for it is no use to the user who
+    # cancelled without planning to. The fingerprint is what keeps it honest: a
+    # record written under different settings is ignored, not trusted.
+    resume = ResumeLog.load(out_dir, fingerprint(job), enabled=bool(job.get("resume", True)))
+    already = resume.finished_count()
+    if already:
+        log(f"resuming: {already} of {total} already done", "info")
+
     # One object for everything that happens to a single planned unit, so the
     # loop below is dispatch and nothing else. The collaborators go in by
     # reference -- `counters` above all, which is locked and is this run's only
@@ -279,6 +290,7 @@ def run_job(job: dict) -> int:
         overwrite=overwrite,
         total=total,
         io_workers=io_workers,
+        resume=resume,
     )
 
     cancelled = False
