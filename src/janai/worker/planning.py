@@ -115,6 +115,13 @@ def gather_units(inp: dict[str, Any]) -> list[dict[str, Any]]:
 
     if raw.is_file():
         add(raw, raw.parent)
+        # `base` has to stay the parent folder -- `keep_structure` and the
+        # resume key are both relative to it -- but that folder is not a
+        # chapter. Without this flag a one-file run packed itself as
+        # "Downloads.cbz", named after whatever folder the file happened to
+        # sit in. See bundle_stem().
+        for unit in units:
+            unit["solo"] = True
     elif raw.is_dir():
         it = raw.rglob("*") if recursive else raw.glob("*")
         for p in sorted(
@@ -205,10 +212,25 @@ def relative_dir(unit: dict[str, Any]) -> Path:
         return Path()
 
 
+def bundle_stem(unit: dict[str, Any]) -> str:
+    """What the archive holding this page is named after.
+
+    A chosen file names itself; a chosen folder names the folder. `base`
+    cannot answer this alone: for a single-file run it is the parent folder,
+    so both "one .cbz" and "a .cbz per folder" used to name the archive after
+    a folder the user never picked.
+    """
+    stem = Path(str(unit["path"])).stem
+    if unit.get("solo"):
+        return stem
+    base = Path(str(unit["base"]))
+    return base.name if base.is_dir() else stem
+
+
 def chapter_dest(unit: dict[str, Any], out_dir: Path, keep_structure: bool) -> Path:
     """The .cbz that this file's own folder becomes."""
     rel = relative_dir(unit)
-    name = rel.name or Path(str(unit["base"])).name or unit["path"].stem
+    name = rel.name or bundle_stem(unit)
     parent = out_dir / (rel.parent if keep_structure else Path())
     return parent / f"{safe_name(name)}.cbz"
 
@@ -241,9 +263,7 @@ def build_tasks(
         group = groups.get(key)
         if group is None:
             if container_id == "cbz_single":
-                base = Path(str(unit["base"]))
-                stem = base.name if base.is_dir() else unit["path"].stem
-                dest = out_dir / f"{safe_name(stem)}.cbz"
+                dest = out_dir / f"{safe_name(bundle_stem(unit))}.cbz"
             else:
                 dest = chapter_dest(unit, out_dir, keep_structure)
             group = {"kind": "bundle", "key": key, "dest": dest, "units": []}
