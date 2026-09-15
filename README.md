@@ -35,8 +35,11 @@ than kept alongside the new UI.
   (grayscale vs colour, size) and names the model to use, so a folder of mixed
   pages is handled in one run without switching settings by hand. The table is
   the only thing that selects a model — there is no second, hidden mechanism.
-* **Fit modes and device presets.** Upscale by scale factor, to a target width,
-  to a target height, or to fit a specific screen size.
+* **A custom exclusions table.** Any row can say “no upscale — re-encode only”
+  instead of naming a model, matched on page kind and a size range, so webtoon
+  strips, credits pages or anything already large enough pass through into the
+  output format untouched — with the numbers visible and editable in the table,
+  rather than one hardcoded long-strip switch.
 * **Adaptive tiling from measurement.** The machine is profiled once, then tile
   size is chosen from that measurement and held across a chapter instead of
   being re-guessed per image. A fixed tile size and a VRAM budget are still
@@ -44,8 +47,12 @@ than kept alongside the new UI.
 * **A capability probe at startup.** Devices, encoders, models and library
   versions are detected and reported, so the format list offers only what this
   install can actually write, with a tooltip explaining anything that is off.
-* **Output packaging.** Loose files, one CBZ per source folder or archive, or a
-  single CBZ for the whole run.
+* **JPEG XL output**, added by this fork. `.jxl` is written through libvips,
+  `pillow-jxl` or the bundled `cjxl`, whichever this install actually has, and
+  the probe reports which one it used.
+* **Output packaging**, added by this fork. Loose files, one CBZ per source
+  folder or archive, or a single CBZ for the whole run — so a folder of loose
+  pages becomes a ready-to-read archive without a second tool.
 * **Dry run.** Reports exactly what a run would write — including skips and
   exclusions — without loading a model.
 * **Resume.** A `.janai-resume.json` manifest is written next to the output and
@@ -58,47 +65,36 @@ than kept alongside the new UI.
   `--print-job`, `--cancel-after`, `--resume/--no-resume` and meaningful exit
   codes, so the pipeline can be scripted or tested without the GUI and without
   hand-writing a job file.
-* **Named presets, a live run log** (kept on disk, 40 runs), **a keep-GPU-awake
-  hold**, dark/light theme, and a status line with one monotonic counter.
+* **Named presets, a live run log** — what the window shows is also written to
+  `logs\Run_<timestamp>.log`, one file per run, and the 30 most recent are kept
+  while older ones are pruned — **a keep-GPU-awake hold**, dark/light theme, and
+  a status line with one monotonic counter.
 * **Linux support** — `setup.sh` and `./janai-upscaler.sh` alongside the Windows
   `setup.cmd` / `JaNaiUpscaler.cmd`.
-* **A self-contained install.** The interpreter, weights, backend source, ICC
-  profiles and tools are all resolved inside the app folder. It never reads from
-  an install of the original application.
+* **A self-contained install, so the whole thing stays portable.** The
+  interpreter, weights, backend source, ICC profiles and tools are all resolved
+  inside the app folder: copy that folder to another disk or another machine and
+  it runs there, with nothing installed system-wide and no registry or `PATH`
+  entries to carry over. It never reads from an install of the original
+  application.
 
 ### Engineering work
 
-* The worker and the main window were split into cohesive modules
-  (`worker.py` 3,264 → 168 lines; `window.py` 2,764 → 811 lines) with a one-way
-  dependency direction: `app → core`, `worker → core`, and nothing imports
-  `app`. Nothing under `app` or `core` imports torch, which is what keeps the
-  window and the dry run instant.
-* ruff (lint + format) and mypy run with committed configuration, in CI on
-  Windows and Ubuntu, plus ~20 executable gate scripts and a real-GPU self-test.
-* ~40 defects found and fixed in this fork's own code across concurrency,
-  cancellation, archive handling, path handling and output naming.
-* Two defects in the inherited chaiNNer-derived backend were fixed after reading
-  the code at the fork point directly. Both are now covered by a test in this
-  repository:
-  * the tile-size budget was computed from the card's **total** VRAM while
-    `mem_get_info()`'s free-memory value was discarded, so tiles could be
-    planned larger than the memory actually available; it is now budgeted from
-    free memory;
-  * the out-of-memory recovery path copied the failing tile back to host RAM
-    (and discarded the copy) inside an `except Exception: pass`, asking for a
-    large host allocation at the moment an allocation had just failed; recovery
-    now simply releases the device allocation. The adjacent pause path called
-    `safe_cuda_cache_empty()`, a name that module neither defines nor imports,
-    and now calls the imported device-aware function.
+The worker and the main window were split into cohesive modules with a one-way
+dependency direction (`worker.py` 3,264 → 168 lines, `window.py` 2,764 → 811
+lines; nothing under `app` or `core` imports torch, which is what keeps the
+window and the dry run instant). ruff and mypy run over the tree with committed
+configuration, in CI on Windows and Ubuntu, alongside ~20 executable gate
+scripts and a real-GPU self-test. ~40 defects were fixed in this fork's own
+code, two more in the inherited chaiNNer-derived backend as it stood at the
+commit this fork branched from, and every dependency pin was decided by
+measurement rather than by changelog — one available libvips upgrade was
+rejected because it changes output bytes for identical inputs.
 
-  These statements describe the code as it stood at the commit this fork
-  branched from and may not reflect current upstream.
-* Dependency pins were audited by measurement rather than by changelog. One
-  available upgrade (libvips 8.18.6) was **rejected** because it changes PNG and
-  AVIF output bytes for identical inputs and settings; the reason is recorded on
-  the pin itself.
-
-Full detail, with commit references: [`docs/changes.md`](docs/changes.md).
+**For the detail — every change since the fork with commit references, the
+measurements behind each claim, the two backend defects in full with their
+scope, and the reasoning for each decision — see
+[`docs/changes.md`](docs/changes.md).**
 
 ---
 
@@ -109,7 +105,9 @@ Full detail, with commit references: [`docs/changes.md`](docs/changes.md).
 * Windows 10/11 or Linux
 * An NVIDIA GPU is strongly recommended (CPU upscaling works, but is slow)
 * [`uv`](https://docs.astral.sh/uv/) — `setup` installs it if it is missing
-* ~10 GB of disk space for the runtime, torch build and model packs
+* ~7 GB of disk space once installed — about 5 GB for the private interpreter
+  and the CUDA torch build, 1.3 GB for both model packs, the rest source and
+  tools. Installing one model pack instead of both takes noticeably less.
 
 ### Setup
 
@@ -211,7 +209,7 @@ half-processed archive.
 | `settings.json` | current UI state |
 | `presets\<name>.janai.json` | named presets |
 | `janai.config.json`, `janai.runtime.txt` | install layout and the interpreter setup found |
-| `logs\Run_YYYYMMDD-HHMMSS.log` | one log per run (40 kept) |
+| `logs\Run_YYYYMMDD-HHMMSS.log` | one log per run (30 most recent kept) |
 | `<output>\.janai-resume.json` | resume manifest for the destination |
 
 ### Command line

@@ -60,11 +60,12 @@ desktop.ini
 
 # ---------------------------------------------------------------------------
 # Agent working files. Deliberately untracked:
-#   MEMORY.md   the agent's sole working memory for a task; per-session, not
-#               a project document (AGENTS.md is the tracked one).
 #   .skills/    maintainer-curated guidance for agents, maintained outside
 #               this repo's history.
+#   MEMORY.md   scratch an agent may leave behind. There is no memory protocol:
+#               AGENTS.md and docs/changes.md are the tracked record, so this is
+#               ignored rather than kept.
 # ---------------------------------------------------------------------------
-MEMORY.md
 .skills/
 skills/
+MEMORY.md

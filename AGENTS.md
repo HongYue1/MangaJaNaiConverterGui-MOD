@@ -523,18 +523,18 @@ not a gate.
 
 ## Working protocol for agents
 
-Two untracked files support agent work and must stay untracked (`.gitignore`
-covers `MEMORY.md`, `.skills/` and `skills/`):
+There is no memory file, and nothing carries between sessions outside the tree.
+This document, the code and its comments, and [`docs/changes.md`](docs/changes.md)
+— what changed since the fork, and why — are the whole record; anything else is
+re-derived by reading the code rather than trusted from a previous session.
+Findings that outlive a task belong in one of those tracked documents, and
+everything else belongs in the report to the user.
 
-- **`MEMORY.md`** — the sole memory for a long task. Chat context is unreliable,
-  so it is updated after every completed step, before and after every edit batch,
-  on every decision, and on every finding. It must let a fresh agent resume
-  without re-deriving anything, and it is **pruned** rather than appended
-  forever: a finished item becomes a one-line record, not a story.
-- **`.skills/`** — user-maintained guidance (note: dotted directory; briefs
-  sometimes call it `./skills/`). Read it at the start of a session. It is
-  guidance, not gospel: where it conflicts with the code, the code wins and the
-  conflict gets recorded in `MEMORY.md`.
+`.skills/` is user-maintained guidance (note: the dotted directory; briefs
+sometimes call it `./skills/`). It stays untracked — `.gitignore` covers
+`.skills/` and `skills/` — so read it at the start of a session. It is guidance,
+not gospel: where it conflicts with the code, the code wins, and the conflict
+goes in the report to the user.
 
 The method that worked for every commit in the refactor, in order:
 
