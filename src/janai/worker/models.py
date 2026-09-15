@@ -26,6 +26,7 @@ from typing import Any
 from janai.core import rules as _rules
 from janai.core.paths import MODEL_EXTS
 from janai.worker import runtime, tiling
+from janai.worker.control import Cancelled
 from janai.worker.events import log
 
 
@@ -64,6 +65,23 @@ def model_info(p: Path) -> dict:
     }
 
 
+def _vendored_abort() -> tuple[type[BaseException], ...]:
+    """The exception classes a vendored node raises for *our own* cancel.
+
+    `ExecutorNodeContext.aborted` (devices.py) reports `Control.cancelled`, and
+    the vendored `Progress.check_aborted()` turns that into its own
+    `api.node_context.Aborted` - an exception the page loop has never heard of,
+    so `orchestrate`'s broad handler used to count a user stop as a lost page
+    (`pages_failed: 1` with an empty warning, because `Aborted` carries no
+    text). Every call into a vendored node translates it back to `Cancelled`.
+
+    Returns an empty tuple before the backend is loaded, so the `except`
+    catches nothing instead of raising `TypeError` over the real error.
+    """
+    cls = runtime.Aborted
+    return (cls,) if isinstance(cls, type) and issubclass(cls, BaseException) else ()
+
+
 class ModelCache:
     def __init__(self, ctx, want_scale: float = 0.0) -> None:
         self.ctx = ctx
@@ -75,7 +93,10 @@ class ModelCache:
     def get(self, path: str):
         got = self._cache.get(path)
         if got is None:
-            loaded = runtime.load_model_node(self.ctx, Path(path))
+            try:
+                loaded = runtime.load_model_node(self.ctx, Path(path))
+            except _vendored_abort() as exc:
+                raise Cancelled from exc
             got = loaded[0] if isinstance(loaded, tuple) else loaded
             self._cache[path] = got
             scale = getattr(got, "scale", None)
@@ -165,7 +186,10 @@ def upscale_array(ctx, image, model, tile):
     report = tiling.split_report()
     if report is not None:
         report["tile"] = 0
-    result = runtime.upscale_image_node(ctx, image, model, False, 0, tile, 256, False)
+    try:
+        result = runtime.upscale_image_node(ctx, image, model, False, 0, tile, 256, False)
+    except _vendored_abort() as exc:
+        raise Cancelled from exc
     if runtime.hwc(image)[2] == 1 and result.ndim == 3:
         result = runtime.np.squeeze(result, axis=-1)
     return result

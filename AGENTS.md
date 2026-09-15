@@ -328,6 +328,16 @@ is named where one exists.
     order in the reader. A manifest whose fingerprint does not match the current
     job is ignored, never merged. (`scripts/smoke.py`'s `resume manifest` and
     `resume wiring` legs)
+13. **Every call into a vendored node translates `api.node_context.Aborted`
+    back into `Cancelled`.** `ModelCache.get` and `upscale_array` (both in
+    `worker/models.py`) are the only two such call sites, and both do it.
+    *Why:* the vendored progress token raises its *own* `Aborted` when it
+    notices our cancel, and the page loop's broad handler counted that as a lost
+    page — a clean stop reported `pages_failed: 1` and logged a blank warning,
+    because `Aborted` carries no message. Translate, never swallow: a genuine
+    upscale failure must stay a failure, so the translation is keyed on that one
+    class and on nothing wider. (`scripts/smoke.py`'s `cancel is not a lost
+    page` leg)
 
 ## Verification
 

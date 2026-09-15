@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from janai.app import runlog
 from janai.core import displays, filetypes, formats, paths, presets, rules
-from janai.worker import planning, resume
+from janai.worker import control, models, planning, resume, runtime
 
 FAILED: list[str] = []
 
@@ -661,6 +661,86 @@ def resume_wiring() -> None:
     _assert_resume_wiring(ORCHESTRATE.read_text(encoding="utf-8"))
 
 
+def cancel_not_a_lost_page() -> None:
+    """A user stop must never be reported as a page the run failed to convert.
+
+    The vendored nodes raise their own ``api.node_context.Aborted`` when our
+    ``ExecutorNodeContext`` reports ``aborted``, and the archive page loop
+    counts anything that is not ``Cancelled`` as a lost page - so an
+    untranslated abort makes a cancel look like data loss in the ``done``
+    summary. Measured before the fix: ``pages_failed: 1`` alongside
+    ``failed: 0``, plus a warning line with no message at all, because
+    ``Aborted`` carries no text.
+
+    Both boundaries that call into a vendored node are asserted, and so is the
+    opposite direction: a genuine upscale failure must NOT become a cancel, or
+    the translation would be a blanket swallow hiding real page loss.
+    """
+
+    class VendoredAbortError(Exception):
+        """Stands in for `api.node_context.Aborted`, which needs the backend."""
+
+    class RealFailureError(Exception):
+        """A genuine page failure, which must stay a failure."""
+
+    def abort(*_args: object, **_kwargs: object) -> None:
+        raise VendoredAbortError
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise RealFailureError
+
+    saved_abort = getattr(runtime, "Aborted", None)
+    saved_upscale = runtime.upscale_image_node
+    saved_load = runtime.load_model_node
+    try:
+        runtime.Aborted = VendoredAbortError
+        runtime.upscale_image_node = abort
+        try:
+            models.upscale_array(None, object(), object(), 0)
+        except control.Cancelled:
+            pass
+        except VendoredAbortError:
+            raise AssertionError(
+                "upscale_array leaks the vendored Aborted, so the page loop counts a "
+                "cancel as a lost page"
+            ) from None
+        else:
+            raise AssertionError("upscale_array swallowed the abort instead of translating it")
+
+        runtime.upscale_image_node = boom
+        try:
+            models.upscale_array(None, object(), object(), 0)
+        except control.Cancelled:
+            raise AssertionError("a real upscale failure is being reported as a cancel") from None
+        except RealFailureError:
+            pass
+
+        runtime.load_model_node = abort
+        try:
+            models.ModelCache(None).get("4x_model.pth")
+        except control.Cancelled:
+            pass
+        except VendoredAbortError:
+            raise AssertionError("the model load path leaks the vendored Aborted") from None
+        else:
+            raise AssertionError("the model load swallowed the abort instead of translating it")
+
+        # Before the heavy stack is loaded the handle is still None, and
+        # `except None` raises TypeError over the top of the real error.
+        runtime.Aborted = None
+        runtime.upscale_image_node = boom
+        try:
+            models.upscale_array(None, object(), object(), 0)
+        except RealFailureError:
+            pass
+        except TypeError as exc:
+            raise AssertionError(f"the translation breaks with no backend loaded: {exc}") from None
+    finally:
+        runtime.Aborted = saved_abort
+        runtime.upscale_image_node = saved_upscale
+        runtime.load_model_node = saved_load
+
+
 def main() -> int:
     print(f"smoke test in {ROOT}")
     check("output formats", output_formats)
@@ -676,6 +756,7 @@ def main() -> int:
     check("headless driver", headless_driver)
     check("resume manifest", resume_manifest)
     check("resume wiring", resume_wiring)
+    check("cancel is not a lost page", cancel_not_a_lost_page)
     check("page entries", page_entries)
     check("entry name decoding", entry_name_decoding)
     check("rule engine", rule_engine)

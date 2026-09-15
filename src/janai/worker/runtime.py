@@ -90,6 +90,10 @@ upscale_image_node: Any = None
 load_model_node: Any = None
 SettingsParser: Any = None
 NodeContext: Any = None
+#: The vendored nodes' own abort signal (`api.node_context.Aborted`). Held here
+#: so the two call sites in `models` can translate it back into our `Cancelled`:
+#: it is *our* cancel arriving through vendored code, not a page failure.
+Aborted: Any = None
 ProgressController: Any = None
 TILE: dict[str, Any] = {}
 _heavy_loaded = False
@@ -146,14 +150,18 @@ def load_imaging(perf: dict | None = None) -> None:
 def load_backend(perf: dict | None = None) -> None:
     global torch, cx_resize, ResizeFilter, normalize, to_uint8, get_h_w_c
     global upscale_image_node, load_model_node, SettingsParser, NodeContext
-    global ProgressController, TILE, _heavy_loaded
+    global ProgressController, TILE, Aborted, _heavy_loaded
     load_imaging(perf)
     if _heavy_loaded:
         return
 
     import spandrel_custom
     import torch as torch_mod
-    from api import NodeContext as NodeContext_cls, SettingsParser as SettingsParser_cls
+    from api import (
+        Aborted as Aborted_cls,
+        NodeContext as NodeContext_cls,
+        SettingsParser as SettingsParser_cls,
+    )
     from chainner_ext import ResizeFilter as ResizeFilter_cls, resize as cx_resize_fn
     from nodes.impl.image_utils import normalize as normalize_fn, to_uint8 as to_uint8_fn
     from nodes.impl.upscale.auto_split_tiles import (
@@ -183,6 +191,7 @@ def load_backend(perf: dict | None = None) -> None:
     normalize, to_uint8, get_h_w_c = normalize_fn, to_uint8_fn, get_h_w_c_fn
     upscale_image_node, load_model_node = upscale_image_node_fn, load_model_node_fn
     SettingsParser, NodeContext = SettingsParser_cls, NodeContext_cls
+    Aborted = Aborted_cls
     ProgressController = ProgressController_cls
     TILE = {
         "estimate": ESTIMATE,
