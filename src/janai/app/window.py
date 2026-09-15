@@ -435,11 +435,16 @@ class MainWindow(
             suffix=" px",
             special="off",
             tip=(
-                "Shrinks an oversized page to this height first and then upscales it "
-                "as usual. Worth using when raws are far larger than the model was "
-                "trained for - a 3000px scan through a 1600p model - since the model "
-                "sees fewer pixels, which is both faster and often cleaner. The page "
-                "is still upscaled, unlike an exclusion rule in the table."
+                "A height in pixels: 0 reads as \u201coff\u201d, and anything from 100 "
+                "to 20000 is accepted (the arrows step by 100, or type an exact "
+                "number). Only a page taller than this is shrunk, to exactly this "
+                "height, with the width following the aspect ratio - width is never "
+                "the test, and a shorter page is left alone. The shrink happens first "
+                "and the page is then upscaled as usual. Worth using when raws are far "
+                "larger than the model was trained for - a 3000px scan through a "
+                "1600p model - since the model sees fewer pixels, which is both faster "
+                "and often cleaner. The page is still upscaled, unlike an exclusion "
+                "rule in the table."
             ),
         )
         body.field("Pre-downscale height", "Shrink huge pages before the model.", self.sp_pre_h)

@@ -26,6 +26,9 @@ import re
 import time
 from typing import TYPE_CHECKING, Any
 
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import QDialog, QPlainTextEdit, QVBoxLayout
+
 from janai.app.fields import TILE_CHOICES, tile_label
 from janai.app.runlog import fmt_bytes, fmt_secs
 from janai.app.widgets import (
@@ -135,6 +138,22 @@ class PerfPanelMixin(_Base):
         self.lbl_profile = label("", "hint", wrap=True)
         body.control(self.lbl_profile)
 
+        self.btn_packages = button(
+            "Installed packages\u2026",
+            self.show_packages,
+            variant="ghost",
+            tip=(
+                "Lists every package in this install's own Python with the version "
+                "actually installed - what a run really imports, not what the pins in "
+                "requirements.txt ask for. Collected by the probe, so F5 refreshes it."
+            ),
+        )
+        body.field(
+            "Dependencies",
+            "What this install actually has.",
+            row(self.btn_packages),
+        )
+
         self.sp_budget = spin_int(
             0,
             128,
@@ -151,11 +170,40 @@ class PerfPanelMixin(_Base):
         )
         body.field("CPU threads", "Leave on auto to let torch decide.", self.sp_threads)
 
-        self.sp_io = spin_int(1, 16, max(1, int(p.get("io_workers", 2))), 1, self.update_summary)
+        self.sp_io = spin_int(
+            1,
+            16,
+            max(1, int(p.get("io_workers", 2))),
+            1,
+            self.update_summary,
+            tip=(
+                "How many pages are read and decoded ahead of the GPU, and encoded and "
+                "written behind it, at the same time. Raise this one first: it is what "
+                "hides a slow encoder (JPEG XL and AVIF cost seconds per page) or a "
+                "slow disk behind the upscale. Two is enough when the GPU is the "
+                "bottleneck; 3-4 helps on a many-core CPU with a heavy encoder. Each "
+                "worker holds a decoded page in RAM - a 2880x16000 colour page is "
+                "about 140 MB - so this costs system memory, never VRAM."
+            ),
+        )
         body.field("I/O workers", "Threads that decode and encode while the GPU works.", self.sp_io)
 
         self.sp_vips = spin_int(
-            0, 64, int(p.get("vips_concurrency", 0)), 1, self.update_summary, special="default"
+            0,
+            64,
+            int(p.get("vips_concurrency", 0)),
+            1,
+            self.update_summary,
+            special="default",
+            tip=(
+                "Threads libvips may use inside a single decode or encode "
+                "(VIPS_CONCURRENCY). Default lets libvips choose, which is roughly the "
+                "core count. The two settings multiply: several I/O workers each "
+                "running a full-width libvips operation oversubscribe the CPU and "
+                "everything gets slower. So lower this to 2-4 if you raise I/O "
+                "workers, and only raise it when I/O workers is 1 and one huge page is "
+                "being encoded at a time."
+            ),
         )
         body.field("libvips concurrency", "Leave on default unless tuning.", self.sp_vips)
 
@@ -199,6 +247,44 @@ class PerfPanelMixin(_Base):
         )
         body.control(self.chk_wake)
         self.page.addWidget(panel)
+
+    # ------------------------------------------------------------------ #
+    # installed packages
+    # ------------------------------------------------------------------ #
+    def show_packages(self) -> None:
+        """What this install's own Python really has, versions included.
+
+        The pins say what was asked for; the probe reports what
+        ``importlib.metadata`` finds, which is what a run actually imports.
+        """
+        entries: list[tuple[str, str]] = []
+        for item in self.probe.get("packages") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name:
+                entries.append((name, str(item.get("version") or "?")))
+        if not entries:
+            self.show_banner(
+                "The package list arrives with the hardware probe \u2014 press F5 to detect."
+            )
+            return
+        width = max(len(name) for name, _ in entries)
+        text = "\n".join(f"{name.ljust(width)}  {version}" for name, version in entries)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Installed packages")
+        dialog.resize(480, 560)
+        box = QVBoxLayout(dialog)
+        box.setContentsMargins(16, 16, 16, 16)
+        box.setSpacing(10)
+        box.addWidget(label(f"{len(entries)} packages in this install's own Python", "hint"))
+        view = QPlainTextEdit(text)
+        view.setReadOnly(True)
+        view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        box.addWidget(view)
+        copy = button("Copy", lambda: QGuiApplication.clipboard().setText(text), variant="ghost")
+        box.addWidget(row(copy, button("Close", dialog.accept)))
+        dialog.exec()
 
     # ------------------------------------------------------------------ #
     # devices

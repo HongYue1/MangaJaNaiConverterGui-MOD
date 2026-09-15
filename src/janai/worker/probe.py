@@ -79,5 +79,29 @@ def do_probe(models_dir: Path) -> int:
     except Exception:
         info["rar"] = False
     info["cpu_count"] = os.cpu_count() or 1
+    info["packages"] = installed_packages()
     emit("probe", **info)
     return 0
+
+
+def installed_packages() -> list[dict[str, str]]:
+    """Every distribution in this interpreter, at the version really installed.
+
+    The pins in ``requirements.txt`` record what was asked for; this records
+    what a run actually imports, which is the only version worth reporting when
+    a result changes and nothing in the repository did.
+    """
+    try:
+        from importlib.metadata import distributions
+    except Exception:
+        return []
+    found: dict[str, str] = {}
+    for dist in distributions():
+        try:
+            name = str(dist.metadata["Name"] or "").strip()
+            version = str(dist.version or "")
+        except Exception:
+            continue
+        if name and name not in found:
+            found[name] = version
+    return [{"name": name, "version": found[name]} for name in sorted(found, key=str.lower)]
